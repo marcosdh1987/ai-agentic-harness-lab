@@ -12,7 +12,7 @@ from harness_lab_app.attribution_service import AttributionService
 from harness_lab_app.case_service import CaseService
 from harness_lab_app.config import get_settings
 from harness_lab_app.evaluation import EvaluationContext, run_profile
-from harness_lab_app.models import Audit, Score, Validation
+from harness_lab_app.models import Audit, HarnessSource, Score, Validation
 from harness_lab_app.run_service import RunService
 
 
@@ -124,6 +124,39 @@ class ScoreService:
             # the surface checks drop out.
             pass
 
+        # The skills this run is about (ADR-0041): what it staged or was asked
+        # to invoke, plus what a sibling arm of its experiment removes — the
+        # baseline of an ablation is "about" the skill being taken away. Minus
+        # what this run itself cannot see.
+        under_test: set[str] = set(config.skills_extra) | set(config.skills_invoke)
+        if run.experiment_id:
+            from harness_lab_app.experiment_service import ExperimentService
+
+            try:
+                for condition in ExperimentService(self.session).conditions(
+                    run.experiment_id
+                ):
+                    for key in ("skills_extra", "skills_disabled", "skills_invoke"):
+                        under_test.update(condition.overrides.get(key) or [])
+            except ValueError:
+                pass
+        # Only what this run could actually open: a staged skill another arm
+        # carries is not on this run's menu, and scoring "not invoked" against
+        # it would put a zero on the baseline of every Add-skills experiment.
+        from harness_lab_app.skills_catalog import known_skill_names
+
+        if config.harness_source == HarnessSource.bare:
+            # A bare arm has no catalog at all: the runner masks every skill
+            # directory (ADR-0049). Whether its `skills_disabled` names them is
+            # a declaration for the condition hash, not a fact about the run, so
+            # nothing here may depend on the operator having written it out.
+            visible: set[str] = set()
+        else:
+            visible = (known_skill_names() - set(config.skills_disabled)) | set(
+                config.skills_extra
+            )
+        under_test &= visible
+
         # The harness-behaviour evaluator reads read-coverage off attribution,
         # and that coverage is only meaningful against the run's own governance
         # surface — which is what AttributionService resolves (ADR-0031).
@@ -139,6 +172,7 @@ class ScoreService:
                     "objective": validation.objective,
                     "cost": validation.cost,
                     "effort": validation.effort,
+                    "subjective": validation.subjective,
                 }
                 if validation
                 else None
@@ -154,6 +188,7 @@ class ScoreService:
             diff_text=diff_text,
             files_expected=expected,
             files_forbidden=forbidden,
+            skills_under_test=tuple(sorted(under_test)),
         )
 
     def evaluate_run(self, run_id: str, profile: str = "default") -> list[Score]:

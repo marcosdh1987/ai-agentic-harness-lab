@@ -12,6 +12,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -31,19 +32,42 @@ from harness_lab_app.auth import (
     verify_password,
 )
 from harness_lab_app.case_derivation import derive_candidates
-from harness_lab_app.case_service import CaseExistsError, CaseService
+from harness_lab_app.case_draft_service import generate_case_draft
+from harness_lab_app.case_service import (
+    CaseExistsError,
+    CaseService,
+    CaseValidationError,
+    resolve_prompt_variant_text,
+)
 from harness_lab_app.celery_app import (
     enqueue_audit,
+    enqueue_compare_audit,
     enqueue_container_cleanup,
+    enqueue_experiment_audit,
+    enqueue_gate_check,
     enqueue_improve,
+    enqueue_repository_audit,
     enqueue_run,
     enqueue_sandbox_start,
     enqueue_sandbox_stop,
     enqueue_validation,
 )
+from harness_lab_app.checkout_service import CheckoutError
+from harness_lab_app.compare_audit_service import (
+    MAX_RUNS,
+    MIN_RUNS,
+    CompareAuditService,
+    comparison_key,
+    runs_finished as comparison_runs_finished,
+)
 from harness_lab_app.config import get_settings, read_env_file_value
 from harness_lab_app.constants import EXAMPLE_LMSTUDIO_URL, EXAMPLE_OLLAMA_URL
 from harness_lab_app.db import get_engine, get_session, init_db
+from harness_lab_app.experiment_audit_service import (
+    TERMINAL_STATES,
+    ExperimentAuditService,
+    runs_finished,
+)
 from harness_lab_app.experiment_service import (
     ExperimentDesignError,
     ExperimentError,
@@ -73,6 +97,10 @@ from harness_lab_app.sandbox_service import VALID_KINDS, SandboxService
 from harness_lab_app.schemas import (
     AssessmentCreate,
     CaseCreate,
+    CaseDraftRequest,
+    CaseDraftResponse,
+    CheckoutAttachRequest,
+    CheckoutFromLocalRequest,
     EnvUpdateRequest,
     ExperimentCreate,
     ExperimentLaunch,
@@ -121,6 +149,8 @@ from harness_lab_app.target_service import (
     TargetError,
     TargetNotFoundError,
     TargetService,
+    clone_source,
+    pin_checkout,
     resolve_ref,
 )
 from harness_lab_app.validation_service import ValidationService
@@ -245,11 +275,11 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def startup() -> None:
         init_db()
-        # Ensure the Tetris pilot case always exists on a fresh DB so the run
-        # form never falls back to a non-existent "default" prompt variant.
-        # Seeding must never block startup.
+        # Every authored benchmark case exists on a fresh DB, and a stale one
+        # is refreshed from its task.yaml (ADR-0025). Seeding must never block
+        # startup.
         with contextlib.suppress(Exception), Session(get_engine()) as session:
-            CaseService(session).seed_tetris_case()
+            CaseService(session).seed_benchmark_cases()
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
@@ -1100,17 +1130,29 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/experiments")
-    def list_experiments(session: Session = Depends(get_session)):
+    def list_experiments(family_id: str = "", session: Session = Depends(get_session)):
         service = ExperimentService(session)
         experiments = service.list_experiments()
-        return [
-            {
-                **experiment.model_dump(),
-                "condition_count": len(service.conditions(experiment.experiment_id)),
-                "run_count": len(service.runs(experiment.experiment_id)),
-            }
-            for experiment in experiments
-        ]
+        if family_id:
+            # A ladder is read as one family (ADR-0051).
+            experiments = [e for e in experiments if e.family_id == family_id]
+        rows = []
+        for experiment in experiments:
+            runs = service.runs(experiment.experiment_id)
+            rows.append(
+                {
+                    **experiment.model_dump(),
+                    "condition_count": len(
+                        service.conditions(experiment.experiment_id)
+                    ),
+                    "run_count": len(runs),
+                    # Derived from the runs, not from `status`, which is set at
+                    # launch and can lag behind the last run.
+                    "finished": bool(runs)
+                    and all(run.state in TERMINAL_STATES for run in runs),
+                }
+            )
+        return rows
 
     @app.get("/api/experiments/{experiment_id}")
     def get_experiment(experiment_id: str, session: Session = Depends(get_session)):
@@ -1128,6 +1170,115 @@ def create_app() -> FastAPI:
             # how two measurements end up filed under one name.
             "launch_config": service.launch_config(experiment_id),
         }
+
+    @app.get("/api/experiments/{experiment_id}/audit")
+    def get_experiment_audit(
+        experiment_id: str, session: Session = Depends(get_session)
+    ):
+        audit = ExperimentAuditService(session).get(experiment_id)
+        if audit is None:
+            raise HTTPException(status_code=404, detail="No audit for this experiment")
+        return audit
+
+    @app.post("/api/experiments/{experiment_id}/audit")
+    def audit_experiment(
+        experiment_id: str,
+        auditor_model: str | None = None,
+        session: Session = Depends(get_session),
+    ):
+        """Queue the LLM reading of a finished experiment.
+
+        Refused while any run is still executing: a reading of a half-finished
+        experiment would describe a comparison that does not exist yet, and it
+        would be persisted as though it did.
+        """
+        service = ExperimentService(session)
+        try:
+            service.get_experiment(experiment_id)
+        except ExperimentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        finished, done, total = runs_finished(session, experiment_id)
+        if not finished:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{done} of {total} run(s) have finished; the reading waits "
+                    "for the last one."
+                    if total
+                    else "This experiment has no runs to read."
+                ),
+            )
+        ExperimentAuditService(session).mark_running(experiment_id, auditor_model or "")
+        enqueue_experiment_audit(experiment_id, auditor_model)
+        return {"status": "queued", "experiment_id": experiment_id}
+
+    def _resolve_comparison(session: Session, run_ids: list[str]) -> list[str]:
+        """The selection, validated: 2-4 distinct runs that all exist."""
+        ordered = list(dict.fromkeys(run_ids))
+        if len(ordered) != len(run_ids):
+            raise HTTPException(
+                status_code=400, detail="A run cannot be compared with itself."
+            )
+        if not MIN_RUNS <= len(ordered) <= MAX_RUNS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"A comparison reads {MIN_RUNS} to {MAX_RUNS} runs; "
+                    f"{len(ordered)} were given."
+                ),
+            )
+        runs = RunService(session)
+        for run_id in ordered:
+            try:
+                runs.get_run(run_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return ordered
+
+    @app.get("/api/compare/audit")
+    def get_compare_audit(
+        run_id: list[str] = Query(default=[]),
+        session: Session = Depends(get_session),
+    ):
+        """The stored reading for this exact selection, if one was ever asked for.
+
+        The 404 is the empty box: the page never generates on its own, so
+        "nothing here yet" is the normal state, not an error to surface.
+        """
+        ordered = _resolve_comparison(session, run_id)
+        audit = CompareAuditService(session).get(comparison_key(ordered))
+        if audit is None:
+            raise HTTPException(
+                status_code=404, detail="No reading for this comparison"
+            )
+        return audit
+
+    @app.post("/api/compare/audit")
+    def audit_compare(
+        run_id: list[str] = Query(default=[]),
+        auditor_model: str | None = None,
+        session: Session = Depends(get_session),
+    ):
+        """Queue the LLM reading of a hand-picked comparison.
+
+        Refused while any run is still executing: a reading of a run that has
+        not stopped would describe an outcome that does not exist yet, and it
+        would be persisted as though it did.
+        """
+        ordered = _resolve_comparison(session, run_id)
+        finished, done, total = comparison_runs_finished(session, ordered)
+        if not finished:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{done} of {total} run(s) have finished; the reading waits "
+                    "for the last one."
+                ),
+            )
+        key = comparison_key(ordered)
+        CompareAuditService(session).mark_running(key, ordered, auditor_model or "")
+        enqueue_compare_audit(ordered, auditor_model)
+        return {"status": "queued", "comparison_key": key}
 
     @app.get("/api/experiments/{experiment_id}/summary")
     def summarize_experiment(
@@ -1316,6 +1467,215 @@ def create_app() -> FastAPI:
         except TargetError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.get("/api/targets/{target_id}/checkout")
+    def target_checkout(target_id: str, session: Session = Depends(get_session)):
+        """What the lab can see of the operator's own clone of this repository.
+
+        Polled by the onboarding while the operator runs the clone command in
+        their terminal. Everything it reports is observed from the directory —
+        "not cloned yet" is an ordinary answer, not an error.
+        """
+        from harness_lab_app.checkout_service import guided_command, inspect_checkout
+
+        try:
+            target = TargetService(session).get_target(target_id)
+        except TargetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        from harness_lab_app.local_sources_service import is_enabled
+
+        try:
+            state = inspect_checkout(target)
+            command = guided_command(target)
+        except CheckoutError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "command": command,
+            "local_sources_enabled": is_enabled(),
+            **state.as_dict(),
+        }
+
+    @app.post("/api/targets/{target_id}/checkout/pin")
+    def pin_target_checkout(target_id: str, session: Session = Depends(get_session)):
+        """Freeze the repository at the commit the operator's clone is on.
+
+        From here the whole audit — readiness, derived cases, every run —
+        reads one commit, so two experiments a week apart compare agents rather
+        than a moving branch (ADR-0042).
+        """
+        from harness_lab_app.checkout_service import inspect_checkout
+
+        try:
+            target = pin_checkout(session, target_id)
+        except TargetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (CheckoutError, TargetError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return inspect_checkout(target).as_dict()
+
+    @app.get("/api/checkouts")
+    def list_lab_checkouts(session: Session = Depends(get_session)):
+        """Every clone already sitting under data/checkouts, and who claims it.
+
+        A repository cloned once should be auditable twice. This is what the
+        onboarding offers instead of asking for a second copy when a clone
+        exists under a name that is not the target's id.
+        """
+        from harness_lab_app.checkout_service import (
+            list_checkouts,
+            recorded_checkout_path,
+        )
+
+        claimed: dict[str, list[str]] = {}
+        for target in TargetService(session).list_targets(include_archived=True):
+            path = recorded_checkout_path(target)
+            if path is not None:
+                claimed.setdefault(path.name, []).append(target.target_id)
+        rows = list_checkouts()
+        for row in rows:
+            row["claimed_by"] = claimed.get(str(row["name"]), [])
+        return rows
+
+    @app.post("/api/targets/{target_id}/checkout/attach")
+    def attach_target_checkout(
+        target_id: str,
+        data: CheckoutAttachRequest,
+        session: Session = Depends(get_session),
+    ):
+        """Point this target at a clone that already exists (ADR-0045)."""
+        from harness_lab_app.checkout_service import inspect_checkout
+        from harness_lab_app.target_service import attach_checkout
+
+        try:
+            target = attach_checkout(session, target_id, data.name)
+        except TargetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (CheckoutError, TargetError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return inspect_checkout(target).as_dict()
+
+    @app.post("/api/targets/{target_id}/checkout/local-command")
+    def local_checkout_command(
+        target_id: str,
+        data: CheckoutFromLocalRequest,
+        session: Session = Depends(get_session),
+    ):
+        """The command that copies a repository the operator already has.
+
+        Built here rather than in the browser because the destination is a host
+        path only the server can work out, and because the source has to be
+        quoted for a shell.
+        """
+        from harness_lab_app.checkout_service import local_copy_command
+
+        try:
+            target = TargetService(session).get_target(target_id)
+        except TargetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        try:
+            command = local_copy_command(target.target_id, data.source)
+        except CheckoutError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"target_id": target.target_id, "command": command}
+
+    @app.get("/api/local-sources")
+    def browse_local_sources(path: str = ""):
+        """One level of the operator's own repositories, if they mounted any.
+
+        Off unless HARNESS_LAB_LOCAL_SOURCES_DIR is set: the lab lists nothing
+        it was not explicitly pointed at (ADR-0045).
+        """
+        from harness_lab_app.local_sources_service import (
+            LocalSourcesDisabled,
+            LocalSourcesError,
+            browse,
+        )
+
+        try:
+            return browse(path)
+        except LocalSourcesDisabled as exc:
+            return {"enabled": False, "reason": str(exc), "entries": []}
+        except LocalSourcesError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/targets/{target_id}/checkout/from-local")
+    def copy_local_checkout(
+        target_id: str,
+        data: CheckoutFromLocalRequest,
+        session: Session = Depends(get_session),
+    ):
+        """Copy a mounted local repository into the lab's own checkout folder."""
+        from harness_lab_app.checkout_service import (
+            create_checkout_from,
+            inspect_checkout,
+        )
+        from harness_lab_app.local_sources_service import LocalSourcesError, resolve
+
+        try:
+            target = TargetService(session).get_target(target_id)
+        except TargetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        try:
+            source = resolve(data.source)
+            create_checkout_from(source, target)
+        except (LocalSourcesError, CheckoutError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return inspect_checkout(target).as_dict()
+
+    @app.post("/api/targets/{target_id}/gate-check", status_code=202)
+    def start_gate_check(target_id: str, session: Session = Depends(get_session)):
+        """Measure the repository alone: its own gate, at the pin, with no agent.
+
+        Without it the first red run is ambiguous — the agent may have failed,
+        or the repository may simply not build in the runner image — and those
+        mean opposite things (ADR-0042).
+        """
+        import uuid
+
+        from harness_lab_app.gate_check_service import (
+            GateCheckError,
+            build_gate_check_spec,
+        )
+        from harness_lab_app.models import GateCheck
+
+        try:
+            target = TargetService(session).get_target(target_id)
+        except TargetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        try:
+            spec = build_gate_check_spec(target)
+        except (GateCheckError, CheckoutError, TargetError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        row = GateCheck(
+            gate_check_id=f"gate-{target.target_id}-{uuid.uuid4().hex[:8]}",
+            target_id=target.target_id,
+            commit=spec["commit"],
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        try:
+            enqueue_gate_check(row.gate_check_id)
+        except Exception as exc:
+            row.status = "failed"
+            row.error = f"Could not queue the gate check: {exc!r}"
+            session.add(row)
+            session.commit()
+            raise HTTPException(status_code=503, detail=row.error) from exc
+        return row
+
+    @app.get("/api/targets/{target_id}/gate-check")
+    def latest_gate_check(target_id: str, session: Session = Depends(get_session)):
+        """The most recent gate check for this repository, or nothing."""
+        from harness_lab_app.models import GateCheck
+
+        row = session.exec(
+            select(GateCheck)
+            .where(GateCheck.target_id == target_id)
+            .order_by(GateCheck.created_at.desc())  # type: ignore[attr-defined]
+        ).first()
+        return row
+
     @app.get("/api/targets/{target_id}/readiness")
     def target_readiness(target_id: str, session: Session = Depends(get_session)):
         """Step 2 of the guided audit: what this repository already has.
@@ -1331,6 +1691,54 @@ def create_app() -> FastAPI:
             return ReadinessService(session).build(target_id)
         except TargetNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/targets/{target_id}/repository-audit")
+    def get_repository_audit(target_id: str, session: Session = Depends(get_session)):
+        """The LLM harness audit of this repository, if one was generated."""
+        from harness_lab_app.repository_audit_service import RepositoryAuditService
+
+        audit = RepositoryAuditService(session).get(target_id)
+        if audit is None:
+            raise HTTPException(status_code=404, detail="No audit for this repository")
+        return audit
+
+    @app.post("/api/targets/{target_id}/repository-audit", status_code=202)
+    def run_repository_audit(
+        target_id: str,
+        auditor_model: str | None = None,
+        session: Session = Depends(get_session),
+    ):
+        """Queue the LLM harness audit of a pinned repository.
+
+        Refused without a pin: the audit reads one commit and says which, and
+        a report about a moving branch could not be re-read a week later. Runs
+        in the worker like every other LLM reading; the UI polls the GET.
+        """
+        from harness_lab_app.repository_audit_service import RepositoryAuditService
+
+        try:
+            target = TargetService(session).get_target(target_id)
+        except TargetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not (target.pinned_commit or "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This repository is not pinned to a commit yet. Pin its "
+                    "checkout in step 1, then audit it."
+                ),
+            )
+        service = RepositoryAuditService(session)
+        service.mark_running(target_id, auditor_model or "", target.pinned_commit)
+        try:
+            enqueue_repository_audit(target_id, auditor_model)
+        except Exception as exc:
+            service.store_error(target_id, f"could not queue the audit: {exc}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"The worker queue is unreachable: {exc}",
+            ) from exc
+        return {"status": "queued", "target_id": target_id}
 
     @app.get("/api/targets/{target_id}/audit-report")
     def target_audit_report(target_id: str, session: Session = Depends(get_session)):
@@ -1372,7 +1780,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         ref = (data.ref or target.default_ref or "").strip()
         try:
-            commit = resolve_ref(target.repository_url, ref)
+            commit = resolve_ref(clone_source(target), ref)
         except TargetError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"target_id": target.target_id, "ref": ref, "commit": commit}
@@ -1398,7 +1806,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         try:
             candidates = derive_candidates(
-                target.repository_url,
+                clone_source(target),
                 ref or target.default_ref,
                 get_settings().target_mirrors_dir,
                 target.target_id,
@@ -1415,8 +1823,14 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/cases")
-    def list_cases(session: Session = Depends(get_session)):
-        return CaseService(session).list_cases()
+    def list_cases(origin_target_id: str = "", session: Session = Depends(get_session)):
+        """Every case, or the library of one repository (ADR-0042)."""
+        cases = CaseService(session).list_cases()
+        if origin_target_id:
+            cases = [
+                case for case in cases if case.origin_target_id == origin_target_id
+            ]
+        return cases
 
     @app.get("/api/cases/{case_id}")
     def get_case(case_id: str, session: Session = Depends(get_session)):
@@ -1432,6 +1846,10 @@ def create_app() -> FastAPI:
         except CaseExistsError as exc:
             # 409, so a client can treat "already there" as the non-event it is.
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except CaseValidationError as exc:
+            # 422 with one message per offending command: the person is still on
+            # the form and each message names the command and the fix.
+            raise HTTPException(status_code=422, detail=exc.problems) from exc
 
     @app.patch("/api/cases/{case_id}")
     def update_case(
@@ -1441,8 +1859,34 @@ def create_app() -> FastAPI:
         # unknown id is an ordinary 404, not a 500 traceback in the panel.
         try:
             return CaseService(session).update_case(case_id, data)
+        except CaseValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.problems) from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/cases/{case_id}/dry-run")
+    def dry_run_case(case_id: str, session: Session = Depends(get_session)):
+        """Run this case's own checks against the clean, pinned tree.
+
+        A check that passes here passed before the agent started, so its green
+        says nothing about the agent. The verdict lands on the case as
+        `metadata_json["dry_run"]`; `verdict == "tautological"` means the case
+        cannot tell work from no work and has to be re-authored.
+        """
+        from harness_lab_app.celery_app import enqueue_case_dry_run
+        from harness_lab_app.validation import is_executable_command
+
+        try:
+            case = CaseService(session).get_case(case_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not [c for c in case.validation_commands if is_executable_command(c)]:
+            raise HTTPException(
+                status_code=422,
+                detail="This case has no runnable validation commands to dry-run.",
+            )
+        enqueue_case_dry_run(case_id)
+        return {"status": "queued", "case_id": case_id}
 
     @app.delete("/api/cases/{case_id}")
     def delete_case(case_id: str, session: Session = Depends(get_session)):
@@ -1514,13 +1958,40 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return CaseService(session).import_swebench_pro_instance(spec, polish=True)
 
-    @app.post("/api/cases/seed/tetris")
-    def seed_tetris(session: Session = Depends(get_session)):
-        return CaseService(session).seed_tetris_case()
+    @app.post("/api/cases/seed")
+    def seed_benchmarks(session: Session = Depends(get_session)):
+        """Import or refresh every benchmarks/*/task.yaml case."""
+        return CaseService(session).seed_benchmark_cases()
 
     @app.get("/api/cases/{case_id}/run-ids")
     def list_case_run_ids(case_id: str, session: Session = Depends(get_session)):
         return {"run_ids": CaseService(session).list_case_run_ids(case_id)}
+
+    @app.get("/api/cases/{case_id}/prompt-content")
+    def get_case_prompt_content(
+        case_id: str, variant: str, session: Session = Depends(get_session)
+    ):
+        """The literal text behind a prompt variant (New evaluation's "View
+        prompt" preview) — resolving a ``task.yaml``-style path to file
+        content, same as the runner does at launch time."""
+        try:
+            case = CaseService(session).get_case(case_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        content = resolve_prompt_variant_text(case, variant)
+        if content is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Prompt variant {variant!r} has no readable content",
+            )
+        return {"variant": variant, "content": content}
+
+    @app.post("/api/cases/generate-draft", response_model=CaseDraftResponse)
+    def generate_case_draft_endpoint(req: CaseDraftRequest) -> CaseDraftResponse:
+        try:
+            return generate_case_draft(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/runs")
     def list_runs(batch_id: str = "", session: Session = Depends(get_session)):

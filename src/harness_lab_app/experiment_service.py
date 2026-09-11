@@ -13,6 +13,7 @@ question it claims to. That is the whole of the difference here (ADR-0033):
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -20,11 +21,13 @@ from typing import TYPE_CHECKING, Any
 from sqlmodel import Session, select
 
 from harness_lab_app.models import (
+    Case,
     ConditionRole,
     Experiment,
     ExperimentCondition,
     ExperimentMode,
     ExperimentStatus,
+    HarnessSource,
     Run,
     RunConfig,
     RunState,
@@ -54,12 +57,28 @@ CONDITION_FIELDS = frozenset(
         "harness_source",
         "skills_disabled",
         "skills_extra",
+        "skills_invoke",
         "prompt_variant",
         "max_steps",
     }
 )
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
+
+
+def _variant_refusal(gaps: list[str]) -> str:
+    """The refusal creation and launch owe alike: named cases, named arms.
+
+    Both call sites answer the same question — would this run be handed a
+    prompt the case never defined — so they say it with the same words.
+    """
+    return (
+        "The design asks for prompt variants the cases do not define, so "
+        "those runs would carry an empty prompt: "
+        + "; ".join(sorted(set(gaps)))
+        + ". Add the variant to the case, or pick variants every selected "
+        "case declares."
+    )
 
 
 class ExperimentError(ValueError):
@@ -72,6 +91,26 @@ class ExperimentNotFoundError(ExperimentError):
 
 class ExperimentDesignError(ExperimentError):
     """The design contradicts the mode it declares."""
+
+
+#: `harness_source` of an arm that sees no governance at all (ADR-0049).
+BARE = "bare"
+
+#: Prompt variants whose body directs the agent through the lab's harness. A
+#: bare arm carrying one is being told to follow what it cannot read.
+HARNESS_FAMILY_VARIANTS = frozenset({"harness", "swe_harness", "sdlc_full"})
+
+#: Axes a bare arm cannot meaningfully vary — see the subsumption rule in
+#: :func:`validate_design`.
+_BARE_SUBSUMED = frozenset(
+    {
+        "prompt_variant",
+        "skills_disabled",
+        "skills_extra",
+        "skills_invoke",
+        "skills_under_test",
+    }
+)
 
 
 def _varying_fields(conditions: list[dict[str, Any]]) -> set[str]:
@@ -93,8 +132,46 @@ def _hashable(value: Any) -> Any:
     return value
 
 
+def _skills_move_together(conditions: list[dict[str, Any]]) -> bool:
+    """Is "stage the skill" and "ask for it" one intervention here, or two?
+
+    Adding a skill and asking the agent to use it is the most common thing an
+    engineer brings to this lab, and ADR-0041 is the reason: for a mode skill,
+    staging it without asking is not a treatment at all. But the two knobs are
+    separate fields, so the correct design lights up as "two harness factors
+    vary at once" — a confound warning fired at the one design that is not
+    confounded. A warning that cries wolf on the right answer teaches people to
+    ignore warnings.
+
+    They are one intervention when the arms can be put in a single order that
+    both fields agree with: every pair of arms is comparable on *both* sets at
+    once, so "more skills" always means "more skills asked for" and never the
+    reverse. Arms that disagree — one adding X unasked while another asks for a
+    Y it already had — are genuinely two factors and still warn.
+    """
+    pairs = []
+    for condition in conditions:
+        overrides = condition.get("overrides", {}) or {}
+        pairs.append(
+            (
+                {str(item) for item in overrides.get("skills_extra") or []},
+                {str(item) for item in overrides.get("skills_invoke") or []},
+            )
+        )
+    for index, (extra_a, invoke_a) in enumerate(pairs):
+        for extra_b, invoke_b in pairs[index + 1 :]:
+            forward = extra_a <= extra_b and invoke_a <= invoke_b
+            backward = extra_b <= extra_a and invoke_b <= invoke_a
+            if not (forward or backward):
+                return False
+    return True
+
+
 def validate_design(
-    mode: ExperimentMode, conditions: list[dict[str, Any]]
+    mode: ExperimentMode,
+    conditions: list[dict[str, Any]],
+    *,
+    in_family: bool = False,
 ) -> list[str]:
     """Reject a design that cannot answer the question its mode implies.
 
@@ -122,6 +199,34 @@ def validate_design(
     varying = _varying_fields(conditions)
     controls = [c for c in conditions if c.get("role") == ConditionRole.control]
 
+    if mode == ExperimentMode.subject_validation:
+        # Returns before the exactly-one-control check below, because this mode
+        # has no control by construction (ADR-0040): every arm is a peer, and
+        # none is the baseline the others are measured against. What it reports
+        # is a pass rate *per arm* — never a delta, never a pooled number.
+        if "target_repo_id" in varying:
+            raise ExperimentDesignError(
+                "Mode 'subject_validation' holds the repository fixed. Varying it "
+                "makes the result unreadable — 'the subject passed 8 of 9' says "
+                "nothing without naming where. Use mode 'cross_repo' to vary the "
+                "repository, or give every condition the same target."
+            )
+        if "skills_disabled" in varying:
+            raise ExperimentDesignError(
+                "Mode 'subject_validation' does not ablate anything: the subject "
+                "under test is the tool and the skill driving it, not the harness. "
+                "Conditions that vary 'skills_disabled' are a harness evaluation "
+                "wearing this mode's label — use mode 'harness_evaluation'."
+            )
+        subject_axes = varying & {"harness", "executor_model"}
+        if len(subject_axes) > 1:
+            warnings.append(
+                "Both the harness and the executor model vary. That cross product "
+                "is the point of this mode, but each cell is its own population: "
+                "read one <harness>/<model> arm at a time, never averaged."
+            )
+        return warnings
+
     if len(conditions) > 1 and len(controls) != 1:
         raise ExperimentDesignError(
             "A comparison needs exactly one control condition — mark the arm the "
@@ -146,6 +251,10 @@ def validate_design(
             "harness_source",
             "skills_disabled",
             "skills_extra",
+            # Being asked to use a skill is a harness lever too: the same
+            # skill, on the menu versus called for, is the "does it help when
+            # asked" comparison (ADR-0041).
+            "skills_invoke",
             "harness",
             # The governance-loaded prompt is a harness lever like any skill:
             # naive-vs-sdlc and swe_default-vs-swe_harness are the lab's
@@ -158,11 +267,77 @@ def validate_design(
                 "These conditions are identical on every harness axis, so there is "
                 "nothing to attribute a difference to."
             )
+        if {"skills_extra", "skills_invoke"} <= harness_axes and _skills_move_together(
+            conditions
+        ):
+            # One intervention wearing two field names (see above).
+            harness_axes = (harness_axes - {"skills_extra", "skills_invoke"}) | {
+                "skills_under_test"
+            }
+        # A bare arm is one axis, not four (ADR-0049). It has no prompt family
+        # to hold fixed and no catalog to hold fixed: the runner masks every
+        # governance directory, so whatever `prompt_variant` and `skills_*` say
+        # about it are declarations that keep the condition hash honest, not
+        # levers that moved. Subsume them — but only the ones that do not also
+        # vary among the arms that *do* have a harness, because those are
+        # genuine confounds and must still be reported.
+        bare_arms = [
+            condition
+            for condition in conditions
+            if (condition.get("overrides") or {}).get("harness_source") == BARE
+        ]
+        if bare_arms and "harness_source" in harness_axes:
+            rest = [condition for condition in conditions if condition not in bare_arms]
+            among_rest = _varying_fields(rest) if len(rest) > 1 else set()
+            harness_axes -= _BARE_SUBSUMED - among_rest
+        for condition in bare_arms:
+            variant = str(
+                (condition.get("overrides") or {}).get("prompt_variant") or ""
+            )
+            if variant in HARNESS_FAMILY_VARIANTS or variant.startswith("sdlc"):
+                warnings.append(
+                    f"Arm '{condition.get('label', '?')}' is bare but runs the "
+                    f"'{variant}' prompt, which tells the agent to follow a "
+                    "harness it cannot see. Give the bare arm the plain variant."
+                )
         if len(harness_axes) > 1:
             warnings.append(
                 "More than one harness factor varies at once "
                 f"({', '.join(sorted(harness_axes))}). A difference cannot be "
                 "attributed to either — vary one factor per experiment."
+            )
+        # A skills ablation inside the lab is a *partial* ablation, always. The
+        # agent runs against this repository's own root, so CLAUDE.md's body,
+        # the SessionStart hook, the subagents and .github/ governance survive
+        # in both arms whatever the skill catalog says. This is a property of
+        # the venue, not of which prompts the arms happen to carry, which is why
+        # it is stated here rather than only when the prompts match.
+        # `skills_invoke` alone moves no directory — both arms see the same
+        # catalog and one is asked to open it — so "only the skill directories
+        # differ" would be false for an activation experiment. A rung of a
+        # ladder (ADR-0051) is exempt as well: it is single-factor *by design*,
+        # read beside the rung that measured the governance body, so the
+        # objection that it might be mistaken for a harness comparison does
+        # not apply.
+        skill_axes = harness_axes & {
+            "skills_disabled",
+            "skills_extra",
+            "skills_under_test",
+        }
+        if (
+            skill_axes
+            and not in_family
+            and all(
+                (condition.get("overrides") or {}).get("harness_source", "lab_root")
+                == "lab_root"
+                for condition in conditions
+            )
+        ):
+            warnings.append(
+                "Every arm runs against the lab's own root, so only the skill "
+                "directories differ: CLAUDE.md's body, the SessionStart hook, "
+                "the subagents and .github/ governance are present in both arms. "
+                "This measures the skills, not the harness."
             )
 
     if mode == ExperimentMode.cross_repo:
@@ -192,12 +367,12 @@ def repetition_warning(repetitions: int) -> str | None:
         return (
             "1 repetition — exploratory only. Agents are stochastic; a single "
             "trial per arm cannot separate a real difference from run-to-run "
-            "variance."
+            "variance. Use 2 for a judgement."
         )
     if repetitions < 5:
         return (
-            f"{repetitions} repetitions — exploratory comparison. Use 5 or more "
-            "before treating a delta as a finding."
+            f"{repetitions} repetitions — a judgement, not a validation. Use 5 "
+            "or more before treating a delta as settled."
         )
     return None
 
@@ -255,6 +430,7 @@ class ExperimentService:
         from harness_lab_app.score_service import ScoreService
         from harness_lab_app.scores import REGISTRY
         from harness_lab_app.statistics import (
+            assess_validity,
             compare,
             paired_by_case,
             success_delta,
@@ -271,7 +447,15 @@ class ExperimentService:
         per_condition: dict[str, list[dict[str, Any]]] = {
             condition.label: [] for condition in conditions
         }
-        verdicts: dict[str, dict[str, bool | None]] = {
+        # Per arm, per case: every scored outcome. Reduced to one verdict per
+        # cell for the paired case matrix *after* the loop — the cell used to
+        # keep whichever repetition came last, so a 1-of-5 pass and a 5-of-5
+        # pass rendered identically.
+        outcomes: dict[str, dict[str, list[bool]]] = {
+            condition.label: {} for condition in conditions
+        }
+        # Per arm, per case: how many runs were scored and how many passed.
+        case_counts: dict[str, dict[str, dict[str, int]]] = {
             condition.label: {} for condition in conditions
         }
         # Why the arms stopped, per arm. Two arms that terminate under
@@ -280,6 +464,44 @@ class ExperimentService:
         stop_reasons: dict[str, list[str]] = {
             condition.label: [] for condition in conditions
         }
+        # Runs that measured the connection rather than the subject. A
+        # `harness_error` archived at exit 0 used to enter the corpus as a model
+        # scoring zero; counting it here is what lets the reader see it as
+        # infrastructure without rewriting the run's recorded state.
+        run_health: dict[str, dict[str, int]] = {
+            condition.label: {
+                "runs": 0,
+                "harness_error": 0,
+                "failed": 0,
+                "unhealthy": 0,
+                "scored_runs": 0,
+            }
+            for condition in conditions
+        }
+        # Whether the skills an arm is about were actually opened (ADR-0041).
+        # A comparison whose treatment arm never invoked its skill measured
+        # availability, and the verdict has to say so before the delta.
+        skill_usage: dict[str, dict[str, Any]] = {
+            condition.label: {"skills": [], "runs": 0, "invoked": 0, "requested": False}
+            for condition in conditions
+        }
+        # What each arm is *about* follows the same rule the scorer used when it
+        # wrote `skill_invoked` (``score_service.build_context``): the skills an
+        # arm stages or is asked for, plus the ones a sibling arm removes. The
+        # second half is what makes a full-harness treatment legible — it stages
+        # nothing and asks for nothing, and the whole catalog is only named on
+        # the control's `skills_disabled`. Reading the arm's own overrides alone
+        # left that arm with an empty skill list, so the observation that none
+        # of its twenty-five skills was ever opened had nowhere to land.
+        removed_elsewhere: dict[str, list[str]] = {}
+        for condition in conditions:
+            mine = set((condition.overrides or {}).get("skills_disabled") or [])
+            others: set[str] = set()
+            for sibling in conditions:
+                if sibling.label == condition.label:
+                    continue
+                others.update((sibling.overrides or {}).get("skills_disabled") or [])
+            removed_elsewhere[condition.label] = sorted(others - mine)
         for run in runs:
             label = run.condition_label or ""
             if label not in per_condition:
@@ -292,8 +514,44 @@ class ExperimentService:
                     else score.value_num
                 )
             per_condition[label].append(values)
-            case_id = run_service.get_run_config(run.run_config_id).case_id
-            verdicts[label][case_id] = values.get("task_validation_pass")
+            config = run_service.get_run_config(run.run_config_id)
+            case_id = config.case_id
+            crashed = run.state in (RunState.failed, RunState.cancelled)
+            invoked = values.get("skill_invoked")
+            # A skill left unopened by a run that died at minute two is not
+            # evidence about activation.
+            if invoked is not None and not crashed:
+                usage = skill_usage[label]
+                usage["runs"] += 1
+                usage["invoked"] += int(float(invoked) > 0)
+                usage["requested"] = usage["requested"] or bool(config.skills_invoke)
+                # A bare arm sees no catalog whatever its overrides say — the
+                # runner masks every skill directory (ADR-0049) — so it is about
+                # no skill, and `treatment_not_activated` must never fire on it.
+                names = (
+                    set()
+                    if config.harness_source == HarnessSource.bare
+                    else (set(config.skills_extra) | set(config.skills_invoke))
+                    # Minus what this run itself cannot see, mirroring the
+                    # scorer: an arm is not measured against a hidden skill.
+                    | (
+                        set(removed_elsewhere.get(label, []))
+                        - set(config.skills_disabled)
+                    )
+                )
+                for name in sorted(names):
+                    if name not in usage["skills"]:
+                        usage["skills"].append(name)
+            passed = values.get("task_validation_pass")
+            if passed is not None:
+                outcomes[label].setdefault(case_id, []).append(bool(passed))
+            cell = case_counts[label].setdefault(
+                case_id, {"runs": 0, "scored_runs": 0, "successes": 0}
+            )
+            cell["runs"] += 1
+            if passed is not None:
+                cell["scored_runs"] += 1
+                cell["successes"] += int(bool(passed))
             validation = self.session.exec(
                 select(Validation).where(Validation.run_id == run.run_id)
             ).first()
@@ -302,6 +560,12 @@ class ExperimentService:
             )
             if reason:
                 stop_reasons[label].append(str(reason))
+            health = run_health[label]
+            health["runs"] += 1
+            health["scored_runs"] += int(values.get("task_validation_pass") is not None)
+            health["harness_error"] += int(reason == "harness_error")
+            health["failed"] += int(crashed)
+            health["unhealthy"] += int(crashed or reason == "harness_error")
 
         summaries = {
             condition.label: summarize_condition(
@@ -314,12 +578,23 @@ class ExperimentService:
         }
 
         control = next((c for c in conditions if c.role == ConditionRole.control), None)
+        # One verdict per cell: a case counts as passed for an arm only when
+        # every scored repetition passed. Strict on purpose — "fixed" should
+        # mean the treatment made the case reliably pass, not once.
+        verdicts: dict[str, dict[str, bool | None]] = {
+            label: {case_id: all(runs) for case_id, runs in cells.items()}
+            for label, cells in outcomes.items()
+        }
         comparisons: list[dict[str, Any]] = []
-        # Discovery has no control arm by construction (ADR-0028) and must not
-        # acquire one here: a mode that cannot support a causal claim never
-        # renders a control-versus-treatment delta, whatever roles the rows
-        # happen to carry.
-        if experiment.mode == ExperimentMode.discovery:
+        # Discovery has no control arm by construction (ADR-0028), and neither
+        # does subject validation (ADR-0040). Neither must acquire one here: a
+        # mode that cannot support a causal claim never renders a
+        # control-versus-treatment delta, whatever roles the rows happen to
+        # carry.
+        if experiment.mode in (
+            ExperimentMode.discovery,
+            ExperimentMode.subject_validation,
+        ):
             control = None
         if control is not None:
             for condition in conditions:
@@ -347,6 +622,17 @@ class ExperimentService:
                 )
 
         first: dict[str, Any] | None = comparisons[0] if comparisons else None
+        # Before the verdict, not beside it: whether this comparison could have
+        # measured the thing it names (ADR-0046).
+        validity = assess_validity(
+            mode=str(experiment.mode.value),
+            control=summaries[first["control"]] if first else None,
+            treatment=summaries[first["treatment"]] if first else None,
+            skill_usage=skill_usage,
+            run_health=run_health,
+            success=first["success"] if first else None,
+            design_notes=list(experiment.design_notes or []),
+        )
         answer = verdict(
             mode=str(experiment.mode.value),
             cases=len(experiment.case_ids),
@@ -358,16 +644,26 @@ class ExperimentService:
             success=first["success"] if first else None,
             case_matrix=first["case_matrix"] if first else None,
             stop_reasons=stop_reasons,
+            # Subject validation reads every arm rather than a control/treatment
+            # pair, so it needs the arms themselves — there is no `first`.
+            subject=experiment.subject,
+            arms=list(summaries.values()),
+            skill_usage=skill_usage,
+            validity=validity,
         )
 
         return {
             "experiment_id": experiment_id,
             "question": experiment.question,
             "mode": experiment.mode,
+            "subject": experiment.subject,
             "repetitions": experiment.repetitions,
             "case_repetitions": dict(experiment.case_repetitions),
             "suite_id": experiment.suite_id,
+            "family_id": experiment.family_id,
             "verdict": answer,
+            "validity": validity,
+            "run_health": run_health,
             "conditions": [
                 {
                     "label": summary.label,
@@ -386,7 +682,45 @@ class ExperimentService:
                 for summary in summaries.values()
             ],
             "comparisons": comparisons,
+            # Per-arm, per-case counts: {label: {case_id: {runs, scored_runs,
+            # successes}}}. Not a comparison — `comparisons[].case_matrix` pairs
+            # a control against a treatment, which a mode without a control
+            # never has. This is the raw grid, with the repetitions kept, which
+            # is the only matrix subject validation can show and is useful under
+            # every mode.
+            "case_outcomes": case_counts,
         }
+
+    def try_complete(self, experiment_id: str) -> Experiment | None:
+        """Mark a running experiment complete once every run has stopped.
+
+        `ExperimentStatus.complete` existed in the enum and was assigned by no
+        line of this codebase, so an experiment stayed `running` forever — long
+        after its last run had finished, its audit had been read and its
+        conclusions written. "Running" then meant nothing, and the attention
+        feed could not tell work in flight from work nobody had closed.
+
+        Returns the experiment when this call is what completed it, and None
+        otherwise — so a caller can act exactly once (queue the reading) rather
+        than on every run that finishes.
+        """
+        from harness_lab_app.experiment_audit_service import runs_finished
+
+        try:
+            experiment = self.get_experiment(experiment_id)
+        except ExperimentNotFoundError:
+            return None
+        if experiment.status != ExperimentStatus.running:
+            return None  # draft, abandoned, or already complete
+        finished, _done, _total = runs_finished(self.session, experiment_id)
+        if not finished:
+            return None
+        experiment.status = ExperimentStatus.complete
+        experiment.updated_at = datetime.now(UTC)
+        self.session.add(experiment)
+        self.session.commit()
+        self.session.refresh(experiment)
+        return experiment
 
     def abandon_experiment(self, experiment_id: str) -> Experiment:
         """Take an experiment out of the working set without erasing anything.
@@ -442,6 +776,127 @@ class ExperimentService:
         self.session.commit()
         return {"experiment_id": experiment_id, "deleted_runs": len(runs)}
 
+    def _check_subject_validation(self, data: ExperimentCreate) -> None:
+        """Refuse a subject validation that cannot produce its own number.
+
+        Two requirements, both hard, both for the same reason: this mode's whole
+        output is "the subject passed N of M under <arm>", and neither half of
+        that sentence can be reconstructed later.
+
+        The validation command is a rejection rather than a warning because of
+        how the pipeline fails without one. ``build_validation_spec`` silently
+        drops entries that do not look executable, so a case whose only
+        "validation" is prose yields zero commands, ``parse_objective`` returns
+        ``passed=None``, ``task_validation_pass`` is never emitted, and the arm
+        ends with ``scored_runs == 0`` and no pass rate at all. The experiment
+        runs in full, costs real money, and answers nothing — without ever
+        saying so. Better to refuse at creation, while it is still one edit away.
+        """
+        from harness_lab_app.validation import _looks_executable
+
+        if not data.subject.strip():
+            raise ExperimentError(
+                "Mode 'subject_validation' needs a subject: the tool, service or "
+                "skill under test. The result this mode produces is a sentence "
+                "about that subject, and it cannot be recovered from the arms."
+            )
+        if not data.case_ids:
+            raise ExperimentError(
+                "Mode 'subject_validation' needs at least one case. The case is "
+                "the definition of what 'works' means for this subject."
+            )
+        unvalidated: list[str] = []
+        for case_id in data.case_ids:
+            case = self.session.exec(
+                select(Case).where(Case.case_id == case_id)
+            ).first()
+            if case is None:
+                raise ExperimentError(f"Unknown case: {case_id}")
+            if not any(_looks_executable(raw) for raw in case.validation_commands):
+                unvalidated.append(case_id)
+        if unvalidated:
+            raise ExperimentError(
+                "Mode 'subject_validation' measures a pass rate, so every case "
+                "must declare at least one executable validation command. These "
+                f"do not: {', '.join(unvalidated)}. Without one the runs execute, "
+                "produce no verdict, and the experiment reports nothing — add a "
+                "command that exits non-zero when the subject fails."
+            )
+
+    def _refuse_tautological_cases(self, case_ids: list[str]) -> None:
+        """Refuse to launch a case whose checks already passed on the clean tree.
+
+        A dry run (``POST /api/cases/{id}/dry-run``) executes the case's own
+        checks against the pinned commit with no agent work applied. When they
+        all pass there, the case cannot tell work from no work — every run it
+        produces will report a green that means nothing, at full cost. Two of
+        the talos cases were exactly that, and four experiment arms were spent
+        on them before anybody read the stored detail.
+
+        Silent for a case that was never dry-run: this refuses a *known* defect
+        rather than demanding a ceremony.
+        """
+        tautological: list[str] = []
+        for case_id in case_ids:
+            case = self.session.exec(
+                select(Case).where(Case.case_id == case_id)
+            ).first()
+            if case is None:
+                continue
+            raw = (case.metadata_json or {}).get("dry_run") or ""
+            try:
+                record = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                continue
+            if isinstance(record, dict) and record.get("verdict") == "tautological":
+                tautological.append(case_id)
+        if tautological:
+            raise ExperimentError(
+                "These cases passed their own checks on the clean tree, before "
+                f"any agent touched it: {', '.join(tautological)}. Their green "
+                "measures the case, not the agent — re-author the checks so at "
+                "least one fails on the untouched repository, then dry-run again."
+            )
+
+    def _check_declared_variants(self, data: ExperimentCreate) -> None:
+        """Refuse at creation a design whose cases do not define its prompts.
+
+        ``launch`` already refuses this, but it refuses *after* the experiment
+        is persisted: the design that cannot run leaves an experiment behind,
+        and the next attempt at the same question has to be filed under a
+        suffixed id. Which variant each arm fixes is knowable here, so the
+        refusal belongs here too — nothing is created that cannot launch
+        (ADR-0059).
+
+        Only fully-determined pairs are checked. When neither the condition nor
+        ``prompt_variants`` names a variant, the runs carry whatever the launch
+        payload supplies, which does not exist yet; ``launch`` keeps the check
+        for those. An unknown case is left to ``launch`` as well — a draft may
+        legitimately name a case that is not imported yet.
+        """
+        case_ids = [case_id for case_id in data.case_ids if case_id]
+        if not case_ids or not data.conditions:
+            return
+        defined = RunService(self.session)._defined_variants(case_ids)
+        gaps: list[str] = []
+        for case_id in case_ids:
+            available = defined.get(case_id)
+            if available is None:
+                continue
+            for condition in data.conditions:
+                # A condition's override wins over the experiment-level axis,
+                # exactly as it does when ``launch`` builds the run config.
+                fixed = (condition.overrides or {}).get("prompt_variant")
+                wanted = [fixed] if fixed else list(data.prompt_variants)
+                gaps.extend(
+                    f"case '{case_id}' / arm '{condition.label}' asks for "
+                    f"prompt variant '{variant}'"
+                    for variant in wanted
+                    if variant and variant not in available
+                )
+        if gaps:
+            raise ExperimentError(_variant_refusal(gaps))
+
     def create_experiment(self, data: ExperimentCreate) -> tuple[Experiment, list[str]]:
         experiment_id = data.experiment_id.strip()
         if not _SLUG.match(experiment_id):
@@ -454,6 +909,8 @@ class ExperimentService:
                 "An experiment needs a question. Without one it is a batch, and "
                 "calling it an experiment lends it authority it has not earned."
             )
+        if data.mode == ExperimentMode.subject_validation:
+            self._check_subject_validation(data)
         existing = self.session.exec(
             select(Experiment).where(Experiment.experiment_id == experiment_id)
         ).first()
@@ -468,7 +925,18 @@ class ExperimentService:
                     f"Condition '{condition['label']}' fixes unknown axis field(s): "
                     f"{', '.join(unknown)}. Valid: {', '.join(sorted(CONDITION_FIELDS))}."
                 )
-        warnings = validate_design(data.mode, conditions)
+        self._check_declared_variants(data)
+        # Objections about the *design*: they stay true for the life of the
+        # experiment, so they are persisted and read back beside the verdict.
+        # The warnings below them are about this moment (no cases yet, too few
+        # repetitions) and are answered by the verdict's own caveats later.
+        design_notes = validate_design(
+            data.mode, conditions, in_family=bool(data.family_id.strip())
+        )
+        design_notes.extend(
+            note.strip() for note in data.design_notes if note and note.strip()
+        )
+        warnings = list(design_notes)
         # The weakest case governs the caveat: an experiment whose SWE-bench
         # instance runs once is exploratory *for that case* however many times
         # the canaries repeat.
@@ -491,6 +959,7 @@ class ExperimentService:
             name=data.name or experiment_id,
             question=data.question.strip(),
             mode=data.mode,
+            subject=data.subject.strip(),
             case_ids=list(data.case_ids),
             prompt_variants=list(data.prompt_variants),
             repetitions=data.repetitions,
@@ -500,6 +969,8 @@ class ExperimentService:
                 if case_id in data.case_ids
             },
             suite_id=data.suite_id,
+            family_id=data.family_id.strip(),
+            design_notes=design_notes,
             notes=data.notes,
         )
         self.session.add(experiment)
@@ -528,6 +999,7 @@ class ExperimentService:
         "max_steps",
         "skills_disabled",
         "skills_extra",
+        "skills_invoke",
     )
 
     @staticmethod
@@ -589,6 +1061,12 @@ class ExperimentService:
                 "prompt_variant": config.prompt_variant,
                 "max_steps": config.max_steps,
                 "score_mode": config.score_mode,
+                # The skill axes are part of what ran: a relaunch that dropped
+                # them would be refused by the lock, and a subject validation
+                # carries its skill in the shared config, not in an arm.
+                "skills_disabled": list(config.skills_disabled),
+                "skills_extra": list(config.skills_extra),
+                "skills_invoke": list(config.skills_invoke),
             }
         return None
 
@@ -607,8 +1085,26 @@ class ExperimentService:
             raise ExperimentError(f"Experiment '{experiment_id}' has no cases.")
 
         runs_service = RunService(self.session, enqueue=self.enqueue)
+        # Which prompts each case actually declares. A design may name a variant
+        # a case does not define — the shared axis crosses every case with every
+        # variant, and a condition may fix a ``prompt_variant`` of its own — and
+        # the run would then be handed an empty prompt, silently: the prompt
+        # lookup falls back to "" for an unknown variant. That failure lands
+        # inside one arm and reads as that arm losing. Batch mode resolves this
+        # per case before persisting anything (ADR-0023); an experiment owes the
+        # same guarantee.
+        defined = runs_service._defined_variants(experiment.case_ids)
+        undefined: list[str] = []
+
+        self._refuse_tautological_cases(experiment.case_ids)
+
         configs: list[tuple[str, RunConfigCreate]] = []
         for case_id in experiment.case_ids:
+            available = defined.get(case_id)
+            if available is None:
+                raise ExperimentError(
+                    f"Unknown case '{case_id}'. Use GET /api/cases for the valid ids."
+                )
             for variant in experiment.prompt_variants or [base.prompt_variant]:
                 for condition in conditions:
                     payload = base.model_dump()
@@ -617,8 +1113,19 @@ class ExperimentService:
                     )
                     payload.update(condition.overrides)
                     config = RunConfigCreate(**payload)
+                    if config.prompt_variant not in available:
+                        undefined.append(
+                            f"case '{case_id}' / arm '{condition.label}' asks for "
+                            f"prompt variant '{config.prompt_variant}'"
+                        )
+                        continue
                     for _ in range(experiment.repetitions_for(case_id)):
                         configs.append((condition.label, config))
+
+        if undefined:
+            raise ExperimentError(_variant_refusal(undefined))
+        if not configs:
+            raise ExperimentError(f"Experiment '{experiment_id}' expands to no runs.")
 
         # One experiment, one measurement configuration. A second launch with a
         # different shared setup (another model, another budget) would file two
@@ -647,6 +1154,7 @@ class ExperimentService:
                 # time, inside one arm, which reads as a treatment effect.
                 tuple(sorted(config.skills_disabled)),
                 tuple(sorted(config.skills_extra)),
+                tuple(sorted(config.skills_invoke)),
             )
             if key in seen:
                 continue

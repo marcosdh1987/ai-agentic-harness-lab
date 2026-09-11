@@ -23,7 +23,22 @@ class Settings(BaseSettings):
     # the sibling runner container is created by the HOST daemon, so bind
     # sources must be host paths, not this container's /app.
     host_repo_root: str = ""
+    # Opt-in: a directory of the operator's own repositories, bind-mounted
+    # read-only so the lab can offer a folder picker instead of asking them to
+    # type an absolute path they cannot browse (ADR-0045). Two values because
+    # the container and the host see it at different paths, exactly like
+    # `repo_root` / `host_repo_root`. Empty host value means "not configured",
+    # and the picker stays off — the lab lists nothing it was not pointed at.
+    local_sources_root: str = ""
+    host_local_sources_root: str = ""
     docker_host_alias: str = "host.docker.internal"
+    # Network the *validation* lane gets while running an audited repository's
+    # own commands. `none` by default: that lane executes untrusted code and
+    # never calls a model, so it needs no egress. Provisioning and setup
+    # (`git clone`, `npm ci`, `uv sync`) are a different phase and keep the
+    # network. Set to `bridge` to restore the old behavior for a repository
+    # whose test suite genuinely reaches the network.
+    validation_network: str = "none"
     run_timeout_seconds: int = 7200
     # Kill a run that has produced no output for this long, even though its
     # total budget is nowhere near spent.
@@ -101,6 +116,15 @@ class Settings(BaseSettings):
         # derivation can read history without re-cloning per request. Disposable
         # by construction: deleting it costs one slower derivation.
         return self.repo_root / "data" / "target-mirrors"
+
+    @property
+    def checkouts_dir(self) -> Path:
+        # Where the operator clones a target repository with their own
+        # credentials (ADR-0042). Under the lab root on purpose: runner
+        # containers already bind-mount the root, so a clone here is visible to
+        # API, worker and runners without a new mount or a credential in a
+        # container.
+        return self.repo_root / "data" / "checkouts"
 
     @property
     def workspace_dir(self) -> Path:

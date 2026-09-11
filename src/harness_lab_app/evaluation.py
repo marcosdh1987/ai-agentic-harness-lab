@@ -73,6 +73,10 @@ class EvaluationContext:
     trajectory: dict[str, Any] | None = None
     files_expected: tuple[str, ...] = ()
     files_forbidden: tuple[str, ...] = ()
+    # The skills this run's experiment is about and this run could see:
+    # staged (`skills_extra`), asked for (`skills_invoke`), or removed in a
+    # sibling arm. Empty for a run no skill question is being asked of.
+    skills_under_test: tuple[str, ...] = ()
 
 
 def _fold(text: str) -> str:
@@ -120,14 +124,18 @@ class DeterministicEvaluator:
                     reason=objective.get("summary", ""),
                 )
             )
-        if checks:
-            passed = sum(1 for check in checks if check.get("passed"))
+        # Only checks that actually produced a verdict. A timed-out or killed
+        # command measured the harness, not the code, and averaging it in as a
+        # zero is infrastructure entering the corpus as capability (ADR-0046).
+        conclusive = [check for check in checks if check.get("conclusive") is not False]
+        if conclusive:
+            passed = sum(1 for check in conclusive if check.get("passed"))
+            reason = f"{passed}/{len(conclusive)} checks passed"
+            skipped = len(checks) - len(conclusive)
+            if skipped:
+                reason += f" ({skipped} inconclusive, excluded)"
             scores.append(
-                ScoreValue(
-                    "test_pass_rate",
-                    passed / len(checks),
-                    reason=f"{passed}/{len(checks)} checks passed",
-                )
+                ScoreValue("test_pass_rate", passed / len(conclusive), reason=reason)
             )
 
         touched = changed_files(context.diff_text)
@@ -162,6 +170,30 @@ class DeterministicEvaluator:
         return scores
 
 
+class RubricJudgeEvaluator:
+    """The judge's rubric level, as a score row rather than a run field only.
+
+    Until now the judge's number lived in ``Validation.subjective`` and
+    ``Run.score`` and never reached the experiment summary — so two equivalent
+    implementations scored 10 and 2 on identical evidence, and nothing on the
+    experiment page could show it. Recorded as JUDGEMENT provenance: it rides
+    in the deltas table, never in the success rate.
+    """
+
+    id = "llm_judge"
+
+    def evaluate(self, context: EvaluationContext) -> list[ScoreValue]:
+        validation = context.validation or {}
+        subjective = validation.get("subjective") or {}
+        if subjective.get("score_source") != "llm_judge":
+            return []
+        score = subjective.get("functional_score")
+        if score is None:
+            return []
+        notes = str(subjective.get("notes") or "")
+        return [ScoreValue("rubric_score", float(score), reason=notes[:400])]
+
+
 class EfficiencyEvaluator:
     """Level 2 — what it cost to get there."""
 
@@ -174,6 +206,8 @@ class EfficiencyEvaluator:
         scores: list[ScoreValue] = []
         for name, value in (
             ("total_tokens", cost.get("total_tokens")),
+            ("billed_tokens", cost.get("billed_tokens")),
+            ("cache_read_tokens", cost.get("cache_read_tokens")),
             ("cost_usd", cost.get("cost_usd")),
             ("wall_time_minutes", cost.get("time_minutes")),
             ("agent_steps", effort.get("steps")),
@@ -268,6 +302,53 @@ class HarnessBehaviorEvaluator:
         return "unclear"
 
 
+class SkillUsageEvaluator:
+    """Level 4 — were the skills under test actually opened? (ADR-0041)
+
+    An **observation**, parsed from the step record: a ``Skill`` tool call
+    naming the skill, or any read of its ``SKILL.md``. It exists because a
+    with-skills arm whose agent never touched the skill compares a menu, not a
+    treatment — and nothing else in the pipeline can tell the two apart.
+
+    Emits nothing when the run is not about any skill, and nothing when no
+    trajectory was recorded: "not observed" must not be stored as "not used".
+    """
+
+    id = "skill_usage"
+
+    def evaluate(self, context: EvaluationContext) -> list[ScoreValue]:
+        under_test = list(context.skills_under_test)
+        if not under_test or context.trajectory is None:
+            return []
+        counts: dict[str, int] = dict(context.trajectory.get("skill_invocations") or {})
+        invoked = [name for name in under_test if counts.get(name, 0) > 0]
+        total = sum(counts.get(name, 0) for name in under_test)
+        detail = {
+            "skills_under_test": under_test,
+            "invoked": invoked,
+            "source": context.trajectory.get("source", ""),
+        }
+        return [
+            ScoreValue(
+                "skill_invoked",
+                len(invoked) / len(under_test),
+                reason=(
+                    f"{', '.join(invoked) if invoked else 'none'} of "
+                    f"{', '.join(under_test)} invoked (Skill call or SKILL.md "
+                    "read in the step record)"
+                ),
+                provenance_detail=detail,
+            ),
+            ScoreValue(
+                "skill_invocations",
+                float(total),
+                reason=", ".join(f"{name} x{counts[name]}" for name in invoked)
+                or "none",
+                provenance_detail=detail,
+            ),
+        ]
+
+
 class DeepEvalEvaluator:
     """Level 3 — trajectory metrics, computed by DeepEval when it is installed.
 
@@ -323,17 +404,36 @@ PROFILES: dict[str, tuple[str, ...]] = {
     # (no library, no judge, no trajectory → no score, never a zero), so a lab
     # without DeepEval scores exactly as it did before. Set DEEPEVAL_MODEL=off
     # to keep the default deterministic-plus-audit only.
-    "default": ("deterministic", "efficiency", "harness_audit", "deepeval"),
-    "with_trajectory": ("deterministic", "efficiency", "harness_audit", "deepeval"),
+    # `skill_usage` is an observation, so it rides in every profile that
+    # reads the record at all: a skill comparison without it cannot tell a
+    # treatment from a menu (ADR-0041).
+    "default": (
+        "deterministic",
+        "llm_judge",
+        "efficiency",
+        "skill_usage",
+        "harness_audit",
+        "deepeval",
+    ),
+    "with_trajectory": (
+        "deterministic",
+        "llm_judge",
+        "efficiency",
+        "skill_usage",
+        "harness_audit",
+        "deepeval",
+    ),
     "outcome_only": ("deterministic",),
-    "no_judgement": ("deterministic", "efficiency"),
+    "no_judgement": ("deterministic", "efficiency", "skill_usage"),
 }
 
 EVALUATORS = {
     evaluator.id: evaluator
     for evaluator in (
         DeterministicEvaluator(),
+        RubricJudgeEvaluator(),
         EfficiencyEvaluator(),
+        SkillUsageEvaluator(),
         HarnessBehaviorEvaluator(),
         DeepEvalEvaluator(),
     )

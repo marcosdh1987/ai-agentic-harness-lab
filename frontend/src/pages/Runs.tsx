@@ -93,6 +93,8 @@ export function Runs({
   const [disabledSkills, setDisabledSkills] = useState<Set<string>>(new Set());
   const [stagedSkills, setStagedSkills] = useState<StagedSkillRecord[]>([]);
   const [extraSkills, setExtraSkills] = useState<Set<string>>(new Set());
+  // Off = available only; on = the agent is told to invoke them every step.
+  const [invokeExtra, setInvokeExtra] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [reloadingModels, setReloadingModels] = useState(false);
   // Target repository (ADR-0029). Empty = the run works in the lab's own
@@ -387,6 +389,7 @@ export function Runs({
     dryRun,
     disabledSkills,
     extraSkills,
+    invokeExtra,
     targetRepoId,
     targetRef,
     harnessSource
@@ -410,6 +413,7 @@ export function Runs({
     dry_run: dryRun,
     skills_disabled: [...disabledSkills].sort(),
     skills_extra: [...extraSkills].sort(),
+    skills_invoke: invokeExtra ? [...extraSkills].sort() : [],
     target_repo_id: targetRepoId,
     target_ref: targetRef.trim(),
     harness_source: harnessSource
@@ -493,6 +497,7 @@ export function Runs({
           dry_run: dryRun,
           skills_disabled: [...disabledSkills].sort(),
           skills_extra: [...extraSkills].sort(),
+          skills_invoke: invokeExtra ? [...extraSkills].sort() : [],
           target_repo_ids: batchTargetAxis,
           target_ref: targetRef.trim(),
           harness_sources: batchHarnessSourceAxis
@@ -541,9 +546,10 @@ export function Runs({
         <ol className="skills-howto">
           <li>Pick a <strong>Case</strong> (the task), then a <strong>Prompt
             variant</strong> and a <strong>Harness</strong>.</li>
-          <li><strong>Executor / Planner model</strong> come live from your LiteLLM
-            gateway. Added a model there? Run <code>make sync-gateway-models</code>
-            and it shows up here.</li>
+          <li><strong>Executor / Planner model</strong> — Gateway models come live
+            from LiteLLM (press Reload here, or Refresh from gateway in Settings);
+            Direct models are read off your LM Studio / Ollama host; claude and codex
+            use their native ids.</li>
           <li>Optionally toggle <strong>Skills</strong> to A/B the harness for this
             run only (a distinct arm).</li>
           <li><strong>Create run</strong>, watch it stream, then score it (SWE-bench
@@ -681,11 +687,14 @@ export function Runs({
                   </small>
                 </fieldset>
               ) : null}
-              {targets.length > 0 ? (
-                <fieldset className="batch-axis">
+              <fieldset className="batch-axis">
                   <legend>Harness ({batchHarnessSources.size})</legend>
                   <div className="batch-options">
-                    {(["lab_root", "native", "injected"] as HarnessSource[]).map(
+                    {(
+                      targets.length > 0
+                        ? (["lab_root", "native", "injected"] as HarnessSource[])
+                        : (["lab_root", "bare"] as HarnessSource[])
+                    ).map(
                       (source) => (
                         <label className="skill-checkbox" key={source}>
                           <input
@@ -703,12 +712,22 @@ export function Runs({
                     )}
                   </div>
                   <small className="muted">
-                    Selecting <code>native</code> and <code>injected</code> together on
-                    one repository is the harness A/B: same repo, same case, same
-                    model, harness varied. Both require a target repository.
+                    {targets.length > 0 ? (
+                      <>
+                        Selecting <code>native</code> and <code>injected</code>{" "}
+                        together on one repository is the harness A/B: same repo, same
+                        case, same model, harness varied. Both require a target
+                        repository.
+                      </>
+                    ) : (
+                      <>
+                        Selecting <code>bare</code> and <code>lab_root</code> together
+                        is the bare-versus-governed A/B: one arm sees the prompt and
+                        nothing else, the other sees the whole harness.
+                      </>
+                    )}
                   </small>
                 </fieldset>
-              ) : null}
               <label>
                 <span>Repetitions</span>
                 <input
@@ -833,7 +852,9 @@ export function Runs({
               <option value="manual">Manual</option>
             </select>
             <small className="muted">
-              Interactive is CLI-only; web runs finish in awaiting_manual_score and are scored from run detail.
+              Interactive scoring is CLI-only. A case with a validation command scores
+              itself, a case with a rubric is LLM-judged; otherwise the run stops in
+              awaiting_manual_score and you score it from the run page.
             </small>
           </label>
           <label>
@@ -873,7 +894,7 @@ export function Runs({
                 <small className="muted">
                   {batchMode
                     ? "Varied as a batch axis below."
-                    : "The repository the agent works in. Cloned fresh per run."}
+                    : "The repository the agent works in. Provisioned from the pinned local checkout for each run."}
                 </small>
               </label>
               {targetRepoId !== "" || batchTargets.size > 0 ? (
@@ -917,9 +938,9 @@ export function Runs({
                   </small>
                 </label>
               ) : null}
-              {targetRepoId !== "" && !batchMode ? (
+              {!batchMode ? (
                 <label>
-                  <span>Harness</span>
+                  <span>Governance source</span>
                   <select
                     onChange={(event) =>
                       setHarnessSource(event.target.value as HarnessSource)
@@ -927,15 +948,29 @@ export function Runs({
                     value={harnessSource}
                   >
                     <option value="lab_root">Lab harness (from the lab repo)</option>
-                    <option value="native">Native — the target's own conventions</option>
-                    <option value="injected">Injected — our harness inside the target</option>
+                    {/* The in-target pair needs a repository to be inside;
+                        `bare` needs the absence of one (ADR-0049). */}
+                    {targetRepoId === "" ? (
+                      <option value="bare">Bare — nothing, not even governance</option>
+                    ) : (
+                      <>
+                        <option value="native">
+                          Native — the target's own conventions
+                        </option>
+                        <option value="injected">
+                          Injected — our harness inside the target
+                        </option>
+                      </>
+                    )}
                   </select>
                   <small className="muted">
                     {harnessSource === "lab_root"
-                      ? "The agent works from the lab repo and edits the target from outside."
-                      : harnessSource === "native"
-                        ? "Control arm: the agent works inside the repo with only what that repo ships."
-                        : "Treatment arm: the agent works inside the repo with our harness projected into it."}
+                      ? "The agent works from the lab repo, so it sees CLAUDE.md, the hooks, the subagents and .github/."
+                      : harnessSource === "bare"
+                        ? "Control arm: an empty workspace with the lab's governance masked in the container — the agent sees the prompt and nothing else. Needs the docker backend."
+                        : harnessSource === "native"
+                          ? "Control arm: the agent works inside the repo with only what that repo ships."
+                          : "Treatment arm: the agent works inside the repo with our harness projected into it."}
                   </small>
                 </label>
               ) : null}
@@ -1008,6 +1043,18 @@ export function Runs({
                         </label>
                       ))}
                     </div>
+                    <label className="checkbox">
+                      <input
+                        checked={invokeExtra}
+                        disabled={extraSkills.size === 0}
+                        onChange={(event) => setInvokeExtra(event.target.checked)}
+                        type="checkbox"
+                      />
+                      <span>
+                        Ask the agent to use them
+                        <small className="muted"> at the start of every step</small>
+                      </span>
+                    </label>
                   </>
                 ) : null}
               </>
@@ -1110,8 +1157,9 @@ export function Runs({
             </p>
           ) : null}
           <p className="muted">
-            Web flow always uses manual scoring to avoid worker blocking; submit score in run detail when state is
-            awaiting_manual_score.
+            Interactive scoring is CLI-only. A case with a validation command scores
+            itself, a case with a rubric is LLM-judged; otherwise the run stops in
+            awaiting_manual_score and you score it from the run page.
           </p>
         </div>
       </section>

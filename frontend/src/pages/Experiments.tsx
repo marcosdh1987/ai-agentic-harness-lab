@@ -5,6 +5,7 @@ import { api } from "../api";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorBanner } from "../components/ErrorBanner";
 import { HelpPanel } from "../components/HelpPanel";
+import { Markdown } from "../components/Markdown";
 import { ModelPicker } from "../components/ModelPicker";
 import { Spinner } from "../components/Spinner";
 import {
@@ -22,21 +23,26 @@ import {
 } from "../harnesses";
 import type {
   AggregateRecord,
+  CaseOutcomeCell,
   ConditionSummary,
   DeltaRecord,
+  ExperimentAuditRecord,
   ExperimentRecord,
   ExperimentSummary,
   LaunchConfigSummary,
   ModelOption,
   RunConfigPayload,
   RunValidationResult,
-  VerdictBlock
+  ValidityBlock,
+  VerdictBlock,
+  VerdictHighlight
 } from "../types";
 
 const MODE_LABEL: Record<string, string> = {
   harness_evaluation: "Harness evaluation",
   cross_repo: "Cross-repo",
-  discovery: "Discovery"
+  discovery: "Discovery",
+  subject_validation: "Subject validation"
 };
 
 /** What each mode does and does not license — shown, not assumed known. */
@@ -46,7 +52,9 @@ const MODE_CAVEAT: Record<string, string> = {
   cross_repo:
     "Harness and model held fixed; the repository varies. Read per repository: scores from different codebases are not equivalent conditions and must never be pooled.",
   discovery:
-    "No control. Exploratory evidence, not experimental evidence — this mode describes, it does not demonstrate."
+    "No control. Exploratory evidence, not experimental evidence — this mode describes, it does not demonstrate.",
+  subject_validation:
+    "No control, nothing ablated. Reports how reliably the declared subject passed under each harness/model arm — one rate per arm, never pooled, and nothing about the harness."
 };
 
 function formatNumber(value: number | null | undefined, digits = 3): string {
@@ -124,8 +132,38 @@ const MOVEMENT_CLASS: Record<string, string> = {
  * lab does not run hypothesis tests and must not sound as though it does.
  */
 /** A rate reads as a percentage, a cost as money, everything else as a number. */
-function formatHighlight(metric: string, value: number | null): string {
-  if (value === null) {
+/**
+ * ▲ / ▼ with a good/bad colour, read from the registry direction the backend
+ * attaches. "10,712 → 7,223 tokens" is an improvement for a cost and a
+ * regression for a rate; without this the reader supplied the direction.
+ */
+function highlightMove(highlight: VerdictHighlight) {
+  const { control, treatment, direction } = highlight;
+  if (
+    control === null ||
+    control === undefined ||
+    treatment === null ||
+    treatment === undefined ||
+    !direction ||
+    direction === "neutral" ||
+    control === treatment
+  ) {
+    return null;
+  }
+  const up = treatment > control;
+  const better = direction === "higher_is_better" ? up : !up;
+  return (
+    <span
+      className={`highlight-move ${better ? "highlight-move--better" : "highlight-move--worse"}`}
+      title={better ? "better" : "worse"}
+    >
+      {up ? "▲" : "▼"}
+    </span>
+  );
+}
+
+function formatHighlight(metric: string, value: number | null | undefined): string {
+  if (value === null || value === undefined) {
     return "—";
   }
   if (metric.endsWith("_rate") || metric.endsWith("_ratio")) {
@@ -137,18 +175,122 @@ function formatHighlight(metric: string, value: number | null): string {
   return formatNumber(value);
 }
 
+/**
+ * The per-arm, per-case grid for a mode with no control: counts per cell, with
+ * the repetitions kept. There is no movement column because there is nothing
+ * to move relative to.
+ */
+function CaseOutcomeGrid({
+  outcomes
+}: {
+  outcomes: Record<string, Record<string, CaseOutcomeCell>>;
+}) {
+  const labels = Object.keys(outcomes);
+  const caseIds = [
+    ...new Set(labels.flatMap((label) => Object.keys(outcomes[label] ?? {})))
+  ];
+  if (caseIds.length === 0) {
+    return null;
+  }
+  return (
+    <div className="card">
+      <h3>Per case, per arm</h3>
+      <p className="muted small">
+        Passed of scored, for every cell. Each arm is read down its own column —
+        the columns are not combined.
+      </p>
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th>Case</th>
+            {labels.map((label) => (
+              <th key={label}>{label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {caseIds.map((caseId) => (
+            <tr key={caseId}>
+              <td className="mono small">{caseId}</td>
+              {labels.map((label) => {
+                const cell = outcomes[label]?.[caseId];
+                return (
+                  <td key={label}>
+                    {!cell || cell.scored_runs === 0
+                      ? "—"
+                      : `${cell.successes} of ${cell.scored_runs}`}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+const VALIDITY_TITLE: Record<string, string> = {
+  treatment_not_activated: "The treatment never happened",
+  infrastructure_failures: "These runs measured the connection",
+  no_headroom: "No headroom to detect an improvement",
+  mixed_treatment: "The arm mixes treated and untreated runs",
+  design_objection: "The design was objected to when it was created"
+};
+
+/**
+ * Read before the verdict (ADR-0046).
+ *
+ * Deliberately its own card above the verdict rather than another line in
+ * `verdict.caveats`: a caveat printed under a confident headline is exactly
+ * how this lab published three comparisons that could not have measured what
+ * they named.
+ */
+function ValidityBanner({ validity }: { validity: ValidityBlock }) {
+  if (validity.status === "valid" || validity.issues.length === 0) return null;
+  const invalid = validity.status === "invalid";
+  return (
+    <div className={`card validity ${invalid ? "validity--invalid" : "validity--degraded"}`}>
+      <div className="row space-between">
+        <p className="verdict-kicker">
+          {invalid ? "Comparison not valid" : "Read with care"}
+        </p>
+        <span className={`badge ${invalid ? "error" : "warn"}`}>{validity.status}</span>
+      </div>
+      <ul className="validity-issues">
+        {validity.issues.map((issue) => (
+          <li key={`${issue.code}:${issue.arm ?? ""}:${issue.detail}`}>
+            <strong>
+              <IconAlert size={14} /> {VALIDITY_TITLE[issue.code] ?? issue.code}
+            </strong>
+            <p>{issue.detail}</p>
+            {issue.remedy ? <p className="muted">{issue.remedy}</p> : null}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function VerdictCard({ verdict }: { verdict: VerdictBlock }) {
-  const tone = verdict.headline.toLowerCase();
-  const Trend = tone.includes("improvement")
-    ? IconTrendUp
-    : tone.includes("regression")
-      ? IconTrendDown
-      : IconMinus;
-  const toneClass = tone.includes("improvement")
-    ? "verdict--better"
-    : tone.includes("regression")
-      ? "verdict--worse"
-      : "verdict--neutral";
+  // `tone` is authoritative since ADR-0046; the headline sniff below stays one
+  // release longer so a summary from an older backend still renders in colour.
+  const headline = verdict.headline.toLowerCase();
+  const tone =
+    verdict.tone ??
+    (headline.includes("improvement")
+      ? "better"
+      : headline.includes("regression")
+        ? "worse"
+        : "neutral");
+  const Trend =
+    tone === "better" ? IconTrendUp : tone === "worse" ? IconTrendDown : IconMinus;
+  const toneClass =
+    tone === "better"
+      ? "verdict--better"
+      : tone === "worse"
+        ? "verdict--worse"
+        : "verdict--neutral";
 
   return (
     <div className={`card verdict ${toneClass}`}>
@@ -160,6 +302,10 @@ function VerdictCard({ verdict }: { verdict: VerdictBlock }) {
           <p className="verdict-kicker">Verdict</p>
           <h2>{verdict.headline}</h2>
           <p className="muted">{verdict.claim}</p>
+          {verdict.observed ? (
+            /* The measurement is demoted, never withheld (ADR-0041). */
+            <p className="muted verdict-observed">Measured: {verdict.observed}</p>
+          ) : null}
         </div>
         <span className="badge neutral verdict-strength">{verdict.strength}</span>
       </div>
@@ -167,11 +313,29 @@ function VerdictCard({ verdict }: { verdict: VerdictBlock }) {
       {verdict.highlights.length > 0 ? (
         <div className="verdict-highlights">
           {verdict.highlights.map((highlight) => (
-            <div className="verdict-highlight" key={highlight.metric}>
+            <div
+              className="verdict-highlight"
+              key={`${highlight.label}:${highlight.metric}`}
+            >
               <span>{highlight.label}</span>
               <strong>
-                {formatHighlight(highlight.metric, highlight.control)} →{" "}
-                {formatHighlight(highlight.metric, highlight.treatment)}
+                {highlight.scored_runs === undefined ? (
+                  <>
+                    {formatHighlight(highlight.metric, highlight.control)} →{" "}
+                    {formatHighlight(highlight.metric, highlight.treatment)}
+                    {highlightMove(highlight)}
+                  </>
+                ) : (
+                  /* One arm on its own: a rate with nothing to compare it
+                     against, so it is shown with the counts behind it rather
+                     than as an arrow between two numbers. */
+                  <>
+                    {formatHighlight(highlight.metric, highlight.rate)}{" "}
+                    <span className="muted">
+                      ({highlight.successes} of {highlight.scored_runs})
+                    </span>
+                  </>
+                )}
               </strong>
             </div>
           ))}
@@ -460,7 +624,12 @@ function LaunchPanel({
               score_mode: "manual",
               max_steps: locked.max_steps,
               resume: false,
-              dry_run: false
+              dry_run: false,
+              // Dropping these turns a subject-validation relaunch into a
+              // config mismatch the backend refuses.
+              skills_disabled: locked.skills_disabled ?? [],
+              skills_extra: locked.skills_extra ?? [],
+              skills_invoke: locked.skills_invoke ?? []
             }
           : buildConfig(caseIds[0] ?? "")
       );
@@ -509,6 +678,24 @@ function LaunchPanel({
             <span>Step budget</span>
             <strong>{locked.max_steps}</strong>
           </div>
+          {locked.skills_extra?.length ? (
+            <div>
+              <span>Skills added</span>
+              <strong>{locked.skills_extra.join(", ")}</strong>
+            </div>
+          ) : null}
+          {locked.skills_invoke?.length ? (
+            <div>
+              <span>Skills asked for</span>
+              <strong>{locked.skills_invoke.join(", ")}</strong>
+            </div>
+          ) : null}
+          {locked.skills_disabled?.length ? (
+            <div>
+              <span>Skills removed</span>
+              <strong>{locked.skills_disabled.join(", ")}</strong>
+            </div>
+          ) : null}
         </div>
         {error ? (
           <ErrorBanner message={error} onDismiss={() => setError(null)} />
@@ -537,12 +724,9 @@ function LaunchPanel({
       <div className="card">
         <h3>Run this experiment</h3>
         <p className="callout callout--warning">
-          This experiment has no cases, so there is nothing to launch. It was
-          created before any case was attached — re-run the flow that created it
-          (for a repository audit: accept at least one derived case, then create
-          the discovery experiment again) or create a new experiment from{" "}
-          <Link to="/evaluate/new">New evaluation</Link>. Experiments are
-          immutable once declared, so this draft simply stays inert.
+          This experiment has no cases, so there is nothing to launch. Create a
+          new one from <Link to="/evaluate/new">New evaluation</Link> or from the
+          repository&apos;s workbench; experiments are immutable once declared.
         </p>
       </div>
     );
@@ -702,6 +886,123 @@ function LaunchPanel({
   );
 }
 
+/**
+ * The LLM reading of a finished experiment (ADR-0053).
+ *
+ * The cards above already hold every fact; this is the same evidence read
+ * back as prose — what was compared, what came out, what each arm actually
+ * used, whether the comparison can be trusted. Disabled until every run has
+ * stopped: a reading of half an experiment would be persisted as though the
+ * comparison existed.
+ */
+function ExperimentAuditPanel({
+  experimentId,
+  finished
+}: {
+  experimentId: string;
+  finished: boolean;
+}) {
+  const [audit, setAudit] = useState<ExperimentAuditRecord | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showEvidence, setShowEvidence] = useState(false);
+
+  useEffect(() => {
+    setAudit(null);
+    setError(null);
+    api
+      .getExperimentAudit(experimentId)
+      .then(setAudit)
+      .catch(() => setAudit(null));
+  }, [experimentId]);
+
+  // Poll while the worker is writing; the call is one gateway request, so a
+  // few seconds between polls is enough.
+  useEffect(() => {
+    if (audit?.status !== "running") {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      api
+        .getExperimentAudit(experimentId)
+        .then(setAudit)
+        .catch(() => undefined);
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [audit?.status, experimentId]);
+
+  const handleRun = () => {
+    setPending(true);
+    setError(null);
+    api
+      .runExperimentAudit(experimentId)
+      .then(() => api.getExperimentAudit(experimentId))
+      .then(setAudit)
+      .catch((runError: unknown) =>
+        setError(runError instanceof Error ? runError.message : "Unable to audit")
+      )
+      .finally(() => setPending(false));
+  };
+
+  return (
+    <div className="card">
+      <div className="row space-between">
+        <h3>Reading</h3>
+        <div className="button-row">
+          {audit ? <span className="badge">{audit.status}</span> : null}
+          <button
+            disabled={!finished || pending || audit?.status === "running"}
+            onClick={handleRun}
+            title={
+              finished
+                ? "An LLM reads the summary's evidence and writes what was compared, what came out, what each arm used, and whether to trust it."
+                : "Available once every run has stopped."
+            }
+            type="button"
+          >
+            {audit?.status === "running"
+              ? "Reading…"
+              : audit?.status === "done"
+                ? "Read again"
+                : "Read this experiment"}
+          </button>
+        </div>
+      </div>
+      {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {audit === null ? (
+        <p className="muted">
+          {finished
+            ? "No reading yet. Ask for one to get the verdict, the result per arm, what each arm read and invoked, and why the comparison can or cannot be trusted — in plain language."
+            : "The reading becomes available once every run has stopped."}
+        </p>
+      ) : audit.status === "running" ? (
+        <p className="muted">Reading with {audit.auditor_model || "the default model"}…</p>
+      ) : audit.status === "failed" ? (
+        <ErrorBanner message={audit.error ?? "The reading failed"} />
+      ) : (
+        <>
+          <Markdown>{audit.markdown}</Markdown>
+          <p className="muted small">
+            {audit.auditor_model} · {new Date(audit.updated_at).toLocaleString()} ·{" "}
+            <button
+              className="link"
+              onClick={() => setShowEvidence((value) => !value)}
+              type="button"
+            >
+              {showEvidence ? "hide the evidence it was given" : "show the evidence it was given"}
+            </button>
+          </p>
+          {showEvidence && audit.evidence_json ? (
+            <pre className="evidence-json">
+              {JSON.stringify(audit.evidence_json, null, 1)}
+            </pre>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
 function ExperimentDetail({
   summary,
   record,
@@ -718,7 +1019,12 @@ function ExperimentDetail({
   const runCount = record?.run_count ?? 0;
   return (
     <div className="stack">
+      {summary.validity ? <ValidityBanner validity={summary.validity} /> : null}
       {summary.verdict ? <VerdictCard verdict={summary.verdict} /> : null}
+      <ExperimentAuditPanel
+        experimentId={summary.experiment_id}
+        finished={record?.finished ?? false}
+      />
       <div className="card">
         <div className="row space-between">
           <h2>{summary.question}</h2>
@@ -752,6 +1058,11 @@ function ExperimentDetail({
           {summary.repetitions === 1 ? "" : "s"} per arm
         </p>
         <p className="muted small">{MODE_CAVEAT[summary.mode]}</p>
+        {summary.subject ? (
+          <p className="muted">
+            Subject under test: <strong>{summary.subject}</strong>
+          </p>
+        ) : null}
         {summary.conditions.flatMap((condition) => condition.warnings).length > 0 && (
           <ul className="warning-list">
             {[
@@ -771,6 +1082,10 @@ function ExperimentDetail({
       </div>
 
       <LaunchPanel experimentId={summary.experiment_id} onLaunched={onLaunched} />
+
+      {summary.mode === "subject_validation" && summary.case_outcomes ? (
+        <CaseOutcomeGrid outcomes={summary.case_outcomes} />
+      ) : null}
 
       {summary.comparisons.map((comparison) => (
         <div className="card" key={`${comparison.control}-${comparison.treatment}`}>
@@ -860,6 +1175,9 @@ function ExperimentDetail({
 export function Experiments() {
   const [params, setParams] = useSearchParams();
   const [experiments, setExperiments] = useState<ExperimentRecord[]>([]);
+  // A ladder is read as one family (ADR-0051): `?family=<id>` narrows the
+  // list to its rungs, in the order they were created.
+  const familyFilter = params.get("family") ?? "";
   // Deep-linkable: the wizard lands here on the experiment it just created.
   const [selected, setSelected] = useState<string | null>(params.get("experiment"));
   const [summary, setSummary] = useState<ExperimentSummary | null>(null);
@@ -949,7 +1267,8 @@ export function Experiments() {
       <HelpPanel title="What an experiment is, and what a batch is not">
         <p>
           An experiment states its <strong>question</strong> before anything runs, and
-          declares its arms up front — one control, the rest treatments. The lab
+          declares its arms up front — a control and its treatments, or, for subject
+          validation, peer arms with no control. The lab
           checks the design against the mode and refuses one that cannot answer the
           question it claims to: a comparison that varies both the harness and the
           repository produces a number that cannot be attributed to either.
@@ -964,7 +1283,22 @@ export function Experiments() {
 
       <div className="card">
         <div className="row space-between">
-          <h2>All experiments</h2>
+          <h2>
+            {familyFilter ? (
+              <>
+                Family <code>{familyFilter}</code>{" "}
+                <button
+                  className="link"
+                  onClick={() => setParams({})}
+                  type="button"
+                >
+                  show all
+                </button>
+              </>
+            ) : (
+              "All experiments"
+            )}
+          </h2>
           {experiments.some((item) => item.status === "abandoned") ? (
             <label className="row gap">
               <input
@@ -996,7 +1330,7 @@ export function Experiments() {
                 </Link>
               </div>
             }
-            description="Start by choosing what you want to learn. An experiment needs a question, a mode, cases and at least one control condition."
+            description="Start by choosing what you want to learn. An experiment needs a question, a mode, cases and at least one arm."
             title="No experiments yet."
           />
         ) : (
@@ -1018,11 +1352,30 @@ export function Experiments() {
                   (experiment) =>
                     showAbandoned || experiment.status !== "abandoned"
                 )
+                .filter(
+                  (experiment) =>
+                    !familyFilter || experiment.family_id === familyFilter
+                )
                 .map((experiment) => (
                 <tr key={experiment.experiment_id}>
                   <td>
                     <strong>{experiment.experiment_id}</strong>
-                    <div className="muted small">{experiment.status}</div>
+                    <div className="muted small">
+                      {experiment.status}
+                      {experiment.family_id && !familyFilter ? (
+                        <>
+                          {" · "}
+                          <button
+                            className="link"
+                            onClick={() => setParams({ family: experiment.family_id ?? "" })}
+                            title="Read this experiment with the rest of its ladder"
+                            type="button"
+                          >
+                            family {experiment.family_id}
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
                   </td>
                   <td className="small">{experiment.question}</td>
                   <td className="small">
@@ -1032,9 +1385,11 @@ export function Experiments() {
                   <td>{experiment.run_count ?? "—"}</td>
                   <td>
                     {experiment.repetitions}
-                    {experiment.repetitions < 5 && (
+                    {experiment.repetitions < 2 ? (
                       <div className="muted small">exploratory</div>
-                    )}
+                    ) : experiment.repetitions < 5 ? (
+                      <div className="muted small">judgement</div>
+                    ) : null}
                   </td>
                   <td>
                     <button

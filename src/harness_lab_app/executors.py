@@ -18,10 +18,12 @@ import threading
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Protocol
 
+from harness_lab_app import governance_paths
 from harness_lab_app.config import get_settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from pathlib import Path
 
 _LOCALHOST_RE = re.compile(r"\blocalhost\b|\b127\.0\.0\.1\b")
 
@@ -33,6 +35,9 @@ _HOST_URL_ENV_VARS = (
     "OLLAMA_BASE_URL",
     "LANGFUSE_HOST",
     "MLFLOW_TRACKING_URI",
+    # Claude Code's gateway base, carried in .claude/settings.local.json rather
+    # than .env — see `claude_settings_env`.
+    "ANTHROPIC_BASE_URL",
 )
 
 
@@ -74,9 +79,182 @@ def runner_skill_masks(mount_root: str = "/app") -> dict[str, str]:
     return {f"{root}/{directory}": "" for directory in RUNNER_MASKED_SKILL_DIRS}
 
 
+# The lab's governance surface, and how much of it a run's condition hides
+# (ADR-0049).
+#
+# `native`, `injected` and `bare` all run the agent from `workspace/<run_id>/`,
+# which lives *under* the repo root that is bind-mounted whole at /app. Claude
+# Code does not load `.claude/` from an ancestor directory — two archived native
+# runs prove it: their `system/init` lists only the built-in agents and no lab
+# slash commands, and no SessionStart hook fired. But it *does* load `/app/.mcp.json`
+# (both runs came up with the lab's context7 and git servers and had no
+# `.mcp.json` of their own), and its memory lookup collects CLAUDE.md from every
+# ancestor. So "the agent's cwd is elsewhere" was never the whole isolation.
+#
+# Masking with empty tmpfs (directories) and read-only empty-file binds (files)
+# rather than deleting anything: the host tree is the source of truth for the
+# tools and for `make sync-skills`, and a run must never mutate it. It is also
+# the only lever that exists — no Claude Code flag turns off ancestor CLAUDE.md
+# lookup — and it is tool-agnostic, which a per-CLI flag would not be.
+#
+# Three levels, because "hide the harness" means different things:
+GOVERNANCE_MASK_NONE = "none"  # lab_root: the lab's harness IS the treatment
+GOVERNANCE_MASK_ANCESTORS = "ancestors"  # native/injected: hide the lab, keep .github
+GOVERNANCE_MASK_ALL = "all"  # bare: hide everything
+
+# Directories an AI tool auto-loads. Masked at every level above `none`.
+#
+# The bare-root entries (`skills`, `hooks`) and the alternative ADR roots come
+# from `governance_paths`, which is also what `governance._GLOBS` counts as the
+# reading surface. A tripwire in `test_executors.py` asserts the two agree: a
+# document the surface counts but the mask misses is a document a `bare` run
+# can read, and the arm that exists to see nothing would see something. These
+# paths address the *lab's* tree at `/app`; a target repository's own root
+# `skills/` lives under `/app/workspace/<run_id>/` and is never masked.
+RUNNER_GOVERNANCE_DIRS = (
+    ".claude",
+    ".agents",
+    ".opencode",
+    ".codex",
+    "memory",
+    *(root.rstrip("/") for root in governance_paths.BARE_SKILL_ROOTS),
+    *(root.rstrip("/") for root in governance_paths.BARE_HOOK_ROOTS),
+    *(root.rstrip("/") for root in governance_paths.ADR_ROOTS),
+)
+
+# Governed *source* directories: nothing auto-loads them, but `bench_run.py`
+# reads them to build an in-target harness — `build_effective_skills` discovers
+# from `.github/skills`, and `inject_harness`/`add_skills_to_native` project
+# from `.github/skills`, `.github/agents` and the registry's governance files.
+# Masking them for `native`/`injected` would make an injected arm project
+# nothing and turn `--disable-skill X` into "unknown skill". Only `bare`, which
+# projects nothing and stages nothing, can afford to lose them.
+RUNNER_GOVERNED_SOURCE_DIRS = (".github",)
+
+# Single files an AI tool auto-loads. Mirrors `governance._SINGLE_FILES` plus
+# the two the lab itself writes; a test asserts the two lists stay aligned.
+#
+# `opencode.json` is deliberately absent: it is routing (the gateway provider
+# block and per-agent models), not governance. Its governance payload is the
+# `instructions` list, and those three files are masked here. Masking it to `{}`
+# would also blank `opencode_overlay.read_tracked_gateway`, making the overlay
+# delta "every catalog model" and drifting `gateway_overlay_hash` on every
+# masked run. `.mcp.json` *is* masked: the MCP servers are lab tooling, so they
+# belong to the treatment.
+RUNNER_GOVERNANCE_FILES = (
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "AGENTS.md",
+    "OPENCODE.md",
+    "LOCAL_AGENT.md",
+    "GEMINI.md",
+    "BENCH_CONTEXT.md",
+    ".mcp.json",
+    ".cursorrules",
+    ".windsurfrules",
+)
+
+# What an empty mask file holds, by suffix. An empty `.mcp.json` is not "no
+# config" but "invalid JSON", which a tool may warn about or refuse to start on.
+_MASK_CONTENT = {".json": "{}\n"}
+_MASK_DEFAULT_CONTENT = ""
+
+
+def _mask_kind(relative: str) -> str:
+    """The mask file a governance path needs: one host file per content kind."""
+    return "json" if relative.endswith(".json") else "text"
+
+
+def runner_governance_masks(
+    level: str, mount_root: str = "/app"
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Mounts that hide the lab's governance from a run.
+
+    Returns ``(tmpfs_dirs, files)`` where ``tmpfs_dirs`` maps container paths to
+    docker-py tmpfs option strings and ``files`` pairs a container path with the
+    mask kind (:func:`_mask_kind`) it should be bound from.
+
+    Skill-catalog masks whose parent directory is already masked are dropped:
+    Docker refuses two mounts with the same destination, and a tmpfs inside a
+    tmpfs would be pointless anyway.
+    """
+    if level == GOVERNANCE_MASK_NONE:
+        return {}, []
+    root = mount_root.rstrip("/")
+    directories = list(RUNNER_GOVERNANCE_DIRS)
+    if level == GOVERNANCE_MASK_ALL:
+        directories += list(RUNNER_GOVERNED_SOURCE_DIRS)
+    tmpfs = {f"{root}/{directory}": "" for directory in directories}
+    files = [(f"{root}/{name}", _mask_kind(name)) for name in RUNNER_GOVERNANCE_FILES]
+    return tmpfs, files
+
+
+def runner_masks(level: str, mount_root: str = "/app") -> tuple[dict[str, str], list]:
+    """Every mask a run gets: the skill mirrors plus its governance level."""
+    governance, files = runner_governance_masks(level, mount_root)
+    tmpfs = dict(governance)
+    for path, options in runner_skill_masks(mount_root).items():
+        # A skill mirror inside an already-masked directory is redundant, and
+        # Docker rejects the duplicate destination.
+        if any(path.startswith(f"{masked}/") for masked in governance):
+            continue
+        tmpfs[path] = options
+    return tmpfs, files
+
+
+def write_mask_sources(run_dir: Path) -> dict[str, Path]:
+    """Write the empty files a governance mask is bound from.
+
+    One file per content kind rather than one per masked path: a bind mount
+    only needs a source, and Docker creates a *directory* at a source path that
+    does not exist yet — which then fails the mount with "not a directory". So
+    these must exist before ``containers.run``.
+    """
+    masks = run_dir / "masks"
+    masks.mkdir(parents=True, exist_ok=True)
+    written: dict[str, Path] = {}
+    for kind, suffix in (("text", ".md"), ("json", ".json")):
+        path = masks / f"empty{suffix}"
+        path.write_text(_MASK_CONTENT.get(suffix, _MASK_DEFAULT_CONTENT))
+        written[kind] = path
+    return written
+
+
+def _host_path(path: Path, repo_root: Path, host_repo_root: str) -> str:
+    """A worker-side path as the host daemon sees it.
+
+    The worker and the runner both mount the lab at /app, so a path under the
+    repo root differs from the host's only in that prefix — the same
+    translation `case_spec.json` already relies on.
+    """
+    relative = path.relative_to(repo_root)
+    return f"{host_repo_root.rstrip('/')}/{relative.as_posix()}"
+
+
 def rewrite_localhost(url: str, alias: str) -> str:
     """Rewrite localhost/127.0.0.1 host references to the docker host alias."""
     return _LOCALHOST_RE.sub(alias, url)
+
+
+def claude_settings_env(repo_root: Path) -> dict[str, str]:
+    """The `env` block of the lab's Claude Code settings, local file winning.
+
+    Tolerant by design: a missing or malformed settings file yields no keys
+    rather than failing a run over configuration the run may not even need.
+    """
+    import json
+
+    merged: dict[str, str] = {}
+    for name in ("settings.json", "settings.local.json"):
+        path = repo_root / ".claude" / name
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        block = data.get("env") if isinstance(data, dict) else None
+        if isinstance(block, dict):
+            merged.update({str(k): str(v) for k, v in block.items()})
+    return merged
 
 
 def build_run_environment() -> dict[str, str]:
@@ -110,10 +288,76 @@ def build_run_environment() -> dict[str, str]:
                 continue
             key, _, val = line.partition("=")
             env[key.strip()] = val.strip()
+    # Claude Code reads .claude/settings*.json from its *project* directory, so
+    # a run whose cwd is the workspace never sees the lab's — and silently loses
+    # ANTHROPIC_BASE_URL, i.e. the LiteLLM gateway and its metrics headers.
+    # Routing must not be a function of the harness condition, so it is
+    # injected as container env for every run alike. (`apiKeySource: "none"`
+    # in `system/init` is how OAuth auth always reports — not a bypass signal;
+    # see the ADR-0049 erratum.)
+    env.update(claude_settings_env(settings.repo_root))
     for key in _HOST_URL_ENV_VARS:
         if env.get(key):
             env[key] = rewrite_localhost(env[key], settings.docker_host_alias)
     return env
+
+
+# Hard limits for a container running an audited repository's own commands.
+# Generous enough that a real test suite never notices; low enough that a fork
+# bomb or a runaway allocation in untrusted code cannot take the host with it.
+_HARDENED_PIDS_LIMIT = 512
+_HARDENED_MEMORY = "4g"
+
+
+def sanitized_run_environment() -> dict[str, str]:
+    """Environment for a container running an audited repository's commands.
+
+    Deliberately *not* :func:`build_run_environment`. That one exists for the
+    agent lane and carries the whole lab ``.env`` — the gateway token, GitHub
+    tokens, Langfuse keys — because the agent lane is where a model is called.
+    The validation lane calls no model and runs code the lab did not write, so
+    it gets none of that: no ``.env``, no ``.claude/settings*.json``, no host
+    environment.
+
+    ``PATH`` is deliberately absent. The container has its own from the image
+    (``/opt/venv/bin`` included); passing the host's would point a Linux
+    container at macOS directories.
+    """
+    return {
+        "PYTHONUNBUFFERED": "1",
+        "SDL_VIDEODRIVER": "dummy",
+        "SDL_AUDIODRIVER": "dummy",
+        # A repository's own suite may branch on CI, and anything reading a
+        # TERM it cannot drive prints control codes into the captured output.
+        "CI": "1",
+        "TERM": "dumb",
+        "LANG": "C.UTF-8",
+        # Inside the container, not on the host: a writable HOME the audited
+        # repository's tooling can put its caches in without reaching the
+        # lab's own.
+        "HOME": "/tmp",  # nosec B108 - container-local, not a host tempfile
+    }
+
+
+def hardened_container_options(phase: str) -> dict[str, Any]:
+    """Docker options for the validation lane, keyed by the command's phase.
+
+    ``network_mode="none"`` applies to ``validate`` only. ``provision`` and
+    ``setup`` are the phases that clone and install (``git clone``, ``npm ci``,
+    ``uv sync``); cutting their network would not harden anything, it would
+    just make every gate check fail at step one.
+    """
+    options: dict[str, Any] = {
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges"],
+        "pids_limit": _HARDENED_PIDS_LIMIT,
+        "mem_limit": _HARDENED_MEMORY,
+    }
+    if phase in ("", "validate"):
+        network = (get_settings().validation_network or "none").strip()
+        if network:
+            options["network_mode"] = network
+    return options
 
 
 class RunHandle(Protocol):
@@ -131,7 +375,15 @@ class RunHandle(Protocol):
 
 
 class RunExecutor(Protocol):
-    def start(self, run_id: str, command: list[str]) -> RunHandle: ...
+    def start(
+        self,
+        run_id: str,
+        command: list[str],
+        *,
+        governance_mask: str = GOVERNANCE_MASK_NONE,
+        hardened: bool = False,
+        phase: str = "",
+    ) -> RunHandle: ...
 
 
 class _SubprocessHandle:
@@ -176,13 +428,36 @@ class _SubprocessHandle:
 class SubprocessRunExecutor:
     """Run the command as a local child process (legacy worker behavior)."""
 
-    def start(self, run_id: str, command: list[str]) -> RunHandle:  # noqa: ARG002
+    def start(
+        self,
+        run_id: str,  # noqa: ARG002
+        command: list[str],
+        *,
+        governance_mask: str = GOVERNANCE_MASK_NONE,
+        hardened: bool = False,
+        phase: str = "",  # noqa: ARG002
+    ) -> RunHandle:
+        if governance_mask != GOVERNANCE_MASK_NONE:
+            raise RuntimeError(
+                "Governance masking needs the docker backend: there is nothing "
+                "to mask the lab's own tree with on the host lane."
+            )
+        extra: dict[str, Any] = {}
+        if hardened:
+            # No container here to drop capabilities in, but the secrets are
+            # the part that travels: a host lane that inherited os.environ
+            # would hand the audited repository's commands the operator's
+            # whole shell. `cwd` stays the lab root, which is what every
+            # command's own `cd {workspace}` prefix is relative to.
+            extra["env"] = sanitized_run_environment()
+            extra["cwd"] = str(get_settings().repo_root)
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            **extra,
         )
         return _SubprocessHandle(process)
 
@@ -240,7 +515,15 @@ class DockerRunExecutor:
 
         return docker.from_env()
 
-    def start(self, run_id: str, command: list[str]) -> RunHandle:
+    def start(
+        self,
+        run_id: str,
+        command: list[str],
+        *,
+        governance_mask: str = GOVERNANCE_MASK_NONE,
+        hardened: bool = False,
+        phase: str = "",
+    ) -> RunHandle:
         settings = get_settings()
         host_repo_root = settings.host_repo_root or str(settings.repo_root)
         if not host_repo_root:
@@ -251,6 +534,19 @@ class DockerRunExecutor:
         self._require_local_image(client, settings.runner_image)
         name = container_name_for_run(run_id)
         self._remove_stale_container(client, name)
+        # Empty tmpfs over the duplicate skill catalogs (one catalog in the
+        # system prompt instead of four, see RUNNER_MASKED_SKILL_DIRS), plus
+        # whatever the run's harness condition hides (ADR-0049).
+        tmpfs, mask_files = runner_masks(governance_mask)
+        extra: dict[str, Any] = {}
+        if mask_files:
+            extra["mounts"] = self._mask_mounts(run_id, host_repo_root, mask_files)
+        # The agent lane is unchanged: full `.env`, the gateway alias, its
+        # network. The hardened lane is the one running code the lab did not
+        # write, and it gets neither the secrets nor, on `validate`, the
+        # network.
+        if hardened:
+            extra.update(hardened_container_options(phase))
         container = client.containers.run(
             image=settings.runner_image,
             command=command,
@@ -258,14 +554,47 @@ class DockerRunExecutor:
             name=name,
             working_dir="/app",
             volumes={host_repo_root: {"bind": "/app", "mode": "rw"}},
-            # Empty tmpfs over the duplicate skill catalogs: one catalog in the
-            # system prompt instead of four (see RUNNER_MASKED_SKILL_DIRS).
-            tmpfs=runner_skill_masks(),
-            environment=build_run_environment(),
+            tmpfs=tmpfs,
+            environment=(
+                sanitized_run_environment() if hardened else build_run_environment()
+            ),
             extra_hosts={settings.docker_host_alias: "host-gateway"},
             labels={"harness-lab.run-id": run_id},
+            **extra,
         )
         return _DockerHandle(container)
+
+    @staticmethod
+    def _mask_mounts(
+        run_id: str, host_repo_root: str, mask_files: list[tuple[str, str]]
+    ) -> list[Any]:
+        """Read-only binds of an empty file over each governance file.
+
+        The sources live under the run's own directory, which is inside the
+        repo root already shared with Docker, so no new file share is needed.
+        Docker mounts by increasing destination depth, so these land after the
+        /app bind and after the tmpfs directories.
+        """
+        from docker.types import Mount
+
+        settings = get_settings()
+        sources = write_mask_sources(settings.data_runs_dir / run_id)
+        return [
+            Mount(
+                target=target,
+                source=_host_path(sources[kind], settings.repo_root, host_repo_root),
+                type="bind",
+                read_only=True,
+            )
+            for target, kind in mask_files
+            # Only what is actually there. A bind whose target does not exist
+            # makes Docker create it — and the target sits inside the /app bind,
+            # so an empty `.cursorrules` would appear in the operator's own
+            # checkout. A file that does not exist cannot leak anyway; the
+            # constant lists the whole surface so the tripwire tests can check
+            # it against `governance.py` and the adapter registry.
+            if (settings.repo_root / target.removeprefix("/app/")).exists()
+        ]
 
     @staticmethod
     def _require_local_image(client: Any, image: str) -> None:

@@ -22,6 +22,8 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from harness_lab_app import governance_paths as gp
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -55,18 +57,18 @@ _SINGLE_FILES = (
 )
 
 # Directories whose markdown is governance. Each entry is (directory, glob).
+# The roots come from `governance_paths` so this surface, the readiness
+# classifier and the audit evidence agree on where a harness lives. A target
+# team that keeps its skills in a root `skills/` gave its agent those skills;
+# judging the run against a surface that omitted them measured the lab.
 _GLOBS = (
     (".github", "*.md"),
     ("memory", "*.md"),
-    (".claude/skills", "*/SKILL.md"),
-    (".claude/agents", "*.md"),
-    (".claude/commands", "*.md"),
-    (".github/skills", "*/SKILL.md"),
-    (".github/skills-external", "*/SKILL.md"),
-    (".github/agents", "*.md"),
-    (".agents/skills", "*/SKILL.md"),
     (".agents/rules", "*.md"),
-    ("docs/adr", "*.md"),
+    *((root.rstrip("/"), "*/SKILL.md") for root in gp.SKILL_ROOTS),
+    *((root.rstrip("/"), "**/*.md") for root in gp.AGENT_ROOTS),
+    *((root.rstrip("/"), "**/*.md") for root in gp.COMMAND_ROOTS),
+    *((root.rstrip("/"), "*.md") for root in gp.ADR_ROOTS),
 )
 
 # How many files a surface may enumerate. A repository with a thousand markdown
@@ -76,6 +78,10 @@ MAX_FILES = 400
 
 #: `harness_source` values that put the agent inside a materialized workspace.
 WORKSPACE_SOURCES = frozenset({"native", "injected"})
+
+#: The source with no repository and no governance at all (ADR-0049). Kept apart
+#: from :data:`WORKSPACE_SOURCES` because it must never fall back to the lab.
+BARE_SOURCE = "bare"
 
 
 @dataclass
@@ -182,19 +188,29 @@ def resolve_surface(
     ``native``    → the target repository as it was, archived with the run.
     ``injected``  → the same workspace *after* the lab's harness was projected
                     into it, which is what the agent actually saw.
+    ``bare``      → the empty workspace: whatever the agent wrote itself, and
+                    nothing else (ADR-0049).
     ``lab_root``  → the repository the lab runs from.
 
     A `native` or `injected` run whose archived workspace is gone falls back to
     the lab's root and says so in ``warning``. That is a degraded record, not a
     correct one, and callers are expected to surface the warning rather than
     quietly present the verdict as sound.
+
+    ``bare`` has no such fallback. There never was a lab surface for it — the
+    runner masked the lab's governance — so falling back would score the run
+    against documents it provably could not reach. A missing archive simply
+    yields the empty surface it always was.
     """
     rules_file, warning = rules_file_for(harness)
     harness_source = harness_source or "lab_root"
 
     root = lab_root
     source = "lab_root"
-    if harness_source in WORKSPACE_SOURCES:
+    if harness_source == BARE_SOURCE:
+        root = run_dir / "workspace"
+        source = BARE_SOURCE
+    elif harness_source in WORKSPACE_SOURCES:
         archived = run_dir / "workspace"
         if archived.is_dir():
             root = archived

@@ -37,8 +37,8 @@ are a polish problem (a homelab leaking into product copy), not an exposure.
 
 ### 1.1 Repository slugs → settings
 
-`marcosdh1987/*` is hardcoded in six places. Defaults stay pointed at the real repos —
-that is on-message for a lab whose subject *is* `ml-python-base` — but they become
+The repository slug is hardcoded in six places. Defaults stay pointed at the real repos —
+that is on-message for a lab whose subject *is* `sdlc-ml-python-base` — but they become
 configurable.
 
 Add to `Settings` ([config.py](../../src/harness_lab_app/config.py), prefix `HARNESS_LAB_`):
@@ -62,7 +62,7 @@ rows, which is correct — historical proposals keep the repo they were authored
 
 ### 1.2 LAN addresses → one shared placeholder
 
-`192.168.0.223` (LM Studio) and `192.168.0.155` (Ollama) appear in eight files as
+A developer's own LM Studio and Ollama LAN addresses appear in eight files as
 examples. Concrete examples are good UX, so keep the *shape* and drop the personal
 address. Define once and import, so they cannot drift:
 
@@ -83,15 +83,17 @@ Call sites: [api.py:420, 464](../../src/harness_lab_app/api.py#L420),
 The frontend needs its own copy in `frontend/src/constants.ts` — do not add an endpoint
 just to serve two strings.
 
-**Exit:** `git grep -nE "192\.168\.0\.(223|155)"` returns nothing — the personal LAN
-addresses are gone entirely.
+**Exit:** grepping the tree for the two original host addresses returns nothing —
+the personal LAN addresses are gone entirely. Only the shared
+`EXAMPLE_*_URL` placeholders remain.
 
-`marcosdh1987` deliberately *stays*, and stays widespread (README, onboarding, the
+The owner slug deliberately *stays*, and stays widespread (README, onboarding, the
 settings defaults, and the fixtures that assert against them). It is the real owner of
 the repositories this lab measures, so it is the correct default rather than a leak;
 Phase 1 makes it configurable, not absent. Grepping for it is therefore not an exit
 criterion — an earlier draft of this plan claimed it returned only `Makefile` and
 settings defaults, which was never true.
+
 
 ## Phase 2 — Publishing hygiene
 

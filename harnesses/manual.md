@@ -11,7 +11,7 @@ recording a run where the tool did not inject metadata automatically.
    request `metadata` field or `litellm.headers`), per `metadata-standard.md`. If they cannot
    carry metadata, rely on the **virtual key per methodology** so usage is still attributable.
 4. Capture diff, `result_commit`, log, screenshot into `data/runs/<run-id>/`.
-5. Score manually with `score_tetris.py`.
+5. Score manually against the case's `scoring.md` rubric.
 
 Use this only when an automated harness recipe does not exist. Prefer `opencode-local` /
 `opencode-conductor` for the matrix cells so runs stay comparable.

@@ -34,7 +34,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from bench_audit import (
-    DEFAULT_AUDITOR_MODEL,
     DIFF_CLIP_CHARS,
     RULES_CLIP_CHARS,
     call_gateway,
@@ -44,45 +43,47 @@ from bench_audit import (
 )
 from create_run import DATA_DIR, REPO_ROOT, _load_env, find_run
 
+from harness_lab_app import llm_transport
+
 GEMINI_RULES = REPO_ROOT / ".agents" / "rules" / "GEMINI.md"
 AGENTS_SKILLS_DIR = REPO_ROOT / ".agents" / "skills"
 
 SYSTEM_PROMPT = """\
-You are an agent-rules editor for Google Antigravity (Gemini). Your job is to
-propose CONCRETE edits to this repository's rules for the Google case, based on how
-the model behaved in ONE benchmark run and on the current rules.
+Sos un editor de reglas de agentes para Google Antigravity (Gemini). Tu trabajo es
+proponer ediciones CONCRETAS a las reglas del repo para el caso Google, en base a
+cómo se comportó el modelo en UNA corrida de benchmark y a las reglas actuales.
 
-Inputs you receive: the current rules (`.agents/rules/GEMINI.md`), the index of
-skills available under `.agents/skills/`, and the run's evidence (diff of the code
-produced, the agent transcript if one exists, human notes, score).
+Entradas que recibís: las reglas actuales (`.agents/rules/GEMINI.md`), el índice de
+skills disponibles en `.agents/skills/`, y la evidencia de la corrida (diff del
+código producido, transcript del agente si existe, notas del humano, score).
 
-CENTRAL RULE: be PRESCRIPTIVE and actionable. Do not merely describe; propose the
-change. For every proposal, cite the evidence that justifies it (a phrase from the
-transcript or notes, a pattern in the diff, the current rule that failed). Separate
-HIGH CONFIDENCE items (clear evidence) explicitly from HYPOTHESES TO VALIDATE
-(hunches without strong evidence). If a section has no evidence, say so.
+REGLA CENTRAL: sé PRESCRIPTIVO y accionable. No te limites a describir; proponé el
+cambio. Para cada propuesta, citá la evidencia que la justifica (frase del
+transcript/notas, patrón del diff, regla actual que falló). Diferenciá
+explícitamente lo de ALTA CONFIANZA (evidencia clara) de las HIPÓTESIS A VALIDAR
+(corazonada sin evidencia fuerte). Si una sección no tiene evidencia, decilo.
 
-Structure the output as Markdown with EXACTLY these sections:
+Estructurá la salida en Markdown EXACTAMENTE con estas secciones:
 
-## Summary
-2-4 lines: how well the current rules guided the model in this run.
+## Resumen
+2-4 líneas: qué tan bien las reglas actuales guiaron al modelo en esta corrida.
 
-## Proposed edits to GEMINI.md
-A prioritized list. For each: which rule to rewrite, add, or remove, the suggested
-text (or a before/after), and the evidence.
+## Ediciones propuestas a GEMINI.md
+Lista priorizada. Por cada una: qué regla reescribir/agregar/quitar, el texto
+sugerido (o el antes/después), y la evidencia.
 
-## Proposed edits to the skills
-Skills that were missing, that were not discovered or invoked, that confused the
-model, or that are worth creating or adjusting. With evidence.
+## Ediciones propuestas a las skills
+Skills que faltaron, que no se descubrieron/invocaron, que confundieron, o que
+convendría crear/ajustar. Con evidencia.
 
-## Observed gaps
-What the model lacked that the rules did not cover (missing instructions, examples,
-constraints).
+## Gaps observados
+Qué le faltó al modelo que las reglas no cubrían (instrucciones ausentes, ejemplos,
+restricciones).
 
-## Hypotheses to validate (low confidence)
-Ideas without strong evidence, marked as such.
+## Hipótesis a validar (baja confianza)
+Ideas sin evidencia fuerte, marcadas como tales.
 
-Write in English. Be concrete; every proposal must be traceable to evidence.
+Escribí en español. Sé concreto; cada propuesta debe poder rastrearse a evidencia.
 """
 
 
@@ -118,24 +119,26 @@ def build_user_message(run_id: str, inp: dict) -> str:
     ]
     if inp["rules"]:
         sections.append(
-            "\n## Current rules under review (.agents/rules/GEMINI.md)\n"
+            "\n## Reglas actuales bajo revisión (.agents/rules/GEMINI.md)\n"
             + clip(inp["rules"].strip(), RULES_CLIP_CHARS)
         )
     if inp["skills"]:
         sections.append(
-            "\n## Skills available under .agents/skills/\n"
+            "\n## Skills disponibles en .agents/skills/\n"
             + "\n".join(f"- {s}" for s in inp["skills"])
         )
     if inp["notes"]:
-        sections.append("\n## Human observations (notes.md)\n" + inp["notes"].strip())
+        sections.append(
+            "\n## Observaciones del humano (notes.md)\n" + inp["notes"].strip()
+        )
     if inp["transcript"]:
         sections.append(
-            "\n## Agent transcript (transcript.md)\n"
+            "\n## Transcript del agente (transcript.md)\n"
             + clip(inp["transcript"].strip(), RULES_CLIP_CHARS)
         )
     if inp["diff"]:
         sections.append(
-            "\n## Code produced (diff.patch)\n```diff\n"
+            "\n## Código producido (diff.patch)\n```diff\n"
             + clip(inp["diff"].strip(), DIFF_CLIP_CHARS)
             + "\n```"
         )
@@ -171,7 +174,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--auditor-model",
         default=None,
-        help=f"Gateway model alias for the auditor (default: {DEFAULT_AUDITOR_MODEL})",
+        help="Model alias for the auditor (default: chosen for the active transport).",
     )
     p.add_argument(
         "--dry-run",
@@ -187,7 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     _load_env()
 
     auditor_model = (
-        args.auditor_model or os.environ.get("AUDITOR_MODEL") or DEFAULT_AUDITOR_MODEL
+        args.auditor_model
+        or os.environ.get("AUDITOR_MODEL")
+        or llm_transport.default_audit_model()
     )
 
     runs_path = resolve_runs_path(args.run)

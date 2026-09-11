@@ -18,34 +18,30 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from harness_lab_app import governance_paths as gp
+
 if TYPE_CHECKING:
     from pathlib import Path
 
     from harness_lab_app.models import TargetRepository
 
-# Rule files an agent harness reads at the repository root.
-RULES_FILES = (
-    "CLAUDE.md",
-    "AGENTS.md",
-    "OPENCODE.md",
-    "GEMINI.md",
-    "LOCAL_AGENT.md",
-    ".cursorrules",
-    ".windsurfrules",
-    ".github/copilot-instructions.md",
-)
+# Rule files an agent harness reads at the repository root. The taxonomy lives
+# in `governance_paths` so the readiness classifier, the audit evidence
+# collector and the run's governance surface cannot disagree about where a
+# harness lives — they used to, and a repository whose skills sat in a root
+# `skills/` was reported as having none.
+RULES_FILES = gp.RULES_FILES
 
 # (prefix, suffix, bucket) — a path in the bucket if it matches both ends.
+# Order is load-bearing: `classify` stops at the first match, so the `.github/`
+# catch-all must stay last or it would swallow workflows and skills.
 _BUCKETS = (
-    (".claude/skills/", "/SKILL.md", "skills"),
-    (".github/skills/", "/SKILL.md", "skills"),
-    (".agents/skills/", "/SKILL.md", "skills"),
-    (".claude/agents/", ".md", "agents"),
-    (".github/agents/", ".md", "agents"),
-    (".claude/commands/", ".md", "commands"),
-    (".github/workflows/", "", "ci_workflows"),
-    ("docs/adr/", ".md", "adrs"),
-    ("memory/", ".md", "memory"),
+    *((root, gp.SKILL_FILE, "skills") for root in gp.SKILL_ROOTS),
+    *((root, ".md", "agents") for root in gp.AGENT_ROOTS),
+    *((root, ".md", "commands") for root in gp.COMMAND_ROOTS),
+    *((root, "", "ci_workflows") for root in gp.CI_ROOTS),
+    *((root, ".md", "adrs") for root in gp.ADR_ROOTS),
+    *((root, ".md", "memory") for root in gp.MEMORY_ROOTS),
     (".github/", ".md", "governance_docs"),
 )
 
@@ -65,8 +61,8 @@ _TEST_MARKERS = (
 
 def _name(path: str, prefix: str, suffix: str) -> str:
     trimmed = path[len(prefix) :]
-    if suffix == "/SKILL.md":
-        return trimmed.rsplit("/", 1)[0]
+    if suffix == gp.SKILL_FILE:
+        return trimmed.removesuffix(gp.SKILL_FILE).strip("/")
     return trimmed.removesuffix(suffix)
 
 
@@ -212,6 +208,21 @@ _MISMATCH_PATTERNS: tuple[tuple[re.Pattern[str], str, tuple[str, ...]], ...] = (
 )
 
 
+def detect_ecosystems(paths: list[str]) -> dict[str, bool]:
+    """``{ecosystem: runner ships its toolchain}`` for every marker at the root.
+
+    Shared by the readiness check and the repository audit so the two never
+    disagree about what language a repository is in or whether the runner
+    image could build it.
+    """
+    path_set = set(paths)
+    return {
+        label: supported
+        for marker, label, supported in _ECOSYSTEMS
+        if marker in path_set
+    }
+
+
 def runtime_compatibility(
     paths: list[str] | None,
     setup_commands: list[str],
@@ -234,11 +245,7 @@ def runtime_compatibility(
             "The repository could not be read, so its runtime cannot be confirmed.",
         )
     path_set = set(paths)
-    present = {
-        label_: supported
-        for marker, label_, supported in _ECOSYSTEMS
-        if marker in path_set
-    }
+    present = detect_ecosystems(paths)
     supported = sorted(name for name, ok in present.items() if ok)
     unsupported = sorted(name for name, ok in present.items() if not ok)
 
@@ -439,7 +446,12 @@ def infer_commands(paths: list[str], contents: dict[str, str]) -> dict[str, list
         or "pytest.ini" in path_set
         or "tox.ini" in path_set
         or any(
-            part.startswith("tests/") and "test" in part.rsplit("/", 1)[-1]
+            part.startswith("tests/")
+            and "test" in part.rsplit("/", 1)[-1]
+            # `.py`, not "any file under tests/": a repository whose suite is
+            # `tests/test_parse.sh` would otherwise be told to run pytest,
+            # which finds nothing and reports a green gate over no tests.
+            and part.endswith(".py")
             for part in path_set
         )
     )
@@ -455,6 +467,26 @@ def infer_commands(paths: list[str], contents: dict[str, str]) -> dict[str, list
         elif has_pytest:
             setup.append("pip install -e .")
             validation.append("pytest -x -q")
+
+    # Shell: a tree of executable test scripts is a suite, even though no
+    # package manager anywhere declares it. The loop is the repository's own
+    # convention, written the way its CLAUDE.md or README writes it.
+    shell_tests = sorted(
+        part
+        for part in path_set
+        if part.startswith("tests/")
+        and part.rsplit("/", 1)[-1].startswith("test")
+        and part.endswith(".sh")
+    )
+    if shell_tests:
+        # `{workspace}`-anchored, like every other command the lab stores: the
+        # gate check runs from inside the checkout but objective validation
+        # runs from the lab's own root, and a bare `tests/` resolves there.
+        # `|| exit 1` inside the body, because a `for` loop otherwise returns
+        # only its last command's status.
+        validation.append(
+            'for t in {workspace}/tests/test_*.sh; do bash "$t" || exit 1; done'
+        )
 
     if "go.mod" in path_set:
         validation.append("go test ./...")
@@ -554,23 +586,32 @@ class ReadinessService:
     def _report_for(self, target: TargetRepository) -> dict[str, Any]:
         from harness_lab_app.case_derivation import sync_mirror
         from harness_lab_app.config import get_settings
-        from harness_lab_app.target_service import resolve_ref
+        from harness_lab_app.target_service import clone_source, resolve_ref
+
+        source = clone_source(target)
 
         commit: str | None = None
         ref_error = ""
-        try:
-            commit = resolve_ref(target.repository_url, target.default_ref)
-        except Exception as error:
-            # Unreachable is a finding about the repository, not a crash: the
-            # page still has to render the rest of what it knows.
-            ref_error = str(error)
+        if target.pinned_commit:
+            # A pinned target is read at its pin, not at whatever its default
+            # branch points to now: the readiness report and the runs have to
+            # describe the same tree, or the report is about a repository nobody
+            # evaluated.
+            commit = target.pinned_commit
+        else:
+            try:
+                commit = resolve_ref(source, target.default_ref)
+            except Exception as error:
+                # Unreachable is a finding about the repository, not a crash: the
+                # page still has to render the rest of what it knows.
+                ref_error = str(error)
 
         paths: list[str] | None = None
         read_error = ""
         suggested: dict[str, list[str]] | None = None
         try:
             mirror = sync_mirror(
-                target.repository_url,
+                source,
                 get_settings().target_mirrors_dir,
                 target.target_id,
             )

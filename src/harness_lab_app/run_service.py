@@ -19,6 +19,7 @@ from harness_lab_app.models import (
     Attribution,
     Audit,
     Case,
+    HarnessSource,
     Run,
     RunConfig,
     RunEvent,
@@ -34,6 +35,7 @@ from harness_lab_app.schemas import RunBatchCreate, RunConfigCreate, RunCreate
 from harness_lab_app.target_service import (
     TargetError,
     TargetService,
+    clone_source,
     resolve_ref,
 )
 
@@ -179,6 +181,7 @@ def _expand_batch(
             resume=False,
             skills_disabled=list(data.skills_disabled),
             skills_extra=list(data.skills_extra),
+            skills_invoke=list(data.skills_invoke),
             target_repo_id=target_repo_id,
             target_ref=data.target_ref,
             harness_source=harness_source,
@@ -213,6 +216,7 @@ def _preflight_key(config: RunConfigCreate) -> tuple:
         config.executor_model,
         tuple(sorted(set(config.skills_disabled))),
         tuple(sorted(set(config.skills_extra))),
+        tuple(sorted(set(config.skills_invoke))),
         config.target_repo_id,
         config.harness_source,
     )
@@ -241,6 +245,7 @@ def _resume_config(config: RunConfig) -> RunConfigCreate:
         continuation_prompt=config.continuation_prompt,
         skills_disabled=list(config.skills_disabled),
         skills_extra=list(config.skills_extra),
+        skills_invoke=list(config.skills_invoke),
     )
 
 
@@ -345,6 +350,20 @@ class RunService:
         self._check_target(config)
         if config.dry_run:
             return
+        # A bare arm is bare only because the runner masks the lab's governance
+        # at the container level (ADR-0049). On the host lane there is nothing
+        # to mask with, and the agent would silently read the lab's CLAUDE.md
+        # from the workspace's parent directory — a control arm that is a second
+        # treatment arm, which is exactly what this condition exists to prevent.
+        if (
+            config.harness_source == HarnessSource.bare
+            and get_settings().execution_backend != "docker"
+        ):
+            raise RunPreflightError(
+                "harness_source='bare' needs the docker backend: the lab's "
+                "governance is masked inside the runner container, and a host "
+                "run would see it through the workspace's parent directory."
+            )
         self._check_runner_image()
         if config.harness in ("codex", "claude"):
             # These harnesses drive their own CLI with native auth (no gateway
@@ -421,6 +440,21 @@ class RunService:
                     f"Unknown/archived staged skills in skills_extra: "
                     f"{', '.join(unknown_extra)}. Create them on the Skills page "
                     "first."
+                )
+        if config.skills_invoke:
+            # Asking for a skill the agent cannot see would be a prompt about
+            # nothing, and the run would count it as "asked and not invoked".
+            from harness_lab_app.skills_catalog import known_skill_names
+
+            available = (known_skill_names() - set(config.skills_disabled)) | set(
+                config.skills_extra
+            )
+            unavailable = sorted(set(config.skills_invoke) - available)
+            if unavailable:
+                raise RunPreflightError(
+                    f"skills_invoke names skills this run cannot see: "
+                    f"{', '.join(unavailable)}. A skill to invoke must be staged "
+                    "via skills_extra, or governed and not in skills_disabled."
                 )
 
     def _probe_gateway_executor(self, executor: str, token: str) -> str | None:
@@ -748,6 +782,12 @@ class RunService:
         the ref is a separate step (``_resolve_target``) because a batch needs it
         once per repository, not once per run.
         """
+        if config.target_repo_id and config.harness_source == HarnessSource.bare:
+            raise RunPreflightError(
+                "harness_source='bare' runs without a repository, so it cannot "
+                "target one. Against a target the bare arm is 'native' — the "
+                "repository's own conventions and nothing of the lab's."
+            )
         if not config.target_repo_id:
             if config.harness_source in IN_TARGET_HARNESS_SOURCES:
                 raise RunPreflightError(
@@ -781,9 +821,15 @@ class RunService:
         if pinned_commit:
             return pinned_commit
         target = TargetService(self.session).get_target(config.target_repo_id)
-        ref = (config.target_ref or target.default_ref or "").strip()
+        ref = (config.target_ref or "").strip()
+        if not ref and target.pinned_commit:
+            # A pinned target answers without asking the network at all: the
+            # operator already chose the commit their whole audit is about, and
+            # re-resolving `main` here would quietly move it (ADR-0042).
+            return target.pinned_commit
+        ref = ref or (target.default_ref or "").strip()
         try:
-            return resolve_ref(target.repository_url, ref)
+            return resolve_ref(clone_source(target), ref)
         except TargetError as exc:
             raise RunPreflightError(
                 f"Could not pin '{target.target_id}' at ref '{ref}': {exc}"
@@ -941,6 +987,7 @@ class RunService:
             # that dropped it would quietly compare a different condition.
             skills_disabled=list(config.skills_disabled),
             skills_extra=list(config.skills_extra),
+            skills_invoke=list(config.skills_invoke),
             target_repo_id=config.target_repo_id,
             target_ref=config.target_ref,
             harness_source=config.harness_source,
@@ -1021,6 +1068,7 @@ class RunService:
             continuation_prompt=prompt_text,
             skills_disabled=list(config.skills_disabled),
             skills_extra=list(config.skills_extra),
+            skills_invoke=list(config.skills_invoke),
             target_repo_id=config.target_repo_id,
             target_ref=config.target_ref,
             harness_source=config.harness_source,

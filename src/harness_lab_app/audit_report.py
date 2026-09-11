@@ -107,17 +107,131 @@ def _evidence_section(session: Session, target_id: str) -> list[str]:
     return lines
 
 
+def _checkout_section(target: Any) -> list[str]:
+    """Which bytes were measured, and when they were frozen.
+
+    An audit that cannot name the commit it read is not reproducible a month
+    later, and "we ran it against main" names nothing (ADR-0042).
+    """
+    lines = ["## What was measured", ""]
+    lines.append(f"- Repository: `{target.repository_url}`")
+    if getattr(target, "pinned_commit", ""):
+        pinned_at = getattr(target, "pinned_at", None)
+        when = f" on {pinned_at.date().isoformat()}" if pinned_at else ""
+        lines.append(
+            f"- Pinned at commit `{target.pinned_commit[:12]}`{when}, read from a "
+            "local checkout made with the operator's own credentials. Every run "
+            "and every number below is against that commit."
+        )
+    else:
+        lines.append(
+            "- **Not pinned.** The repository was read over the network at a "
+            "moving ref, so two measurements taken on different days are not "
+            "strictly comparable."
+        )
+    return lines
+
+
+def _harness_audit_section(session: Session, target_id: str) -> list[str]:
+    """What the auditor model said the repository's harness amounts to.
+
+    Labelled as a judgement, like every LLM-written line in the lab. The
+    section quotes only the structured half of the audit — the summary, the
+    verdict, the gaps — and the lab's own runtime decision, which is a fact.
+    """
+    from harness_lab_app.models import RepositoryAudit
+
+    row = session.exec(
+        select(RepositoryAudit).where(RepositoryAudit.target_id == target_id)
+    ).first()
+    lines = ["## The harness, as read by the auditor", ""]
+    if row is None or row.status != "done":
+        lines.append(
+            "Not generated. The guided audit's second step asks a model to "
+            "describe the harness the repository ships; nothing here is "
+            "claimed until it has."
+        )
+        return lines
+    findings = row.findings_json or {}
+    evidence = row.evidence_json or {}
+    runtime = evidence.get("runtime") or {}
+    lines.append(
+        f"Read at `{row.commit[:12]}` by `{row.auditor_model}` — a judgement, "
+        "not a measurement."
+    )
+    lines.append("")
+    if findings.get("parse_error"):
+        lines.append(
+            "The auditor did not return the structure asked for; its reading "
+            "is kept on the repository's page but not summarised here."
+        )
+    else:
+        if findings.get("summary"):
+            lines.append(findings["summary"])
+            lines.append("")
+        lines.append(
+            f"- Harness verdict: **{findings.get('harness_verdict', 'unknown')}**."
+        )
+        for gap in findings.get("gaps") or []:
+            lines.append(f"- Gap: {gap}")
+    ecosystems = ", ".join(runtime.get("ecosystems") or []) or "not detected"
+    can = "can" if runtime.get("runner_can_execute") else "cannot"
+    lines.append(f"- Runtime (fact): {ecosystems}; the runner image {can} execute it.")
+    return lines
+
+
+def _gate_check_section(session: Session, target_id: str) -> list[str]:
+    """Did the repository pass its own gate before any agent touched it?
+
+    The control measurement: without it a failed run is ambiguous between "the
+    agent failed" and "this repository does not build in the runner image".
+    """
+    from harness_lab_app.models import GateCheck
+
+    row = session.exec(
+        select(GateCheck)
+        .where(GateCheck.target_id == target_id)
+        .order_by(GateCheck.created_at.desc())  # type: ignore[attr-defined]
+    ).first()
+    lines = ["## The repository's own gate, with no agent", ""]
+    if row is None or row.status != "done":
+        lines.append(
+            "Not run. Until it is, a failed run cannot be separated from a "
+            "repository that does not build in the evaluation image."
+        )
+        return lines
+    if row.passed:
+        lines.append(
+            f"Passed at `{row.commit[:12]}` — provisioning, setup and the "
+            "repository's own validation commands all succeeded with no agent "
+            "involved. Failures in the runs below are therefore about the agent."
+        )
+        return lines
+    lines.append(
+        f"**Failed at `{row.commit[:12]}` in the *{row.failed_phase}* phase.** "
+        "Runs against this repository are measuring that failure as much as "
+        "they measure any agent."
+    )
+    for check in row.checks_json:
+        if not check.get("passed"):
+            lines.append(
+                f"- `{check.get('command', '')}` exited {check.get('exit_code')}."
+            )
+    return lines
+
+
 def _cases_section(session: Session, target_id: str) -> list[str]:
     cases = [
         case
         for case in session.exec(select(Case)).all()
-        if target_id in (case.tags or [])
+        if case.origin_target_id == target_id or target_id in (case.tags or [])
     ]
-    lines = ["## Cases derived from this repository's own history", ""]
+    lines = ["## Cases held against this repository", ""]
     if not cases:
         lines.append(
             "None yet. Cases are mined from real commits (a change and the "
-            "tests that verified it), so the benchmark is this team's own work."
+            "tests that verified it) or written against the checkout, so the "
+            "benchmark is this team's own work."
         )
         return lines
     for case in cases:
@@ -204,7 +318,13 @@ def build_report(session: Session, target: Any, readiness: dict[str, Any]) -> st
         "",
     ]
     body = [
+        *_checkout_section(target),
+        "",
         *_readiness_section(readiness),
+        "",
+        *_harness_audit_section(session, target.target_id),
+        "",
+        *_gate_check_section(session, target.target_id),
         "",
         *_cases_section(session, target.target_id),
         "",

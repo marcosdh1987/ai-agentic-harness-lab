@@ -65,3 +65,129 @@ def test_judge_functional_score_uses_injected_gateway() -> None:
     assert calls["model"] == "stub-judge"
     assert "Fix it." in calls["user"]
     assert "JSON" in calls["system"]
+
+
+# --------------------------------------------------------------------------
+# Evidence-typed rubric levels (2026-09-08)
+# --------------------------------------------------------------------------
+
+
+def test_the_rubric_prompt_forbids_manual_levels_and_demands_a_citation():
+    """Two equivalent Tetris builds scored 10 and 2 on identical evidence.
+
+    The rubric's upper levels describe gameplay no diff or headless check can
+    establish, and the prompt told the judge both to award what the diff shows
+    and to withhold what only a check could prove. Levels now say what can
+    establish them, and the prompt stops guessing at the ones only a human can.
+    """
+    from harness_lab_app.harness_lifecycle.judge import RUBRIC_SYSTEM_PROMPT
+
+    assert "[manual]" in RUBRIC_SYSTEM_PROMPT
+    assert "NEVER award" in RUBRIC_SYSTEM_PROMPT
+    assert "[diff]" in RUBRIC_SYSTEM_PROMPT
+    assert "quote" in RUBRIC_SYSTEM_PROMPT
+    assert '"evidence"' in RUBRIC_SYSTEM_PROMPT
+
+
+def test_parse_keeps_the_citation_when_the_judge_gives_one():
+    from harness_lab_app.harness_lifecycle.judge import parse_judge_score
+
+    parsed = parse_judge_score(
+        '{"score": 8, "evidence": "def clear_lines(self): ...", "rationale": "level 8"}'
+    )
+
+    assert parsed["score"] == 8
+    assert parsed["evidence"].startswith("def clear_lines")
+    # Older replies carry no citation; that is not a parse failure.
+    assert "evidence" not in parse_judge_score('{"score": 2, "rationale": "runs"}')
+
+
+def test_every_shipped_rubric_tags_every_level():
+    """A rubric is the judge's scale; an untagged level is a guess."""
+    import re
+    from pathlib import Path
+
+    benchmarks = Path(__file__).resolve().parents[2] / "benchmarks"
+    # Only the rubrics of cases: a write-up directory may carry a scoring.md too.
+    rubrics = sorted(
+        task.parent / "scoring.md"
+        for task in benchmarks.glob("*/task.yaml")
+        if (task.parent / "scoring.md").exists()
+    )
+    assert rubrics
+    for rubric in rubrics:
+        rows = [
+            line
+            for line in rubric.read_text().splitlines()
+            if re.match(r"^\| \d+ \|", line)
+        ]
+        assert rows, rubric
+        for row in rows:
+            assert re.search(r"\[(check|diff|manual)\]", row), (rubric, row)
+
+
+def test_the_tetris_v2_rubric_is_provable_by_its_own_tests():
+    """Ten shipped assertions mean no level is left to a human (ADR-0050)."""
+    import re
+    from pathlib import Path
+
+    text = (
+        Path(__file__).resolve().parents[2] / "benchmarks" / "tetris-v2" / "scoring.md"
+    ).read_text()
+    rows = [line for line in text.splitlines() if re.match(r"^\| \d+ \|", line)]
+    assert not any("[manual]" in row for row in rows)
+
+
+def test_the_judge_is_told_checks_and_the_file_list_decide_existence():
+    """Native wrote tests/test_install_and_hooks.sh, a PASS check executed it,
+    the diff (tracked files only) omitted it, and the judge scored 0 for "the
+    test was not added". The prompt now says what decides existence."""
+    from harness_lab_app.harness_lifecycle.judge import RUBRIC_SYSTEM_PROMPT
+
+    assert "Never conclude a file is missing" in RUBRIC_SYSTEM_PROMPT
+    assert "PASS check that executed a path proves" in RUBRIC_SYSTEM_PROMPT
+    # And the sibling failure: grading the repository's pre-existing behaviour
+    # that a check's output happened to describe, instead of the agent's work.
+    assert "not the repository's pre-existing behaviour" in RUBRIC_SYSTEM_PROMPT
+
+
+def test_the_rubric_message_lists_the_files_the_agent_wrote():
+    from harness_lab_app.harness_lifecycle.judge import build_rubric_message
+
+    message = build_rubric_message(
+        task="t",
+        rubric="r",
+        diff="",
+        files_modified=["tests/test_install_and_hooks.sh", "hooks/armed-gate.sh"],
+    )
+    assert "## Files the agent wrote or modified" in message
+    assert "- tests/test_install_and_hooks.sh" in message
+    assert message.index("## Files the agent wrote") < message.index("## Agent diff")
+    assert "## Files the agent wrote" not in build_rubric_message(
+        task="t", rubric="r", diff=""
+    )
+
+
+def test_files_for_the_judge_are_workspace_relative_and_deduplicated(tmp_path):
+    import json
+
+    from harness_lab_app.tasks import _files_modified_for_judge
+
+    run_dir = tmp_path / "talos-K-002"
+    run_dir.mkdir()
+    (run_dir / "usage.json").write_text(
+        json.dumps(
+            {
+                "files_modified": [
+                    "/app/workspace/talos-K-002/tests/test_install_and_hooks.sh",
+                    "/app/workspace/talos-K-002/tests/test_install_and_hooks.sh",
+                    "hooks/armed-gate.sh",
+                ]
+            }
+        )
+    )
+    assert _files_modified_for_judge(run_dir, "talos-K-002") == [
+        "tests/test_install_and_hooks.sh",
+        "hooks/armed-gate.sh",
+    ]
+    assert _files_modified_for_judge(tmp_path / "missing", "x") == []

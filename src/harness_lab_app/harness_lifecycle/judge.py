@@ -16,7 +16,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 # The auditor's default model — "the same LLM that does the analysis".
 DEFAULT_JUDGE_MODEL = "gpt-5.4-mini"
@@ -32,8 +32,10 @@ JUDGE_SYSTEM_PROMPT = (
     "core issue unresolved; 1-3 = wrong direction or barely started; 0 = no "
     "relevant change. Judge only the code change against the task — never invent "
     "tests or credit intentions not present in the diff. When a partial test "
-    "summary is present, weight it heavily. Keep the rationale to 1-3 sentences, "
-    "and never include secrets, tokens, or local filesystem paths."
+    "summary is present, weight it heavily — but a check marked INCONCLUSIVE "
+    "timed out, was killed, or never ran, and is evidence about the lab rather "
+    "than the agent: ignore it and judge the diff. Keep the rationale to 1-3 "
+    "sentences, and never include secrets, tokens, or local filesystem paths."
 )
 
 RUBRIC_SYSTEM_PROMPT = (
@@ -41,22 +43,41 @@ RUBRIC_SYSTEM_PROMPT = (
     "supplied by the person who wrote the task. The rubric is the ONLY scale "
     "you may use: do not substitute your own idea of quality, and do not "
     "reward effort the rubric does not ask for. Output ONLY a JSON object: "
-    '{"score": <integer 0-10>, "rationale": <string>}. '
+    '{"score": <integer 0-10>, "evidence": <string>, "rationale": <string>}. '
     "Rubric levels are cumulative unless the rubric says otherwise: award the "
     "HIGHEST level whose requirement is evidenced, and every level below it "
-    "must hold too. Judge from the evidence given — the diff, the automated "
-    "check summary, the agent's own report — and treat the agent's claims as "
-    "claims, not results: a report asserting a feature that the diff does not "
-    "implement earns nothing. When the evidence cannot distinguish two levels, "
-    "take the lower one and say why in the rationale. Name the level you "
-    "awarded and the evidence for it in 1-3 sentences. Never include secrets, "
-    "tokens, or local filesystem paths."
+    "must hold too. "
+    "Each rubric level may carry an evidence tag that says what can establish "
+    "it. [check]: only an automated check can — award it only when a PASS "
+    "check establishes it, never from the diff or the report. [diff]: the code "
+    "itself can — award it only when you can quote the lines that implement "
+    "it, and put that quotation in the evidence field. [manual]: only a human "
+    "running the program can — NEVER award it; stop at the highest level "
+    "below it that you can establish. An untagged level is treated as [diff]. "
+    "Automated checks are marked PASS, FAIL or INCONCLUSIVE. A FAIL is a fact "
+    "about the code and refutes every level it contradicts. An INCONCLUSIVE "
+    "check timed out, was killed, or never ran: it is a fact about the lab, not "
+    "about the agent, so it neither confirms nor refutes anything — do not read "
+    "it as a failure, and do not award a [check] level on it. "
+    "Checks and the file list are authoritative on EXISTENCE: a PASS check that "
+    "executed a path proves that file exists and behaves as the check asserts, "
+    "and a file in the agent's file list was written even if the diff omits it "
+    "(the diff can miss newly created files). Never conclude a file is missing "
+    "when a PASS check ran it or the file list names it. A check's OUTPUT "
+    "describes the repository the agent was working in; grade the agent's "
+    "work, not the repository's pre-existing behaviour that the output reports. "
+    "Treat the agent's claims as claims, not results: a report asserting a "
+    "feature that the diff does not implement earns nothing. When the evidence "
+    "cannot distinguish two levels, take the lower one and say why. Name the "
+    "level you awarded and the evidence for it in 1-3 sentences. Never include "
+    "secrets, tokens, or local filesystem paths."
 )
 
 # Keep the prompt bounded: the diff is the signal, the rest is context.
 _DIFF_CLIP = 24000
 _TEXT_CLIP = 8000
 _RUBRIC_CLIP = 12000
+_FILES_CLIP = 60
 
 
 def build_judge_message(
@@ -96,7 +117,13 @@ def parse_judge_score(raw: str) -> dict:
         raise ValueError("judge response contained no JSON object")
     obj = json.loads(text[start : end + 1])
     score = max(0, min(10, round(float(obj["score"]))))
-    return {"score": score, "rationale": str(obj.get("rationale", "")).strip()}
+    result = {"score": score, "rationale": str(obj.get("rationale", "")).strip()}
+    # The quoted code behind a [diff] level. Optional: the SWE judge and older
+    # replies do not carry it, and a missing citation is not a parse failure.
+    evidence = str(obj.get("evidence", "")).strip()
+    if evidence:
+        result["evidence"] = evidence
+    return result
 
 
 def judge_functional_score(
@@ -125,6 +152,7 @@ def build_rubric_message(
     diff: str,
     objective_summary: str = "",
     report: str = "",
+    files_modified: Sequence[str] = (),
 ) -> str:
     """Render rubric + task + evidence as one prompt. Pure assembly.
 
@@ -138,8 +166,15 @@ def build_rubric_message(
     ]
     if objective_summary.strip():
         blocks.append(
-            "## Automated checks already run (facts, not opinions)\n\n"
-            f"{objective_summary.strip()[:_TEXT_CLIP]}"
+            "## Automated checks already run (facts, not opinions — but an "
+            "INCONCLUSIVE check is a fact about the lab, not about the code)"
+            f"\n\n{objective_summary.strip()[:_TEXT_CLIP]}"
+        )
+    if files_modified:
+        listed = "\n".join(f"- {path}" for path in list(files_modified)[:_FILES_CLIP])
+        blocks.append(
+            "## Files the agent wrote or modified (from the run's tool log — "
+            f"facts; the diff below may omit newly created ones)\n\n{listed}"
         )
     diff = diff.strip()
     blocks.append(
@@ -161,6 +196,7 @@ def judge_rubric_score(
     gateway: Callable[[str, str, str], str],
     objective_summary: str = "",
     report: str = "",
+    files_modified: Sequence[str] = (),
     model: str = DEFAULT_JUDGE_MODEL,
 ) -> dict:
     """One gateway call → ``{score, rationale}``. Raises on an unparseable reply."""
@@ -170,5 +206,6 @@ def judge_rubric_score(
         diff=diff,
         objective_summary=objective_summary,
         report=report,
+        files_modified=files_modified,
     )
     return parse_judge_score(gateway(model, RUBRIC_SYSTEM_PROMPT, user))

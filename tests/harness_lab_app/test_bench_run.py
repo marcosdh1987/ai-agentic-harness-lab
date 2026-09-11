@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -328,3 +329,380 @@ def test_tetris_continuation_prompt_still_carries_its_own_framing(tmp_path):
 
     assert "SDL_VIDEODRIVER=dummy" in text
     assert "main.py" in text
+
+
+def test_stamp_event_line_keeps_json_valid():
+    import json
+
+    stamped = bench_run.stamp_event_line(
+        '{"type":"assistant","message":{}}\n', now_iso="2026-08-27T20:00:00Z"
+    )
+    event = json.loads(stamped)
+    assert event["_received_at"] == "2026-08-27T20:00:00Z"
+    assert event["type"] == "assistant"
+
+
+def test_stamp_event_line_leaves_non_json_untouched():
+    assert bench_run.stamp_event_line("plain text\n") == "plain text\n"
+    # `{}` cannot take a prepended key without corrupting the object.
+    assert bench_run.stamp_event_line("{}\n") == "{}\n"
+
+
+def _managed_run(
+    tmp_path,
+    monkeypatch,
+    rc: int,
+    *,
+    spec_extra: dict | None = None,
+    argv_extra: tuple[str, ...] = (),
+    calls: dict | None = None,
+) -> tuple[int, Path, dict]:
+    """Drive `main()` down the managed path with a harness that exits `rc`.
+
+    `calls` opts into recording which lab-root mutations were attempted: the
+    named functions write the lab's own adapter files, and a masked harness
+    condition must not call them at all.
+    """
+    monkeypatch.setattr(bench_run, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(bench_run, "DATA_DIR", tmp_path / "data" / "runs")
+    monkeypatch.setattr(bench_run, "WORKSPACE_ROOT", tmp_path / "workspace")
+    for name in (
+        "_load_env",
+        "apply_gateway_overlay",
+        "restore_full_skill_views",
+        "write_bench_context",
+        "apply_skill_views",
+    ):
+        if calls is not None and name in calls:
+            monkeypatch.setattr(
+                bench_run,
+                name,
+                lambda *_a, _n=name, **_k: calls.__setitem__(_n, calls[_n] + 1),
+            )
+        else:
+            monkeypatch.setattr(bench_run, name, lambda *_a, **_k: None)
+    if calls is not None and "build_effective_skills" in calls:
+        monkeypatch.setattr(
+            bench_run,
+            "build_effective_skills",
+            lambda *_a, **_k: calls.__setitem__(
+                "build_effective_skills", calls["build_effective_skills"] + 1
+            )
+            or [],
+        )
+    else:
+        monkeypatch.setattr(bench_run, "build_effective_skills", lambda *_a, **_k: [])
+    monkeypatch.setattr(bench_run, "copy_to_clipboard", lambda *_a, **_k: False)
+    monkeypatch.setattr(bench_run.shutil, "which", lambda name: f"/usr/bin/{name}")
+    for name in ("pull_usage_litellm", "pull_usage_langfuse", "pull_usage_opencode_db"):
+        monkeypatch.setattr(bench_run, name, lambda *_a, **_k: None)
+
+    seen: dict = {}
+
+    def fake_run(cmd, log_path, **kwargs):
+        seen["cwd"] = kwargs.get("cwd")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("SSE stream closed unexpectedly\n")
+        return rc
+
+    monkeypatch.setattr(bench_run, "run_opencode", fake_run)
+
+    out_dir = tmp_path / "data" / "runs" / "r-1"
+    out_dir.mkdir(parents=True)
+    spec = {
+        "case_id": "db-case-1",
+        "prompt": "Build it.",
+        "prompt_variant": "sdlc",
+        "repo": "",
+    }
+    spec.update(spec_extra or {})
+    (out_dir / "case_spec.json").write_text(json.dumps(spec))
+    code = bench_run.main(
+        [
+            "--case",
+            "db-case-1",
+            "--run",
+            "r-1",
+            "--harness",
+            "claude",
+            "--executor-model",
+            "stub",
+            "--score-mode",
+            "manual",
+            "--fresh",
+            *argv_extra,
+        ]
+    )
+    return code, out_dir, seen
+
+
+def test_a_dead_harness_exits_non_zero_but_keeps_its_evidence(tmp_path, monkeypatch):
+    """A crashed harness must not archive as a legitimate attempt (ADR-0046).
+
+    This exit used to be 0, so the worker — which reads the exit code, not
+    usage.json — recorded `state=completed` and auto-scored the run 0: a dead
+    connection entered the corpus as a model that could not solve the case.
+    The non-zero return comes *after* usage.json and the archive, because the
+    evidence of why is the whole point.
+    """
+    code, out_dir, _ = _managed_run(tmp_path, monkeypatch, rc=2)
+
+    assert code != 0
+    usage = json.loads((out_dir / "usage.json").read_text())
+    assert usage["stop_reason"] == "harness_error"
+    # The archive survives the non-zero exit: the return sits after it.
+    assert (out_dir / "workspace").is_dir()
+
+
+def test_a_harness_that_finished_still_exits_zero(tmp_path, monkeypatch):
+    code, out_dir, _ = _managed_run(tmp_path, monkeypatch, rc=0)
+
+    assert code == 0
+    assert json.loads((out_dir / "usage.json").read_text()).get("stop_reason") is None
+
+
+# --------------------------------------------------------------------------
+# Harness conditions in the runner (ADR-0049)
+# --------------------------------------------------------------------------
+
+
+def test_a_bare_run_never_writes_to_the_lab_tree(tmp_path, monkeypatch):
+    """A bare arm must not touch what a bare arm cannot see.
+
+    `restore_full_skill_views` and `apply_skill_views` rewrite the lab's own
+    adapter files (CLAUDE.md, OPENCODE.md, `.claude/skills`), which in a masked
+    container are read-only empty binds: the write would raise, and if it
+    succeeded it would refill the very mask that makes the arm bare. Same for
+    BENCH_CONTEXT.md.
+    """
+    calls = {
+        "restore_full_skill_views": 0,
+        "apply_skill_views": 0,
+        "write_bench_context": 0,
+        "build_effective_skills": 0,
+    }
+    code, out_dir, seen = _managed_run(
+        tmp_path,
+        monkeypatch,
+        rc=0,
+        spec_extra={"harness_source": "bare"},
+        argv_extra=("--disable-skill", "brainstorming"),
+        calls=calls,
+    )
+
+    assert code == 0
+    assert calls == dict.fromkeys(calls, 0)
+    # The agent runs from the workspace, not the lab root.
+    assert seen["cwd"] == tmp_path / "workspace" / "r-1"
+    meta = json.loads((out_dir / "metadata.json").read_text())
+    assert meta["harness_source"] == "bare"
+    # No catalog and no subagents, stated rather than inferred from the masks.
+    assert meta["skills_bundle"] == []
+    assert meta["subagents"] == []
+    # The declaration survives for the condition hash even though nothing was
+    # ablated: it is what makes the arm addressable.
+    assert meta["skills_disabled"] == ["brainstorming"]
+    assert meta["harness_git_dirty"] is None
+    assert meta["harness_fingerprint"]["harness_root"] == "workspace"
+    assert "current working directory" in (out_dir / "prompt.md").read_text()
+
+
+def test_a_bare_run_reads_its_condition_before_it_acts_on_it(tmp_path, monkeypatch):
+    """The reorder, pinned.
+
+    `--disable-skill <unknown>` is rejected by `build_effective_skills`, which
+    used to run before `harness_source` was read. A bare run has no catalog to
+    check the name against, so reaching exit 0 here proves the condition is now
+    known before anything acts on it.
+    """
+    code, _out_dir, _seen = _managed_run(
+        tmp_path,
+        monkeypatch,
+        rc=0,
+        spec_extra={"harness_source": "bare"},
+        argv_extra=("--disable-skill", "no-such-skill-anywhere"),
+    )
+
+    assert code == 0
+
+
+def test_a_bare_run_refuses_to_stage_or_invoke_a_skill(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit) as excinfo:
+        _managed_run(
+            tmp_path,
+            monkeypatch,
+            rc=0,
+            spec_extra={"harness_source": "bare"},
+            argv_extra=("--invoke-skill", "brainstorming"),
+        )
+
+    assert "bare" in str(excinfo.value)
+
+
+def test_a_bare_run_refuses_an_unmasked_lab_root(tmp_path, monkeypatch):
+    """The tripwire: on the host lane nothing masks the lab (ADR-0049).
+
+    The workspace lives under the repo root, so a readable CLAUDE.md there is
+    an ancestor memory file — the control arm would be a second treatment arm
+    and nothing downstream would ever say so.
+    """
+    (tmp_path / "CLAUDE.md").write_text("# the lab's governance\n")
+
+    with pytest.raises(SystemExit) as excinfo:
+        _managed_run(tmp_path, monkeypatch, rc=0, spec_extra={"harness_source": "bare"})
+
+    assert "masked" in str(excinfo.value) or "readable" in str(excinfo.value)
+
+
+def test_a_lab_root_run_still_regenerates_its_skill_views(tmp_path, monkeypatch):
+    """The gate must not be so broad that it breaks the ordinary ablation."""
+    calls = {
+        "restore_full_skill_views": 0,
+        "apply_skill_views": 0,
+        "build_effective_skills": 0,
+    }
+    code, _out_dir, seen = _managed_run(
+        tmp_path,
+        monkeypatch,
+        rc=0,
+        argv_extra=("--disable-skill", "brainstorming"),
+        calls=calls,
+    )
+
+    assert code == 0
+    assert calls["restore_full_skill_views"] == 1
+    assert calls["apply_skill_views"] == 1
+    assert calls["build_effective_skills"] == 1
+    # And it runs from the lab root, which is the whole point of the condition.
+    assert seen["cwd"] is None
+
+
+# --------------------------------------------------------------------------
+# "Needs a clone" and "is SWE-bench" are different questions
+# --------------------------------------------------------------------------
+
+
+def test_a_target_paired_case_needs_a_clone_but_is_not_swe_bench():
+    """The conflation that invalidated both talos experiments.
+
+    `source: "git_target"` is stamped on every case paired with an external
+    repository (ADR-0029/0030) — a documentation review, a shell test suite,
+    anything. It was read as "this is SWE-bench", so from step 2 onward those
+    runs were told to resolve a GitHub issue, shown an empty list of target
+    failing tests, and instructed to run `python -m pytest` in a repository
+    with no Python. Both arms, both experiments.
+    """
+    spec = {"source": "git_target", "repo": "acme/talos", "case_type": "repo_task"}
+
+    assert bench_run.spec_provisions_repo(spec) is True
+    assert bench_run.spec_is_swe_bench(spec) is False
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"case_type": "swe_bench_instance", "repo": "pallets/flask"},
+        {"case_type": "swe_pro", "repo": "a/b"},
+        {"repo": "astropy/astropy", "fail_to_pass": ["tests/test_x.py::test_y"]},
+    ],
+)
+def test_a_real_swe_case_is_still_recognised(spec):
+    assert bench_run.spec_is_swe_bench(spec) is True
+
+
+def test_nothing_at_all_is_not_swe_bench():
+    assert bench_run.spec_is_swe_bench(None) is False
+    assert bench_run.spec_is_swe_bench({}) is False
+
+
+def test_a_swe_spec_naming_no_failing_tests_stops_the_run(tmp_path):
+    """A SWE-bench task IS its failing tests; without them there is no objective.
+
+    The prompt used to render an empty bullet list under "Target failing
+    test(s):" and a bare `python -m pytest` under "Run them with:" —
+    instructions to run nothing. That must fail loudly instead of reaching the
+    agent.
+    """
+    with pytest.raises(bench_run.SweSpecError):
+        bench_run.generate_swe_continuation_prompt(
+            "flask-K-001",
+            2,
+            tmp_path,
+            {"case_type": "swe_bench_instance", "fail_to_pass": []},
+            None,
+        )
+
+
+def test_a_swe_continuation_still_names_its_tests(tmp_path):
+    path = bench_run.generate_swe_continuation_prompt(
+        "flask-K-001",
+        2,
+        tmp_path,
+        {"case_type": "swe_bench_instance", "fail_to_pass": ["tests/t.py::test_a"]},
+        None,
+    )
+    text = path.read_text()
+
+    assert "Target failing test(s):" in text
+    assert "tests/t.py::test_a" in text
+
+
+def test_the_generic_continuation_says_nothing_about_failing_tests(tmp_path):
+    """What a target-paired non-SWE case gets instead, at step 2."""
+    path = bench_run.generate_generic_continuation_prompt("talos-K-001", 2, tmp_path)
+    text = path.read_text()
+
+    assert "Target failing test" not in text
+    assert "SWE-bench" not in text
+    assert "python -m pytest" not in text
+
+
+def test_usage_json_records_which_prompt_each_step_was_given(tmp_path):
+    """The leak showed up in no stored number. Now it shows up in one."""
+    path = bench_run.write_usage_json(
+        tmp_path, {"steps": 2, "prompt_kinds": ["case", "generic"]}
+    )
+    stored = json.loads(path.read_text())
+
+    assert stored["prompt_kinds"] == ["case", "generic"]
+
+
+def test_a_usage_skeleton_names_the_field_even_when_empty(tmp_path):
+    stored = json.loads(bench_run.write_usage_json(tmp_path, None).read_text())
+
+    assert "prompt_kinds" in stored
+
+
+def test_finalize_workspace_includes_files_the_agent_created(tmp_path):
+    """`git diff <ref>` lists tracked files only. Two talos arms each wrote a
+    new test file and shipped an empty patch; the judge scored one of them 0
+    for a file a PASS check had just executed."""
+    import subprocess
+
+    workspace = tmp_path / "workspace" / "talos-K-001"
+    workspace.mkdir(parents=True)
+    git = lambda *args: subprocess.run(  # noqa: E731
+        ["git", "-C", str(workspace), *args], check=True, capture_output=True, text=True
+    )
+    git("init", "-q")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    (workspace / "lib.sh").write_text("echo old\n")
+    (workspace / ".gitignore").write_text("build/\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "provisioned")
+    # The agent: edits a tracked file, creates a new one, and leaves build output.
+    (workspace / "lib.sh").write_text("echo new\n")
+    (workspace / "tests").mkdir()
+    (workspace / "tests" / "test_new.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (workspace / "build").mkdir()
+    (workspace / "build" / "out.bin").write_text("x")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    bench_run.finalize_workspace(out_dir, workspace, "talos-K-001")
+
+    patch = (out_dir / "diff.patch").read_text()
+    assert "+echo new" in patch
+    assert "tests/test_new.sh" in patch and "+exit 0" in patch
+    assert "build/out.bin" not in patch

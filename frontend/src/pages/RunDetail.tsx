@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { ArtifactsPanel } from "../components/ArtifactsPanel";
 import { ErrorBanner } from "../components/ErrorBanner";
@@ -186,7 +186,14 @@ export function RunDetail({
   const [proposalNotice, setProposalNotice] = useState<string | null>(null);
   const [proposalCopied, setProposalCopied] = useState(false);
   const [copiedField, setCopiedField] = useState<string | null>(null);
-  const [tab, setTab] = useState<"detail" | "terminal" | "desktop">("detail");
+  // The sandbox is reachable by link, not only by clicking through: a wizard
+  // that tells you to go and look inside the workspace has to be able to point
+  // at it. Read once, at mount — after that the tab is yours.
+  const [searchParams] = useSearchParams();
+  const requestedTab = searchParams.get("tab");
+  const [tab, setTab] = useState<"detail" | "terminal" | "desktop">(
+    requestedTab === "terminal" || requestedTab === "desktop" ? requestedTab : "detail"
+  );
   const consoleRef = useRef<HTMLDivElement | null>(null);
   // A claude run with events-based attribution has real tool counts; only fall
   // back to the summary-only explainer when there is nothing to show.
@@ -467,6 +474,11 @@ export function RunDetail({
   // ("resolved=True F2P=1/1 P2P=18/18") written by swebench_validate.py.
   const isSwebench = validation?.objective?.summary?.startsWith("resolved=") ?? false;
 
+  // null means "nothing was measured". That is two different situations: a case
+  // with no objective criterion at all (manual scoring), or checks that ran and
+  // could not conclude — a timeout is a fact about the lab, not about the code.
+  const hasChecks = (validation?.objective?.checks?.length ?? 0) > 0;
+
   const objectiveBadge = (passed: boolean | null | undefined) => {
     if (isSwebench) {
       if (passed === true) return <span className="badge ok">SWE-bench: RESOLVED</span>;
@@ -474,6 +486,7 @@ export function RunDetail({
     }
     if (passed === true) return <span className="badge ok">objective: pass</span>;
     if (passed === false) return <span className="badge error">objective: fail</span>;
+    if (hasChecks) return <span className="badge warn">objective: inconclusive</span>;
     return <span className="badge">objective: manual</span>;
   };
 
@@ -682,7 +695,7 @@ export function RunDetail({
           <p className="muted run-lineage">
             {run.parent_run_id ? (
               <>
-                Continues <Link to={`/runs/${run.parent_run_id}`}>{run.parent_run_id}</Link>
+                Continues <Link to={`/advanced/runs/${run.parent_run_id}`}>{run.parent_run_id}</Link>
               </>
             ) : null}
             {run.parent_run_id && children.length > 0 ? " · " : null}
@@ -692,7 +705,7 @@ export function RunDetail({
                 {children.map((child, index) => (
                   <span key={child.run_id}>
                     {index > 0 ? ", " : ""}
-                    <Link to={`/runs/${child.run_id}`}>{child.run_id}</Link>
+                    <Link to={`/advanced/runs/${child.run_id}`}>{child.run_id}</Link>
                   </span>
                 ))}
               </>
@@ -794,14 +807,19 @@ export function RunDetail({
           <strong>{run.failure_reason ?? "None"}</strong>
         </div>
       </div>
-      {run.state === "awaiting_manual_score" ? (
+      {run.state === "awaiting_manual_score" || run.state === "completed" ? (
         <div className="panel subtle">
           <div className="panel-head">
             <h3>Manual score</h3>
             <span className="muted">
               {isSwebench
                 ? "SWE-bench runs auto-score from validation — use Re-validate below instead"
-                : "Required to complete run"}
+                : run.state === "completed"
+                  ? // A run with objective validation completes on its own, so this
+                    // form would never appear for it — and the human judgement of
+                    // *how* it did is exactly what the objective verdict cannot say.
+                    "Already scored objectively — add your judgement of the work"
+                  : "Required to complete run"}
             </span>
           </div>
           <div className="form-grid score-form-grid">
@@ -941,17 +959,19 @@ export function RunDetail({
             </div>
             {validation.objective?.checks && validation.objective.checks.length > 0 ? (
               <div className="run-console">
-                {validation.objective.checks.map((check, index) => (
-                  <div
-                    className={`run-console-line ${check.passed ? "info" : "error"}`}
-                    key={index}
-                  >
-                    <span>{check.passed ? "✓" : "✗"}</span>
-                    <span>
-                      {check.name} (exit {check.exit_code ?? "?"}) {check.detail}
-                    </span>
-                  </div>
-                ))}
+                {validation.objective.checks.map((check, index) => {
+                  const inconclusive = check.conclusive === false;
+                  const tone = inconclusive ? "warn" : check.passed ? "info" : "error";
+                  const mark = inconclusive ? "⊘" : check.passed ? "✓" : "✗";
+                  return (
+                    <div className={`run-console-line ${tone}`} key={index}>
+                      <span title={inconclusive ? "did not measure" : undefined}>{mark}</span>
+                      <span>
+                        {check.name} (exit {check.exit_code ?? "?"}) {check.detail}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             ) : null}
           </>
@@ -965,9 +985,10 @@ export function RunDetail({
           </p>
         ) : (
           <p className="muted">
-            Objective validation runs a headless smoke of workspace/{run.run_id}/ in the
-            runner container (SDL dummy driver). The functional level below is the
-            subjective dimension; the composite gates it by the objective floor.
+            Objective validation runs the case&apos;s — or the target repository&apos;s —
+            validation commands against the archived workspace in a runner container.
+            The functional level is the subjective dimension; the composite is gated by
+            the objective floor.
           </p>
         )}
       </div>
@@ -995,7 +1016,7 @@ export function RunDetail({
               (<code>permission=edit</code>, <code>read</code>, <code>bash</code>…) that
               opencode emits. Counts would all read 0 — not because the agent did
               nothing, but because the harness doesn't expose them. Only the step count
-              is observable; judge behavior from the LLM audit below.
+              is observable; judge behaviour from the LLM audit below.
             </p>
             <div className="detail-grid">
               <div>
@@ -1061,7 +1082,9 @@ export function RunDetail({
                 <strong>
                   {attribution.harness_usage.governance_source === "target_workspace"
                     ? "target repository's own"
-                    : "lab repository's"}
+                    : attribution.harness_usage.governance_source === "bare"
+                      ? "empty"
+                      : "lab repository's"}
                 </strong>{" "}
                 governance surface, under{" "}
                 <code>harness_source={attribution.harness_usage.harness_source}</code>
@@ -1069,6 +1092,13 @@ export function RunDetail({
                   ? ` · fingerprint ${attribution.harness_usage.governance_fingerprint.slice(0, 12)}`
                   : ""}
                 .
+              </p>
+            ) : null}
+            {attribution.harness_usage?.governance_source === "bare" ? (
+              <p className="muted small">
+                A bare run had no governance to read: the runner masked the lab's
+                CLAUDE.md, hooks, subagents and <code>.github/</code>, so read
+                coverage is not a measure of anything here (ADR-0049).
               </p>
             ) : null}
             {attribution.harness_usage?.governance_warning ? (
@@ -1088,7 +1118,7 @@ export function RunDetail({
             <input
               className="audit-model-input"
               onChange={(event) => setAuditModel(event.target.value)}
-              placeholder="auditor model (optional)"
+              placeholder="auditor model — empty uses the transport default"
               type="text"
               value={auditModel}
             />
@@ -1188,7 +1218,7 @@ export function RunDetail({
               type="button"
             >
               {improving
-                ? "Synthesizing..."
+                ? "Synthesising..."
                 : improvements
                   ? "Re-synthesize"
                   : "Propose improvements"}

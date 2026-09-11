@@ -273,6 +273,7 @@ def compute_condition_hash(
     gateway_overlay_hash: str | None = None,
     target: dict[str, Any] | None = None,
     harness_source: str = "",
+    skills_invoke: tuple[str, ...] = (),
 ) -> str:
     """Deterministic id of the experimental arm (excludes provenance-only fields).
 
@@ -301,6 +302,10 @@ def compute_condition_hash(
         identity["skills_disabled"] = sorted(set(skills_disabled))
     if skills_extra_hashes:
         identity["skills_extra"] = dict(sorted(skills_extra_hashes.items()))
+    if skills_invoke:
+        # Being told to use a skill is a different arm from having it on the
+        # menu (ADR-0041). Same non-empty-only rule as the fields above.
+        identity["skills_invoke"] = sorted(set(skills_invoke))
     if gateway_overlay_hash:
         identity["gateway_overlay"] = gateway_overlay_hash
     if harness_source and harness_source != "lab_root":
@@ -336,6 +341,7 @@ def build_condition(
     harness_source: str = "",
     harness_root: Path | None = None,
     harness_projection: dict[str, Any] | None = None,
+    skills_invoke: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Assemble the full, hashable trial condition manifest.
 
@@ -367,6 +373,7 @@ def build_condition(
             gateway_overlay_hash=gateway_overlay_hash,
             target=target,
             harness_source=harness_source,
+            skills_invoke=skills_invoke,
         ),
         "gateway_overlay_hash": gateway_overlay_hash,
         "harness_source": harness_source or "lab_root",
@@ -388,7 +395,16 @@ def build_condition(
         "case_hash": case_hash,
         "skills_ablation": ablation_active,
         "lab_git_commit": _git(repo_root, "rev-parse", "HEAD"),
-        "harness_git_dirty": _harness_git_dirty(repo_root, exclude=dirty_exclude),
+        # Only meaningful when the lab tree *is* the harness under test. Every
+        # other source runs the agent from the workspace with the lab's
+        # governance masked in the container (ADR-0049), so git reports the
+        # masked paths as deleted and every such run would record itself dirty.
+        # None says "not applicable", which is the honest answer.
+        "harness_git_dirty": (
+            _harness_git_dirty(repo_root, exclude=dirty_exclude)
+            if harness_source in ("", "lab_root")
+            else None
+        ),
         "runner_image": runner_image,
     }
 
@@ -411,6 +427,7 @@ def enrich_metadata(
     harness_source: str = "",
     harness_root: Path | None = None,
     harness_projection: dict[str, Any] | None = None,
+    skills_invoke: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Add the condition manifest to a metadata dict; never raises."""
     with contextlib.suppress(Exception):
@@ -431,6 +448,7 @@ def enrich_metadata(
                 harness_source=harness_source,
                 harness_root=harness_root,
                 harness_projection=harness_projection,
+                skills_invoke=skills_invoke,
             )
         )
     return meta

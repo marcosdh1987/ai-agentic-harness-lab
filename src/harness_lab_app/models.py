@@ -61,11 +61,19 @@ class ExperimentMode(StrEnum):
 
     The mode is not decoration: it decides which comparisons are valid, and the
     lab refuses a design that contradicts the mode it declares.
+
+    ``subject_validation`` (ADR-0040) is the odd one and deliberately so. The
+    other three interrogate the harness; this one holds the harness as *setting*
+    and asks whether some other thing — a tool, an MCP server, an internal API,
+    and the skill that drives it — does its job reliably across harnesses and
+    models. Mechanically it is the same runs. Epistemically it has no ablated
+    arm, so it can report a pass rate per arm and nothing about the harness.
     """
 
     harness_evaluation = "harness_evaluation"
     cross_repo = "cross_repo"
     discovery = "discovery"
+    subject_validation = "subject_validation"
 
 
 class ExperimentStatus(StrEnum):
@@ -90,16 +98,30 @@ class HarnessSource(StrEnum):
     repository. They differ in what is there when it arrives — nothing but the
     repo's own conventions, or the lab's harness materialized on top. That pair
     is the comparison: same repo, same case, same model, harness varied.
+
+    ``bare`` is the same idea without a repository (ADR-0049): the agent runs in
+    an empty workspace and the lab's governance surface is masked inside the
+    runner container, so it sees the prompt and nothing else. It is the control
+    a lab-native case like Tetris needs — a `lab_root` "bare" arm still carries
+    CLAUDE.md, the SessionStart hook, the subagents and `.github/`.
     """
 
     lab_root = "lab_root"
     native = "native"
     injected = "injected"
+    bare = "bare"
 
 
 # The two sources that require an external target: both run the agent inside the
 # cloned repository, which does not exist for a lab-root run.
 IN_TARGET_HARNESS_SOURCES = frozenset({HarnessSource.native, HarnessSource.injected})
+
+# Every source whose agent runs from the workspace rather than the lab root, and
+# whose container therefore masks the lab's governance so it cannot be picked up
+# from an ancestor directory (the workspace lives under the repo root).
+MASKED_HARNESS_SOURCES = frozenset(
+    {HarnessSource.native, HarnessSource.injected, HarnessSource.bare}
+)
 
 
 class TargetStatus(StrEnum):
@@ -130,6 +152,11 @@ class Case(SQLModel, table=True):
     tags: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     subject_repo: str | None = None
     base_commit: str | None = None
+    # The target repository this case was authored against, when it was authored
+    # from one (ADR-0042). A tag would have done the same job loosely; a column
+    # is what lets a repository's page list "the cases we have for this repo"
+    # without string-matching, which is the whole point of a case library.
+    origin_target_id: str = Field(default="", index=True)
     prompt_variants: dict[str, str] = Field(
         default_factory=dict, sa_column=Column(JSON)
     )
@@ -185,6 +212,15 @@ class TargetRepository(SQLModel, table=True):
     language: str = ""
     team: str = ""
     tags: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    # The engineer's own clone of this repository, on the machine running the lab
+    # (ADR-0042). Set once the operator has cloned it with their own credentials
+    # and pinned it; empty means the lab still reads the repository over the
+    # network. `pinned_commit` is the commit that clone was at when it was
+    # pinned, and it is what runs and readiness read — a repository the lab keeps
+    # re-resolving is a repository whose findings cannot be compared week to week.
+    checkout_path: str = ""
+    pinned_commit: str = ""
+    pinned_at: datetime | None = None
     metadata_json: dict[str, str] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -206,6 +242,9 @@ class RunConfig(SQLModel, table=True):
     continuation_prompt: str = ""
     skills_disabled: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     skills_extra: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    # Skills the prompt tells the agent to invoke (ADR-0041). Part of the arm:
+    # "asked to use it" and "free to use it" are different conditions.
+    skills_invoke: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     # External target repository this run works against (ADR-0029). All three
     # are empty for a run with no external target — which is every run created
     # before targets existed, so absence is the historical default, not a gap.
@@ -269,6 +308,12 @@ class Experiment(SQLModel, table=True):
     name: str
     question: str
     mode: ExperimentMode
+    # What is under test, when the answer is not "the harness" (ADR-0040).
+    # Required for `subject_validation`, empty everywhere else. Declared rather
+    # than recovered from the conditions on purpose: the sentence this mode
+    # licenses names the subject, and a name reconstructed from overrides is the
+    # reconstruction ADR-0033 exists to refuse.
+    subject: str = ""
     status: ExperimentStatus = ExperimentStatus.draft
     case_ids: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     prompt_variants: list[str] = Field(default_factory=list, sa_column=Column(JSON))
@@ -284,6 +329,17 @@ class Experiment(SQLModel, table=True):
     # The regression suite this experiment was generated from, when it was
     # (ADR-0037). Empty for a hand-designed experiment.
     suite_id: str = ""
+    # The family this experiment belongs to — a set of single-factor
+    # experiments read together, such as the harness ladder (ADR-0051):
+    # bare → governance → +skills → +harness prompt → +activation. Empty for
+    # a standalone experiment.
+    family_id: str = ""
+    # What the design was warned about when it was created (ADR-0046). The
+    # wizard's objections used to die in the 201 response body, so a design
+    # someone was told was confounded rendered a fully confident verdict
+    # afterwards with no trace of the objection. Persisting them is what lets
+    # `summarize` put them back in front of the reader.
+    design_notes: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     notes: str = ""
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -410,6 +466,29 @@ class Sandbox(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class GateCheck(SQLModel, table=True):
+    """Did this repository pass its own gate at the pinned commit, with no agent?
+
+    The control measurement of an audit (ADR-0042). Kept as rows rather than a
+    field on the target because it is a *result at a commit*: re-pinning a
+    month later and finding the gate red is itself the finding, and that is
+    only visible if the earlier green one is still on the record.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    gate_check_id: str = Field(index=True, unique=True)
+    target_id: str = Field(index=True)
+    commit: str = ""
+    status: str = "running"  # running | done | failed
+    passed: bool | None = None
+    failed_phase: str = ""
+    # Per-command results: [{phase, command, exit_code, passed, detail}].
+    checks_json: list = Field(default_factory=list, sa_column=Column(JSON))
+    error: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class Audit(SQLModel, table=True):
     """Qualitative LLM audit of a run (descriptive behavior diagnostic).
 
@@ -435,6 +514,89 @@ class Audit(SQLModel, table=True):
     # verdict scored against the lab's own rules has to be identifiable rather
     # than trusted (see `harness_lab_app.governance`).
     governance_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    error: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ExperimentAudit(SQLModel, table=True):
+    """A natural-language reading of a finished experiment, written by an LLM.
+
+    The summary page already computes everything — validity, verdict, deltas,
+    what each arm read and invoked — but it renders as cards and caveats. This
+    is the same evidence read back as prose: what was compared, what came out,
+    what the arms actually used, and whether the comparison can be trusted.
+    The evidence the model was given is stored beside the text so a reader can
+    check any sentence against the numbers it came from.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    experiment_id: str = Field(index=True, unique=True)
+    auditor_model: str = ""
+    status: str = "running"  # running | done | failed
+    markdown: str = ""
+    evidence_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    error: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class CompareAudit(SQLModel, table=True):
+    """A natural-language reading of an ad-hoc comparison, written by an LLM.
+
+    The Compare page lines up 2-4 runs side by side and highlights the winning
+    cell per row, but it never says what the table means: whether a column
+    actually improved on the baseline, which dashes are "not measured" rather
+    than zero, and which of the visible differences could account for a delta.
+    This is that reading.
+
+    Unlike an experiment, a comparison has no server-side identity -- it is a
+    selection of run ids a person made in the browser. `comparison_key` is a
+    hash of the sorted, de-duplicated set, so the same selection resolves to
+    the same row no matter what order the columns were added in, and asking
+    again overwrites the reading instead of accumulating rows.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    comparison_key: str = Field(index=True, unique=True)
+    run_ids: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    auditor_model: str = ""
+    status: str = "running"  # running | done | failed
+    markdown: str = ""
+    evidence_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    error: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class RepositoryAudit(SQLModel, table=True):
+    """The LLM reading of a repository's harness, before the lab runs anything.
+
+    Step 2 of the guided audit. The lab reads the checkout at the pinned commit
+    — rules files, skills, agents, hooks, CI, build files — and an auditor
+    model says what harness that amounts to, in which language, and what could
+    be tried on it. One row per target: a re-audit at a new pin replaces it,
+    and ``commit`` says which tree the text is about.
+
+    The gate that decides whether the wizard continues (``next_step`` inside
+    ``evidence_json``) is computed from the deterministic evidence, never taken
+    from the model: which toolchains the runner ships and whether any harness
+    file exists are facts the lab can check, and a judgement must not be able
+    to open a door a fact has closed.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    target_id: str = Field(index=True, unique=True)
+    commit: str = ""
+    auditor_model: str = ""
+    status: str = "running"  # running | done | failed
+    markdown: str = ""
+    # The model's structured answer (summary, harness_verdict, components, use
+    # cases, gaps). Empty with a `parse_error` key when its JSON did not parse.
+    findings_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    # What the model was given, plus the lab's own verdict on runtime support
+    # and harness presence — the half of the report a reader can verify.
+    evidence_json: dict = Field(default_factory=dict, sa_column=Column(JSON))
     error: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
