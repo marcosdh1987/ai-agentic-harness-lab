@@ -10,6 +10,7 @@ import {
 import { ErrorBanner } from "../components/ErrorBanner";
 import { HelpPanel } from "../components/HelpPanel";
 import { ModelPicker } from "../components/ModelPicker";
+import { PromptPreview } from "../components/PromptPreview";
 import { IconAlert, IconArrowRight } from "../components/icons";
 import type {
   CaseRecord,
@@ -48,8 +49,20 @@ const FACTORS = [
       "every skill, against a bare arm with the skills hidden and a plain " +
       "prompt. A win says the harness earns its keep as a unit — ablate " +
       "factors afterwards to see which parts do the work.",
-    controlLabel: "Bare — plain prompt, skills hidden",
+    controlLabel: "Bare — empty workspace, governance masked, skills hidden",
     treatmentLabel: "Full harness"
+  },
+  {
+    key: "governance",
+    label: "Governance body",
+    blurb:
+      "The rulebook alone: CLAUDE.md, the SessionStart hook, the subagents, " +
+      "the slash commands, the .github/ governance and the MCP servers — " +
+      "against nothing at all. Both arms hide every skill and run the same " +
+      "prompt, so a difference is about the governance and not about the " +
+      "catalog. Lab venue only.",
+    controlLabel: "Bare — an empty workspace, nothing loaded",
+    treatmentLabel: "Governance body, skills hidden"
   },
   {
     key: "skills_extra",
@@ -73,6 +86,29 @@ const FACTORS = [
     treatmentLabel: "Without the skills"
   },
   {
+    key: "prompt",
+    label: "Harness prompt",
+    blurb:
+      "The preamble alone: the plain task against the task with the harness " +
+      "instruction prepended (read .github/, use these skills), with the " +
+      "governance body and the whole catalog present on both arms. Rung 3 of " +
+      "the ladder — what the wording adds once everything is already there.",
+    controlLabel: "Plain prompt",
+    treatmentLabel: "Harness prompt"
+  },
+  {
+    key: "activation",
+    label: "Activation",
+    blurb:
+      "Being asked outright. Both arms carry the harness prompt and the whole " +
+      "catalog; the treatment also gets the activation block that names every " +
+      "skill and requires the agent to invoke it at the start of each step. " +
+      "Rung 4 of the ladder — the difference between a harness on disk and a " +
+      "harness in use (ADR-0041).",
+    controlLabel: "Harness prompt, skills available",
+    treatmentLabel: "Harness prompt, skills invoked"
+  },
+  {
     key: "harness",
     label: "Swap the harness",
     blurb: "The same case and model driven by a different agent CLI.",
@@ -86,10 +122,13 @@ type FactorKey = (typeof FACTORS)[number]["key"];
 /** Backend ceiling on an experiment slug; suffixes have to fit inside it. */
 const MAX_SLUG = 64;
 
+// Three named levels, sized for a budget a lab can actually spend: one run
+// per arm explores, two is enough for a judgement the page will state, five is
+// a validation. The backend's wording ladder matches (statistics.py).
 const REPETITION_CHOICES = [
-  { value: 2, label: "2 — exploratory only" },
-  { value: 5, label: "5 — useful comparison" },
-  { value: 10, label: "10 — stronger evidence" }
+  { value: 1, label: "1 — exploratory" },
+  { value: 2, label: "2 — judgement" },
+  { value: 5, label: "5 — validation" }
 ];
 
 function slugify(value: string): string {
@@ -179,12 +218,16 @@ export function NewEvaluation() {
   const [venue, setVenue] = useState<"lab" | "target">("lab");
   const [useSuite, setUseSuite] = useState(false);
   const [suiteId, setSuiteId] = useState("harness-regression-v1");
-  const [repetitions, setRepetitions] = useState(5);
+  const [repetitions, setRepetitions] = useState(2);
   // Adding one skill is the narrowest useful test and the commonest question
   // asked of this lab's own harness, so it is where the form opens. Governance
   // source needs an external repository and would open the form blocked.
   const [factorKey, setFactorKey] = useState<FactorKey>("skills_extra");
   const [skillNames, setSkillNames] = useState<string[]>([]);
+  // Off answers "does the skill help unasked" (only available, the agent
+  // decides); on answers "does it help when asked for" (the agent is told to
+  // invoke it at the start of every step).
+  const [enforceSkills, setEnforceSkills] = useState(false);
   // The full-harness comparison's prompt pair: the bare and the governed
   // member of whichever prompt family the selected cases are from.
   const [bareVariant, setBareVariant] = useState("");
@@ -280,10 +323,13 @@ export function NewEvaluation() {
     [cases, caseIds]
   );
 
-  // Union across the selected cases, exactly as batch mode does it: a case
-  // without the chosen variant contributes no runs for it, but an intersection
-  // goes empty as soon as one case is unusual.
-  const variantOptions = useMemo(() => {
+  /** Whether a case declares this variant — the shape `promptEntriesFor` reads. */
+  const declares = (item: CaseRecord, variant: string) =>
+    typeof item.prompt_variants?.[variant] === "string";
+
+  // Every variant *some* selected case declares. Not what the pickers offer —
+  // it exists to explain what a mixed selection costs.
+  const declaredVariants = useMemo(() => {
     const names = new Set<string>();
     for (const item of selectedCases) {
       for (const variant of Object.keys(item.prompt_variants ?? {})) {
@@ -292,6 +338,50 @@ export function NewEvaluation() {
     }
     return [...names].sort();
   }, [selectedCases]);
+
+  // What the pickers offer: the variants EVERY selected case declares.
+  //
+  // The union is what batch mode uses, and it is right there — a batch drops
+  // the pairs a case cannot run and carries on. An experiment cannot: it runs
+  // one design across every case it selected, and `experiment_service.launch`
+  // refuses the whole launch if any case lacks the variant an arm asks for.
+  // Offering the union meant a lab case and three SWE-bench instances put
+  // 'default'/'harness' in the pickers, and the refusal arrived six screens
+  // later, after the experiment had already been created (ADR-0059).
+  const variantOptions = useMemo(() => {
+    if (selectedCases.length === 0) {
+      return [];
+    }
+    return declaredVariants.filter((variant) =>
+      selectedCases.every((item) => declares(item, variant))
+    );
+  }, [declaredVariants, selectedCases]);
+
+  // The selected cases grouped by the prompt family they belong to, phrased for
+  // an operator who has to fix the selection: which cases, declaring what.
+  const variantFamilies = useMemo(() => {
+    const groups = new Map<string, string[]>();
+    for (const item of selectedCases) {
+      const key = Object.keys(item.prompt_variants ?? {}).sort().join(", ");
+      groups.set(key, [...(groups.get(key) ?? []), item.case_id]);
+    }
+    return [...groups.entries()].map(([variants, ids]) => {
+      const who =
+        ids.length > 2 ? `${ids.length} cases` : ids.map((id) => `'${id}'`).join(" and ");
+      const verb = ids.length === 1 ? "declares" : "declare";
+      return `${who} ${verb} ${variants || "no prompt at all"}`;
+    });
+  }, [selectedCases]);
+
+  // Cases feeding the "View prompt" toggle next to bare/harness selects — one
+  // entry per selected case that actually defines this variant, so a person
+  // can see what they picked without leaving the form. `prompt_variants`
+  // holds either the literal text or a `task.yaml`-style path, so the
+  // content itself is fetched from the API, which resolves either form.
+  const promptEntriesFor = (variant: string) =>
+    selectedCases
+      .filter((item) => declares(item, variant))
+      .map((item) => ({ caseId: item.case_id, label: item.name }));
 
   const stepOptions = useMemo(() => {
     const budgets = new Set<number>([3, 6, 10, maxSteps]);
@@ -332,20 +422,57 @@ export function NewEvaluation() {
     if (venue === "lab" && factorKey === "harness_source") {
       setFactorKey("skills_extra");
     }
+    // And the mirror: a bare arm is a masked *lab* container, so there is no
+    // bare condition to put inside somebody else's repository (ADR-0049).
+    if (
+      venue === "target" &&
+      (factorKey === "governance" ||
+        factorKey === "prompt" ||
+        factorKey === "activation")
+    ) {
+      setFactorKey("harness_source");
+    }
   }, [factorKey, venue]);
 
   // The two skill factors draw from different catalogs, so a selection cannot
   // survive switching between them.
+  //
+  // This effect — not the `useState` initialiser — is where the activation
+  // default lives, because it overwrites the flag on every factor change.
+  // Asking is the default wherever the treatment is a skill the arm *has*: an
+  // arm that never invokes its skills measured availability, not the skill
+  // (ADR-0041/0046). It stays off for `skills_disabled`, whose treatment is
+  // removal, and for the factors that move no catalog at all.
+  //
+  // `full_harness` also seeds the selection with the whole catalog. Turning the
+  // flag on over an empty grid was a dead end: the activation block is built
+  // from `skillNames`, so it came out empty, and the only unblocking move the
+  // form offered was clearing the flag again — which is how the treatment arm
+  // of `...-on--4` reached its runs with `skills_invoke: []` and invoked none
+  // of its twenty-five skills. What "full harness" names *is* the catalog, so
+  // the catalog is the honest default; the operator can trim it below. The
+  // catalog is fetched once on mount, hence the `skills` dependency: on the
+  // first render it is still empty and there is nothing to seed.
   useEffect(() => {
-    setSkillNames([]);
-  }, [factorKey]);
+    setSkillNames(
+      factorKey === "full_harness" ? skills.map((skill) => skill.name).sort() : []
+    );
+    setEnforceSkills(factorKey === "full_harness" || factorKey === "skills_extra");
+  }, [factorKey, skills]);
 
   // Pair the arms with the conventional members of the prompt family:
-  // naive→sdlc for the lab's own cases, swe_default→swe_harness for imported
-  // SWE-bench instances. Falls back to first/last so an unusual family still
-  // yields a usable pair the operator can correct.
+  // default→harness for cases on the two-variant shape (ADR-0047),
+  // swe_default→swe_harness for imported SWE-bench instances. The legacy
+  // naive→sdlc pairing is kept for cases that still ship a prompt family, but
+  // it is listed last: those variants vary the task as well as the harness, so
+  // it is the fallback, not the default. Falls back to first/last so an unusual
+  // family still yields a usable pair the operator can correct.
   useEffect(() => {
-    if (factorKey !== "full_harness" || variantOptions.length === 0) {
+    const usesPair =
+      factorKey === "full_harness" ||
+      factorKey === "prompt" ||
+      factorKey === "activation";
+    if (!usesPair || variantOptions.length === 0) {
       return;
     }
     const pick = (candidates: string[], fallback: string) =>
@@ -353,13 +480,13 @@ export function NewEvaluation() {
     setBareVariant((current) =>
       variantOptions.includes(current)
         ? current
-        : pick(["naive", "swe_default", "vibe"], variantOptions[0])
+        : pick(["default", "swe_default", "naive", "vibe"], variantOptions[0])
     );
     setHarnessVariant((current) =>
       variantOptions.includes(current)
         ? current
         : pick(
-            ["sdlc", "swe_harness"],
+            ["harness", "swe_harness", "sdlc"],
             variantOptions[variantOptions.length - 1]
           )
     );
@@ -369,28 +496,52 @@ export function NewEvaluation() {
   // question-less experiment on purpose (a batch with authority it has not
   // earned), so the wizard offers a starting sentence rather than silently
   // inventing one.
-  const suggestedQuestion = useMemo(() => {
+  const suggestedQuestions = useMemo(() => {
     if (mode === "cross_repo") {
-      return "Does this harness hold up across repositories, or does it degrade outside the one it was built in?";
+      return [
+        "Does this harness hold up across repositories, or does it degrade outside the one it was built in?",
+        "Do the same cases score the same way in every repository, or is one repository carrying the result?"
+      ];
     }
     if (factorKey === "full_harness") {
-      return "Does the full harness improve outcomes over the bare model on these cases?";
+      const listed = skillNames.length > 0 ? skillNames.join(", ") : "the governed skills";
+      return [
+        "Does the full harness improve outcomes over the bare model on these cases?",
+        // The same-prompt design this factor now accepts: one plain prompt, run
+        // with the catalog hidden and with it available. Worth offering as a
+        // sentence, because it is the question a case written in this UI can
+        // actually answer.
+        "Running the same prompt with and without the harness, does the governed skill catalog change the outcome?",
+        enforceSkills
+          ? `When the agent is told to use ${listed}, does the harness beat the bare run on the same prompt?`
+          : "Is the harness worth what it costs here — better outcomes for the extra steps and tokens?"
+      ];
     }
     if (factorKey === "skills_extra") {
-      return skillNames.length > 0
-        ? `Does adding ${skillNames.join(", ")} improve outcomes?`
-        : "Does adding this staged skill improve outcomes?";
+      const listed = skillNames.length > 0 ? skillNames.join(", ") : "this staged skill";
+      return [
+        `Does adding ${listed} improve outcomes?`,
+        `Does ${listed} earn a place in the harness, or is the baseline already good enough here?`
+      ];
     }
     if (factorKey === "skills_disabled") {
-      return skillNames.length > 0
-        ? `Does removing ${skillNames.join(", ")} change outcomes at all?`
-        : "Does removing this skill change outcomes at all?";
+      const listed = skillNames.length > 0 ? skillNames.join(", ") : "this skill";
+      return [
+        `Does removing ${listed} change outcomes at all?`,
+        `If we dropped ${listed} from the harness, would these cases notice?`
+      ];
     }
     if (factorKey === "harness") {
-      return `Does ${treatmentHarness} beat ${controlHarness} on the same cases and model?`;
+      return [
+        `Does ${treatmentHarness} beat ${controlHarness} on the same cases and model?`,
+        `Do ${controlHarness} and ${treatmentHarness} differ in what they finish, or only in how they get there?`
+      ];
     }
-    return "Does the injected lab harness improve over the repository's own setup?";
-  }, [controlHarness, factorKey, mode, skillNames, treatmentHarness]);
+    return [
+      "Does the injected lab harness improve over the repository's own setup?",
+      "For a team that already has its own governance, is our harness an improvement or only a difference?"
+    ];
+  }, [controlHarness, enforceSkills, factorKey, mode, skillNames, treatmentHarness]);
 
   const setMode = (next: ExperimentMode) => {
     setParams({ mode: next });
@@ -462,16 +613,47 @@ export function NewEvaluation() {
       // Two levers moved together on purpose — the governance prompt and the
       // skill catalog are one treatment, and the claim is about the harness
       // as a unit.
+      //
+      // The activation block only ever rides the treatment arm: the bare arm
+      // hides every governed skill, and preflight refuses a run told to invoke
+      // a skill it cannot see. It exists because a prompt written in this UI
+      // says nothing about governance, so without it "full harness" means only
+      // that the catalog was on disk.
+      const invoked = enforceSkills ? [...skillNames].sort() : [];
+      // Naming all twenty-five would bury the arm's description under quoted
+      // strings — the same reason `statistics._skill_usage_issues` counts
+      // instead of listing once a catalog is more than a handful.
+      const invokedList =
+        invoked.length > 3
+          ? `its ${invoked.length} governed skills`
+          : invoked.map((name) => `'${name}'`).join(", ");
+      const invokedNote = invoked.length
+        ? ` The agent is asked at the start of every step to invoke ${invokedList} and follow them.`
+        : "";
+      // Inside the lab the control arm is `bare`: an empty workspace with the
+      // lab's governance masked in the container (ADR-0049). Without it a
+      // "bare" arm still carried CLAUDE.md, the SessionStart hook, the
+      // subagents and .github/ — the whole rulebook — and the experiment
+      // measured the catalog while claiming to measure the harness.
+      //
+      // `skills_disabled` stays on it even though the masks make it redundant:
+      // it is what names the catalog the *treatment* is about, through the
+      // sibling-removes rule (ADR-0046), and what keeps the two arms distinct
+      // in the condition hash.
+      const bareGovernance = venue === "lab" ? { harness_source: "bare" } : {};
       return [
         {
           label: "bare",
           role: "control" as const,
           description:
-            bareVariant && bareVariant === harnessVariant
-              ? `Same prompt ('${bareVariant}') with every governed skill hidden.`
-              : `Plain prompt ('${bareVariant || "?"}') with every governed skill hidden.`,
+            venue === "lab"
+              ? `Empty workspace, the lab's governance masked, plain prompt ('${bareVariant || "?"}'), every governed skill hidden.`
+              : bareVariant && bareVariant === harnessVariant
+                ? `Same prompt ('${bareVariant}') with every governed skill hidden.`
+                : `Plain prompt ('${bareVariant || "?"}') with every governed skill hidden.`,
           overrides: {
             ...base,
+            ...bareGovernance,
             prompt_variant: bareVariant,
             skills_disabled: skills.map((skill) => skill.name).sort()
           }
@@ -479,22 +661,123 @@ export function NewEvaluation() {
         {
           label: "full-harness",
           role: "treatment" as const,
-          description: `Governance prompt ('${harnessVariant || "?"}') with the whole skill catalog available.`,
-          overrides: { ...base, prompt_variant: harnessVariant, skills_disabled: [] }
+          description:
+            `Governance prompt ('${harnessVariant || "?"}') with the whole skill ` +
+            "catalog available." +
+            invokedNote,
+          overrides: {
+            ...base,
+            prompt_variant: harnessVariant,
+            skills_disabled: [],
+            ...(invoked.length ? { skills_invoke: invoked } : {})
+          }
+        }
+      ];
+    }
+    if (factorKey === "prompt" || factorKey === "activation") {
+      // Rungs 3 and 4 of the ladder (ADR-0051). Both sit on `lab_root` with the
+      // whole catalog visible; a bare arm cannot be their control, because it
+      // has no prompt family and no catalog to hold fixed.
+      const plain = bareVariant || "default";
+      const governed = harnessVariant || "harness";
+      const catalog = skills.map((skill) => skill.name).sort();
+      if (factorKey === "prompt") {
+        return [
+          {
+            label: "plain-prompt",
+            role: "control" as const,
+            description: `Plain prompt ('${plain}'), governance body and every governed skill available.`,
+            overrides: { ...base, prompt_variant: plain, skills_disabled: [] }
+          },
+          {
+            label: "harness-prompt",
+            role: "treatment" as const,
+            description: `Harness prompt ('${governed}'), same governance body and catalog.`,
+            overrides: { ...base, prompt_variant: governed, skills_disabled: [] }
+          }
+        ];
+      }
+      return [
+        {
+          label: "harness-prompt",
+          role: "control" as const,
+          description: `Harness prompt ('${governed}') with every governed skill available, not asked for.`,
+          overrides: { ...base, prompt_variant: governed, skills_disabled: [] }
+        },
+        {
+          label: "activated",
+          role: "treatment" as const,
+          description:
+            `Harness prompt ('${governed}') plus the activation block naming its ` +
+            `${catalog.length} governed skills at the start of every step.`,
+          overrides: {
+            ...base,
+            prompt_variant: governed,
+            skills_disabled: [],
+            skills_invoke: catalog
+          }
+        }
+      ];
+    }
+    if (factorKey === "governance") {
+      // The rulebook on its own. Both arms hide every skill and inherit the
+      // same prompt, so the only thing that moves is whether the lab's
+      // governance is readable — which is the question "is our governance any
+      // good?" asked without the catalog confounding it (ADR-0049).
+      const hidden = skills.map((skill) => skill.name).sort();
+      return [
+        {
+          label: "bare",
+          role: "control" as const,
+          description:
+            "An empty workspace with the lab's governance masked in the " +
+            "container: no CLAUDE.md, no hooks, no subagents, no .github/, " +
+            "no MCP servers, and no skills.",
+          overrides: { ...base, harness_source: "bare", skills_disabled: hidden }
+        },
+        {
+          label: "governance-only",
+          role: "treatment" as const,
+          description:
+            "The lab's governance as the agent normally meets it — CLAUDE.md, " +
+            "the SessionStart hook, the subagents, the slash commands and " +
+            ".github/ — with the same skills hidden on both sides.",
+          overrides: { ...base, skills_disabled: hidden }
         }
       ];
     }
     const isAblation = factorKey === "skills_disabled";
     const chosen = [...skillNames].sort();
     const listed = chosen.map((name) => `'${name}'`).join(", ");
+    // The descriptions travel with the experiment and are what a reader sees
+    // next to each arm later, so they say what "baseline" actually is: the
+    // governed harness as it stands (CLAUDE.md plus every governed skill), not
+    // a bare model. A staged skill is *available* to the treatment arm, not
+    // forced — the agent invokes it only when the instruction or the skill's
+    // own triggers call for it.
+    const governedCount = skills.length;
+    const governed = governedCount
+      ? `the governed harness as it is today (CLAUDE.md + ${governedCount} governed skills)`
+      : "the governed harness as it is today";
+    // Enforcing changes which arm gets `skills_invoke`: it is always the arm
+    // that *has* the skill — the treatment when adding, the control when
+    // removing — since an invoked skill must also be available in that run.
+    const enforced = enforceSkills && chosen.length > 0;
+    const asked =
+      ", and the agent is asked at the start of every step to invoke it and follow it.";
     return [
       {
         label: "baseline",
         role: "control" as const,
         description: isAblation
-          ? "With the skills available."
-          : "Without the staged skills.",
-        overrides: isAblation ? { ...base } : { ...base, skills_extra: [] }
+          ? `${governed}, with ${listed || "the selected skills"} still available` +
+            (enforced ? asked : ".")
+          : `${governed}, without ${listed || "the staged skills"}.`,
+        overrides: isAblation
+          ? enforced
+            ? { ...base, skills_invoke: chosen }
+            : { ...base }
+          : { ...base, skills_extra: [] }
       },
       {
         // One treatment arm whatever the count: several skills are a *bundle*,
@@ -502,14 +785,24 @@ export function NewEvaluation() {
         label: isAblation ? "without-skills" : "with-skills",
         role: "treatment" as const,
         description: isAblation
-          ? `With ${listed || "the selected skills"} removed from the harness.`
-          : `With ${listed || "the selected skills"} added to the harness.`,
-        overrides: { ...base, [factorKey]: chosen }
+          ? `The same harness with ${listed || "the selected skills"} removed.`
+          : `The same harness with ${listed || "the selected skills"} added as an ` +
+            "available skill" +
+            (enforced
+              ? asked
+              : ". Available, not forced: the agent invokes it only if " +
+                "the case's instruction or the skill's own triggers call for it."),
+        overrides:
+          !isAblation && enforced
+            ? { ...base, skills_extra: chosen, skills_invoke: chosen }
+            : { ...base, [factorKey]: chosen }
       }
     ];
   }, [
+    enforceSkills,
     bareVariant,
     controlHarness,
+    skills,
     crossRepoIds,
     factorKey,
     harness,
@@ -530,6 +823,22 @@ export function NewEvaluation() {
     if (caseIds.length === 0 && !useSuite) {
       problems.push("Choose at least one case.");
     }
+    // Cases from two prompt families cannot share one design: whatever variant
+    // is picked, the other family's cases would be handed an empty prompt and
+    // the backend refuses the launch. Said here, while the selection is on
+    // screen and fixable.
+    if (
+      !useSuite &&
+      caseIds.length > 0 &&
+      declaredVariants.length > 0 &&
+      variantOptions.length === 0
+    ) {
+      problems.push(
+        "The selected cases share no prompt variant, so any choice would hand " +
+          "some of them an empty prompt. Keep one prompt family: " +
+          `${variantFamilies.join("; ")}.`
+      );
+    }
     if (mode === "cross_repo" && crossRepoIds.length < 2) {
       problems.push("Cross-repo needs at least two repositories to vary.");
     }
@@ -539,7 +848,22 @@ export function NewEvaluation() {
     if (mode === "harness_evaluation" && venue === "lab" && factorKey === "harness_source") {
       problems.push(
         "Native versus injected governance needs an external repository — " +
-          "inside the lab there is no other governance to compare against."
+          "inside the lab there is no other governance to compare against. " +
+          "To compare the lab's own governance against nothing, use " +
+          "'Governance body'."
+      );
+    }
+    if (
+      mode === "harness_evaluation" &&
+      venue === "target" &&
+      (factorKey === "governance" ||
+        factorKey === "prompt" ||
+        factorKey === "activation")
+    ) {
+      problems.push(
+        `'${factor.label}' is a rung of the lab's own harness ladder, which ` +
+          "only the lab venue can stage. Against an external repository use " +
+          "'Governance source'."
       );
     }
     if (
@@ -555,22 +879,31 @@ export function NewEvaluation() {
           "The regression suite fixes its own prompts, so it cannot carry the " +
             "bare-versus-governed pair. Pick cases by hand, or choose another factor."
         );
-      } else if (caseIds.length > 0 && variantOptions.length < 2) {
-        problems.push(
-          "The selected cases define fewer than two prompt variants, so there " +
-            "is no bare-versus-governed pair to compare."
-        );
       } else if (
+        venue === "target" &&
         bareVariant &&
         bareVariant === harnessVariant &&
         skills.length === 0
       ) {
         // Equal prompts alone are not degenerate: the bare arm still hides the
-        // whole governed catalog, which is a treatment on its own. The arms
-        // only collapse into one condition when there are no skills to hide.
+        // whole governed catalog, which is a treatment on its own, and a case
+        // written in this UI defines exactly one prompt — the same-prompt pair
+        // is its *only* shape, and the honest one, since such a prompt carries
+        // no governance instruction for the bare arm to lose. The arms collapse
+        // into a single condition only when there are no skills to hide.
+        //
+        // Scoped to the target venue: in the lab the control arm now also
+        // carries `harness_source: bare`, so the two arms differ by the whole
+        // governance surface no matter what the prompts and the catalog say.
         problems.push(
           "Both arms use the same prompt variant and there are no governed " +
             "skills to hide, so the two arms would be identical."
+        );
+      }
+      if (enforceSkills && skillNames.length === 0) {
+        problems.push(
+          "Choose the governed skills to name in the activation block, or " +
+            "clear 'Ask the agent to use the harness'."
         );
       }
     }
@@ -578,6 +911,8 @@ export function NewEvaluation() {
   }, [
     caseIds,
     crossRepoIds,
+    declaredVariants,
+    factor,
     factorKey,
     mode,
     question,
@@ -585,8 +920,10 @@ export function NewEvaluation() {
     harnessVariant,
     skillNames,
     skills,
+    enforceSkills,
     targetId,
     useSuite,
+    variantFamilies,
     variantOptions,
     venue
   ]);
@@ -596,6 +933,10 @@ export function NewEvaluation() {
   // operator should read that before the results rather than after them.
   const advisories = useMemo(() => {
     const notes: string[] = [];
+    const isSkillFactor =
+      factorKey === "skills_extra" || factorKey === "skills_disabled";
+    // A. Skills-only ablation: the arms share a prompt, so what moved is the
+    // catalog and nothing else.
     if (
       mode === "harness_evaluation" &&
       factorKey === "full_harness" &&
@@ -603,15 +944,110 @@ export function NewEvaluation() {
       bareVariant === harnessVariant &&
       skills.length > 0
     ) {
+      const forced =
+        variantOptions.length < 2
+          ? "The selected cases define a single prompt, so both arms run it. "
+          : "";
       notes.push(
-        `Both arms run '${bareVariant}', so the treatment is the skill catalog ` +
-          "alone rather than the harness as a unit. That is a sound ablation — " +
-          "it is what the 'Remove skills' factor states directly — but read the " +
-          "result as a claim about the skills, not about the whole harness."
+        `${forced}Both arms run '${bareVariant}', so what moves is ` +
+          (venue === "lab"
+            ? "the governance body plus the skill catalog, with the prompt " +
+              "held fixed. That is a sound comparison — it is the harness " +
+              "minus its prompt — but read the result as a claim about what " +
+              "the agent could load, not about the wording it was given."
+            : "the skill catalog alone rather than the harness as a unit. " +
+              "That is a sound ablation — it is what the 'Remove skills' " +
+              "factor states directly — but read the result as a claim about " +
+              "the skills, not about the whole harness.")
+      );
+    }
+    // B. Partial ablation. This is a property of the *venue*, not of the prompt
+    // pair: the sync engine rewrites only the generated skills region of
+    // CLAUDE.md, so inside the lab the governance body, the SessionStart hook,
+    // the subagents and .github/ survive in both arms however the prompts are
+    // set. Gating this on "both arms run the same prompt" is what let three
+    // experiments describe a control arm as bare when it never was.
+    //
+    // It no longer applies to `full_harness`: that factor's lab-venue control
+    // is now `harness_source: bare`, whose container masks all of it (ADR-0049).
+    // A skills-only factor still leaves the governance standing on both sides,
+    // which is correct for what those factors measure — and worth saying.
+    if (mode === "harness_evaluation" && venue === "lab" && isSkillFactor) {
+      notes.push(
+        "Inside this lab both arms still carry the governance body of " +
+          "CLAUDE.md, the SessionStart hook and the .github/ governance — only " +
+          "the generated skills catalog differs. The control arm is not a bare " +
+          "model. For a bare-versus-governed comparison use 'Governance body' " +
+          "(the rulebook against nothing) or 'Full harness' (everything " +
+          "against nothing)."
+      );
+    }
+    // C. Prompt and catalog moved together. Legitimate — it is what the factor
+    // means (ADR-0044) — and unattributable, which the reader must know before
+    // the numbers rather than after them.
+    if (
+      mode === "harness_evaluation" &&
+      factorKey === "full_harness" &&
+      bareVariant &&
+      harnessVariant &&
+      bareVariant !== harnessVariant
+    ) {
+      notes.push(
+        `The arms differ in prompt ('${bareVariant}' vs '${harnessVariant}')` +
+          (venue === "lab" ? ", in governance body" : "") +
+          " and in skill catalog. That is the harness as a unit, and a " +
+          "difference cannot be attributed to any one part. For a claim about " +
+          "the skills alone use 'Add skills' or 'Remove skills'; for the " +
+          "rulebook alone use 'Governance body'; to run one prompt on both " +
+          "arms, set them equal above."
+      );
+    }
+    // D. The pickers are narrower than the case list suggests. Not a fault in
+    // the design — the intersection is what every case can actually run — but
+    // the operator picked those cases for a reason and should see that one
+    // family is deciding the prompt for all of them.
+    if (!useSuite && variantOptions.length > 0) {
+      const dropped = declaredVariants.filter(
+        (variant) => !variantOptions.includes(variant)
+      );
+      if (dropped.length > 0) {
+        notes.push(
+          `${dropped.map((variant) => `'${variant}'`).join(", ")} ` +
+            `${dropped.length === 1 ? "is" : "are"} declared by some of the ` +
+            "selected cases but not all of them, so the prompt pickers offer " +
+            `only ${variantOptions.map((variant) => `'${variant}'`).join(", ")}. ` +
+            "An experiment runs one design across every case it selects."
+        );
+      }
+    }
+    // E. A bare arm told to follow what it cannot read. `governance` inherits
+    // the launch prompt on both sides, so a harness-family variant reaches the
+    // masked arm as an instruction about documents that are not there.
+    if (
+      mode === "harness_evaluation" &&
+      factorKey === "governance" &&
+      /^(harness|swe_harness|sdlc)/.test(promptVariant)
+    ) {
+      notes.push(
+        `Both arms run '${promptVariant}', which directs the agent through ` +
+          "the lab's governance — the bare arm cannot read any of it. Pick the " +
+          "plain variant so the comparison is about what each arm had, not " +
+          "about one arm being told to use what it did not."
       );
     }
     return notes;
-  }, [bareVariant, factorKey, harnessVariant, mode, skills]);
+  }, [
+    bareVariant,
+    declaredVariants,
+    factorKey,
+    harnessVariant,
+    mode,
+    promptVariant,
+    skills,
+    useSuite,
+    variantOptions,
+    venue
+  ]);
 
   // A verdict only describes the configuration that produced it, so any edit
   // voids it rather than leaving a stale green tick above the Launch button.
@@ -629,6 +1065,7 @@ export function NewEvaluation() {
     controlHarness,
     crossRepoIds,
     dryRun,
+    enforceSkills,
     executorModel,
     factorKey,
     harness,
@@ -760,7 +1197,11 @@ export function NewEvaluation() {
           mode,
           case_ids: caseIds,
           repetitions,
-          conditions
+          conditions,
+          // The objections the designer was shown and created anyway. Sent so
+          // the results page can repeat them next to the verdict instead of
+          // letting them die in this form (ADR-0046).
+          design_notes: advisories
         })
       );
       setWarnings(created.warnings ?? []);
@@ -853,13 +1294,19 @@ export function NewEvaluation() {
           />
         </label>
         {question.trim() ? null : (
-          <button
-            className="secondary"
-            onClick={() => setQuestion(suggestedQuestion)}
-            type="button"
-          >
-            Use a suggested question: &ldquo;{suggestedQuestion}&rdquo;
-          </button>
+          <div className="button-row">
+            {suggestedQuestions.map((suggestion, index) => (
+              <button
+                className="secondary"
+                key={suggestion}
+                onClick={() => setQuestion(suggestion)}
+                type="button"
+              >
+                {index === 0 ? "Use a suggested question: " : ""}
+                &ldquo;{suggestion}&rdquo;
+              </button>
+            ))}
+          </div>
         )}
       </div>
 
@@ -893,7 +1340,8 @@ export function NewEvaluation() {
               />
               <span>
                 <strong>An external repository</strong> — the agent works inside
-                someone else&apos;s codebase, cloned fresh per run.
+                someone else&apos;s codebase, provisioned from the pinned local
+                checkout for each run.
               </span>
             </label>
           </fieldset>
@@ -925,28 +1373,39 @@ export function NewEvaluation() {
               onChange={(event) => setFactorKey(event.target.value as FactorKey)}
               value={factorKey}
             >
-              {FACTORS.map((item) => (
-                <option
-                  // Native vs injected compares two governance surfaces, and
-                  // inside the lab there is only one.
-                  disabled={item.key === "harness_source" && venue === "lab"}
-                  key={item.key}
-                  value={item.key}
-                >
-                  {item.label}
-                  {item.key === "harness_source" && venue === "lab"
-                    ? " — needs an external repository"
-                    : ""}
-                </option>
-              ))}
+              {FACTORS.map((item) => {
+                // Native vs injected compares two governance surfaces, and
+                // inside the lab there is only one. The mirror: a bare arm is a
+                // masked lab container, which no external repository can host.
+                const needsTarget = item.key === "harness_source" && venue === "lab";
+                const needsLab =
+                  venue === "target" &&
+                  (item.key === "governance" ||
+                    item.key === "prompt" ||
+                    item.key === "activation");
+                return (
+                  <option
+                    disabled={needsTarget || needsLab}
+                    key={item.key}
+                    value={item.key}
+                  >
+                    {item.label}
+                    {needsTarget ? " — needs an external repository" : ""}
+                    {needsLab ? " — lab venue only" : ""}
+                  </option>
+                );
+              })}
             </select>
           </label>
           <p className="muted">{factor.blurb}</p>
-          {factorKey === "full_harness" ? (
+          {factorKey === "full_harness" ||
+          factorKey === "prompt" ||
+          factorKey === "activation" ? (
             variantOptions.length === 0 ? (
               <p className="muted small">
-                Pick cases below first — the bare and governed prompts come from
-                the variants those cases define.
+                {caseIds.length === 0 || declaredVariants.length === 0
+                  ? "Pick cases below first — the bare and governed prompts come from the variants those cases define."
+                  : "The selected cases share no prompt variant, so there is no pair that runs on all of them. Narrow the selection to one prompt family."}
               </p>
             ) : (
               <div className="field-row">
@@ -966,6 +1425,7 @@ export function NewEvaluation() {
                     The plain task prompt — no governance instructions, and every
                     governed skill hidden for this arm.
                   </span>
+                  <PromptPreview entries={promptEntriesFor(bareVariant)} variant={bareVariant} />
                 </label>
                 <label className="field">
                   <span>Full-harness arm prompt</span>
@@ -983,9 +1443,64 @@ export function NewEvaluation() {
                     The governance-loaded variant, with the whole skill catalog
                     ({skills.length}) available.
                   </span>
+                  <PromptPreview
+                    entries={promptEntriesFor(harnessVariant)}
+                    variant={harnessVariant}
+                  />
                 </label>
               </div>
             )
+          ) : null}
+          {factorKey === "full_harness" && skills.length > 0 ? (
+            <fieldset className="field">
+              <legend>Activation on the full-harness arm</legend>
+              <label className="checkbox">
+                <input
+                  checked={enforceSkills}
+                  onChange={(event) => setEnforceSkills(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>
+                  Ask the agent to use the harness{" "}
+                  <small className="muted">
+                    <strong>On by default, with the whole catalog selected.</strong>{" "}
+                    A prompt written in this UI says nothing about governance, so
+                    the full-harness arm may never open a skill and the pair
+                    measures only what sat on disk. This names the skills below in
+                    an activation block at the start of every step of that arm;
+                    the bare arm never gets it — it cannot see those skills at
+                    all. Untick individual skills to narrow the block, or turn the
+                    whole thing off only to ask the different question: whether
+                    the agent reaches for them unprompted.
+                  </small>
+                </span>
+              </label>
+              {enforceSkills ? (
+                <div className="checkbox-grid">
+                  {skills.map((skill) => (
+                    <label className="checkbox" key={skill.name}>
+                      <input
+                        checked={skillNames.includes(skill.name)}
+                        onChange={() =>
+                          setSkillNames((current) => toggle(current, skill.name))
+                        }
+                        type="checkbox"
+                      />
+                      <span>
+                        {skill.name} <small className="muted">{skill.kind}</small>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              ) : null}
+              {enforceSkills && skillNames.length > 1 ? (
+                <p className="muted small">
+                  {skillNames.length} skills named — they are asked for together,
+                  so a win belongs to the harness as a whole and not to any one
+                  of them.
+                </p>
+              ) : null}
+            </fieldset>
           ) : null}
           {factorKey === "skills_extra" || factorKey === "skills_disabled" ? (
             <fieldset className="field">
@@ -1026,6 +1541,24 @@ export function NewEvaluation() {
                   ))}
                 </div>
               )}
+              <label className="checkbox">
+                <input
+                  checked={enforceSkills}
+                  disabled={skillNames.length === 0}
+                  onChange={(event) => setEnforceSkills(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>
+                  Enforce skill use{" "}
+                  <small className="muted">
+                    Tell the agent, at the start of every step, to invoke the
+                    selected skill(s) and follow them for the whole task. Off =
+                    the skill is only available and the agent decides. On = the
+                    test of &ldquo;does it help when asked for&rdquo;; Off =
+                    &ldquo;does it help unasked&rdquo;.
+                  </small>
+                </span>
+              </label>
               {skillNames.length > 1 ? (
                 <p className="muted small">
                   {skillNames.length} skills selected — the treatment is the{" "}
@@ -1183,8 +1716,8 @@ export function NewEvaluation() {
           </select>
         </label>
         <p className="muted">
-          Agents are stochastic. Below five repetitions per arm the lab will describe
-          the result as exploratory, whatever the difference looks like.
+          Agents are stochastic. One repetition per arm is exploratory and gets no
+          directional headline; two is a judgement; five is a validation.
         </p>
         </>
         )}
@@ -1290,7 +1823,8 @@ export function NewEvaluation() {
                 />
               )}
               <span className="muted small">
-                Union of the variants the selected cases define.
+                Variants every selected case defines — one case short of a
+                variant is enough for the launch to be refused.
               </span>
             </label>
           )}

@@ -9,6 +9,7 @@ from harness_lab_app.models import (
     Finding,
     FindingSeverity,
     FindingStatus,
+    RepositoryAudit,
     TargetRepository,
 )
 
@@ -112,3 +113,137 @@ def test_derived_cases_show_their_scoring_mode(session):
 
     assert "acme-fix-1" in report
     assert "manual scoring" in report
+
+
+def test_the_report_names_the_commit_it_measured(session):
+    """An audit that cannot name its commit is not reproducible (ADR-0042)."""
+    from datetime import UTC, datetime
+
+    from harness_lab_app.audit_report import build_report
+    from harness_lab_app.models import TargetRepository
+
+    target = TargetRepository(
+        target_id="payments",
+        name="Payments",
+        repository_url="https://example.invalid/payments.git",
+        pinned_commit="c" * 40,
+        pinned_at=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    session.add(target)
+    session.commit()
+
+    markdown = build_report(session, target, {"checks": [], "commit": "c" * 40})
+
+    assert "cccccccccccc" in markdown
+    assert "2026-09-04" in markdown
+
+
+def test_an_unpinned_repository_says_so_rather_than_implying_a_commit(session):
+    from harness_lab_app.audit_report import build_report
+    from harness_lab_app.models import TargetRepository
+
+    target = TargetRepository(
+        target_id="payments",
+        name="Payments",
+        repository_url="https://example.invalid/payments.git",
+    )
+    markdown = build_report(session, target, {"checks": [], "commit": None})
+    assert "Not pinned" in markdown
+
+
+def test_a_red_gate_check_is_reported_as_the_repository_s_failure(session):
+    """Otherwise the runs below it read as the agent failing."""
+    from harness_lab_app.audit_report import build_report
+    from harness_lab_app.models import GateCheck, TargetRepository
+
+    target = TargetRepository(
+        target_id="payments",
+        name="Payments",
+        repository_url="https://example.invalid/payments.git",
+        pinned_commit="c" * 40,
+    )
+    session.add(target)
+    session.add(
+        GateCheck(
+            gate_check_id="gate-payments-1",
+            target_id="payments",
+            commit="c" * 40,
+            status="done",
+            passed=False,
+            failed_phase="setup",
+            checks_json=[
+                {
+                    "phase": "setup",
+                    "command": "uv sync",
+                    "exit_code": 1,
+                    "passed": False,
+                }
+            ],
+        )
+    )
+    session.commit()
+
+    markdown = build_report(session, target, {"checks": [], "commit": "c" * 40})
+
+    assert "setup" in markdown
+    assert "uv sync" in markdown
+
+
+def test_a_case_in_the_repository_library_reaches_the_report(session):
+    from harness_lab_app.audit_report import build_report
+    from harness_lab_app.models import Case, CaseType, TargetRepository
+
+    target = TargetRepository(
+        target_id="payments",
+        name="Payments",
+        repository_url="https://example.invalid/payments.git",
+    )
+    session.add(target)
+    session.add(
+        Case(
+            case_id="refund-endpoint",
+            name="Add a refund endpoint",
+            type=CaseType.single_prompt,
+            origin_target_id="payments",
+            validation_commands=["make check"],
+        )
+    )
+    session.commit()
+
+    markdown = build_report(session, target, {"checks": []})
+    assert "refund-endpoint" in markdown
+
+
+def test_an_ungenerated_harness_audit_claims_nothing(session):
+    report = build_report(session, _target(), _readiness())
+
+    assert "## The harness, as read by the auditor" in report
+    assert "Not generated" in report
+
+
+def test_a_generated_harness_audit_is_quoted_as_a_judgement(session):
+    session.add(
+        RepositoryAudit(
+            target_id="acme",
+            commit="f" * 40,
+            auditor_model="auditor-x",
+            status="done",
+            findings_json={
+                "summary": "Este repositorio cuenta con un harness parcial.",
+                "harness_verdict": "partial",
+                "gaps": ["No hay comando de validación."],
+            },
+            evidence_json={
+                "runtime": {"ecosystems": ["Python"], "runner_can_execute": True}
+            },
+        )
+    )
+    session.commit()
+
+    report = build_report(session, _target(), _readiness())
+
+    assert "a judgement, not a measurement" in report
+    assert "cuenta con un harness parcial" in report
+    assert "Harness verdict: **partial**" in report
+    assert "Gap: No hay comando de validación." in report
+    assert "Runtime (fact): Python; the runner image can execute it." in report

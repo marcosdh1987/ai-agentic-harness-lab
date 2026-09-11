@@ -16,6 +16,11 @@ pick a Case → choose model + harness + prompt → Create run
    → Compare runs across models / conditions
 ```
 
+The LLM judge, the audit and the other in-process LLM calls go through one
+transport: the AI gateway when `GATEWAY_BASE_URL` + `GATEWAY_TOKEN` are set,
+otherwise the Claude Code CLI with a Claude credential
+([ADR-0043](adr/0043-one-llm-transport-gateway-first-claude-cli-second.md)).
+
 Everything the web app runs also has a CLI equivalent (`make bench-run …`); the
 form shows the equivalent command as a reference. The web lane and the CLI are
 two front-ends over the same runner (`scripts/bench_run.py`).
@@ -29,23 +34,24 @@ state a question → declare the arms → launch N repetitions
    → record a finding → test it with another experiment
 ```
 
-## Three ways to use the lab
+## Four ways to use the lab
 
 The screens below document *what each one does*. This section is the other half:
 **which job you are doing**, and which screens that job touches.
 
-The lab distinguishes three modes ([ADR-0028](adr/0028-evaluation-modes.md)), and
-they are not labels — each one fixes a different set of factors and therefore
-licenses a different kind of conclusion. An experiment declares its mode, and the
-lab **refuses a design the mode cannot answer**.
+The lab distinguishes four modes ([ADR-0028](adr/0028-evaluation-modes.md),
+[ADR-0040](adr/0040-subject-validation-mode.md)), and they are not labels — each
+one fixes a different set of factors and therefore licenses a different kind of
+conclusion. An experiment declares its mode, and the lab **refuses a design the
+mode cannot answer**.
 
-| | **Mode A** — Harness evaluation | **Mode B** — Cross-repo | **Mode C** — Discovery |
-|---|---|---|---|
-| **Question** | Does this change to the harness cause a better outcome? | Does the harness work outside the repo it was designed in? | How does this team work with agents? |
-| **Held fixed** | repo, case, model | harness, model, task family | — |
-| **Varied** | the harness | the repository | — |
-| **Licenses** | a causal claim, with repetitions | where it holds and where it degrades | nothing — **exploratory evidence, not experimental evidence** |
-| **Never** | pool across repos | pool across repos | present as a measurement |
+| | **Mode A** — Harness evaluation | **Mode B** — Cross-repo | **Mode C** — Discovery | **Mode D** — Subject validation |
+|---|---|---|---|---|
+| **Question** | Does this change to the harness cause a better outcome? | Does the harness work outside the repo it was designed in? | How does this team work with agents? | Does the tool I built work reliably when an agent drives it? |
+| **Held fixed** | repo, case, model | harness, model, task family | — | the subject, the case, the repo |
+| **Varied** | the harness | the repository | — | harness and model |
+| **Licenses** | a causal claim, with repetitions | where it holds and where it degrades | nothing — **exploratory evidence, not experimental evidence** | a pass rate **per arm** |
+| **Never** | pool across repos | pool across repos | present as a measurement | pool across arms, or say anything about the harness |
 
 ### Mode A — did our change help?
 
@@ -53,9 +59,9 @@ The everyday question: a new skill, a rule, a prompt, a harness version.
 
 1. **Experiments** → create one with mode `harness_evaluation`, your cases, and two
    conditions: a `control` (today's setup) and a `treatment` (the change).
-2. Launch it with N ≥ 5 repetitions. Agents are stochastic; one trial per arm cannot
-   tell a real difference from run-to-run variance, and the screen labels anything
-   below 5 as exploratory.
+2. Launch it with 2 repetitions for a judgement, 5 for a validation. Agents are
+   stochastic; one trial per arm cannot tell a real difference from run-to-run
+   variance, and the screen labels a single repetition as exploratory.
 3. Read the **experiment detail**: the condition table, the deltas, and — most
    usefully — the **case matrix**, which shows *where* the treatment helped.
 
@@ -76,60 +82,161 @@ whatever difference you measured could not be attributed to the harness.
 No control, no causal claim. You are looking, not proving. Outputs are **findings**,
 and everything they produce is labelled exploratory until an experiment tests it.
 
+### Mode D — does my tool work?
+
+The question most people arrive with, and the only one that needs nothing set up
+first. You built something — an agent behind an API, an MCP server, a service
+wrapper — and a skill that drives it. **Home → Validate your tool** walks it through
+five gated steps: stage the skill, declare the subject and **an executable
+validation command** (a hard block, because without one the runs execute and
+report nothing), pick harness/model arms with no control role, watch the runs and
+open a sandbox, and read **one pass rate per arm**.
+
+Nothing is ablated, so the result says nothing about the harness. The sentence it
+licenses is "this subject passed N of M under `<harness>`/`<model>`", and it never
+adds the arms together. Lane C of
+[guide-skill-validation.md](guide-skill-validation.md) is the walkthrough.
+
 ## Auditing someone else's repository — worked example
 
 This is the flow that spans everything above: take a repository you did not write,
 find out how an agent behaves in it, and turn what you see into something testable.
+It has two halves — a **one-time setup** that ends with an experiment queued against
+the repository, and a **workbench** you come back to afterwards.
 
-**1. Register the repository.** Repositories → *Add a repository*: clone URL, default
-ref, setup commands (`uv sync`), and the repo's own validation commands (`make test`).
-Press **Check** to see the exact commit the ref points at right now. A private repo
-with no credentials or a typo'd branch fails here, not after a container is up.
+### Setup: Audit a repository (four steps, once)
 
-**2. Get a case that means something in that repo.** Press **Derive cases**. The lab
-mines the repository's history for commits that changed source **and** its tests
-together — tasks that team actually performs and already knows how to verify. Read the
-candidates, keep the ones the team would recognise as their work, and create them in
-**Cases** with provenance `organization`.
+**1. Point at the repository.** The step opens a folder picker on the directory the lab
+sits in. Each row is one folder: click it to open it, and the folders that are git
+repositories say so — a branch icon, a `git` badge, and the **Audit this folder** button
+sitting on the row itself, so choosing one is a single click rather than "open it, then
+find the button". The breadcrumb above the list says where you are and every step in it
+is a jump back; **Up one level** goes back one, and at the top it says so instead of
+offering a dead button.
+
+That one press registers the repository — the folder's own `origin` and branch supply the
+URL and the ref — copies it into `data/checkouts/` and freezes it at the commit it is on.
+
+For a repository that is not on this machine yet, register it with the form below the
+picker and clone it yourself: the lab shows the exact `git clone` command with the
+destination filled in, you paste it into your own terminal where your ssh keys and tokens
+already work, and it watches for the clone, reports its HEAD, and you press **Pin this
+commit**.
+
+Either way the lab never contacts the remote and never asks for a credential (ADR-0042,
+[ADR-0045](adr/0045-a-checkout-the-lab-can-be-given-not-only-watched.md)). Everything
+downstream reads your local checkout at the pinned commit. `git pull` moves nothing until you press **Re-pin to HEAD**:
+that is what lets two experiments a week apart compare agents rather than a moving
+branch.
+
+**2. Harness audit.** Press **Generate the audit**. The lab reads the tree at the
+pinned commit — rules files, the opening of every skill and agent, commands, the hooks
+in `.claude/settings.json`, pre-commit, CI, Makefile targets, build manifests, README —
+and the auditor model writes a short report with fixed sections: a summary ("this
+repository ships a harness made of…"), the harness parts and what each is worth, the
+language and toolchain, the standards its rules impose, the gaps, and three to five
+use cases with a validation hint each
+([ADR-0054](adr/0054-a-repository-is-audited-before-the-lab-runs-anything-on-it.md)).
+It runs in the worker like every other LLM reading and uses `AUDITOR_MODEL` when set.
+
+The callout under the report is the lab's, not the model's, and it decides where the
+wizard goes:
+
+| Verdict | Decided from | What happens |
+|---|---|---|
+| **The lab cannot run cases here** | No Python or Node ecosystem detected — by marker file, or by which extensions dominate the tree (a mostly-`.cbl` repository is named as COBOL) | The audit ends. No continue button. |
+| **No harness to evaluate** | Nothing written for an agent: no rules file, skills, agents, commands or hooks. CI and pre-commit do not count. | The primary flow ends; one secondary button continues, to compare the repository against the lab harness. |
+| **Can be evaluated here** | Supported runtime and a harness present | **Choose or create a case →** |
+
+Each proposed use case has **Draft this as a case**, which pre-fills the next step's AI
+draft with it. Below the report, the deterministic readiness checklist and the gate
+check are still there: rules files, skills, agents, CI, ADRs, the validation gate
+inferred from the repository's own files — which you can **adopt** in one press.
+Everything there is *detected*; what the lab could not observe says "Not detected".
+
+Then press **Run gate check**. It provisions the pinned commit in the runner image,
+runs the repository's setup and its own validation commands, and stops — no agent, no
+prompt, no model. Without it a red run is ambiguous between "the agent failed" and
+"this repository does not build here", which look identical and mean opposite things.
+A green gate check is what makes every later failure a fact about the agent.
+
+**3. One case.** Four ways to get one, all storing the case against this repository;
+every case created or selected here is ticked for the experiment in step 4:
+
+| Source | When to use it |
+|---|---|
+| **AI draft** | Fastest. The assistant reads your checkout — README, layout, the repo's own rules file, its adopted gate — and drafts a task that repository plausibly gets asked for. |
+| **From history** | Mines commits that changed source **and** its tests together: tasks the team performs and already knows how to verify. |
+| **By hand** | You know exactly what you want measured. |
+| **Existing case** | Reuse a case already in the catalog against this repository. |
 
 > Running `build a Tetris clone` against a payments API measures nothing. This step is
 > what makes everything after it interpretable.
 
 **Freeze the case and its rubric before running anything.** A case edited after seeing
-results is not a measurement. Each candidate carries the commit it came from, which is
-what lets you show later that the case predates the results.
+results is not a measurement. A derived candidate carries the commit it came from,
+which is what lets you show later that the case predates the results.
 
-**3. See how an agent does in it, as it is.** Runs → New run → pick the case, pick the
-repository, and set **Harness** to `native`: the agent works *inside* their repo with
-only what that repo ships — their `CLAUDE.md`, their conventions, or nothing at all.
-This is their baseline, and it is the first honest answer to "how does an agent resolve
-this case here today?"
+**4. Run an experiment.** Tick the cases (the ones from step 3 plus any from the
+catalog), pick the repetitions, and choose the comparison:
 
-**4. Read the run.** The **Scores** panel separates facts (a command exited) from
+- **This repository only — one arm.** A subject validation with no control: does the
+  case pass here at all?
+- **This repository vs the lab harness (ml-python-base).** A harness evaluation:
+  `native` (the repository's own governance, nothing injected) against `injected` (the
+  lab's harness materialised into the same workspace at the same commit). The only
+  thing that varies is the harness.
+
+A `bare` arm is not on offer: it is a masked lab container and cannot be put inside
+somebody else's repository (ADR-0049). Pick the **Harness** and its **Executor model**
+from the menus: `claude` and `codex` list their own CLI's model names and offer
+*CLI default*, which needs no configuration at all, while `opencode` opens the
+three-tier picker (source → provider → model) used everywhere else and starts on the
+gateway's default. Switching the harness clears the model, because the two menus name
+different things and a model carried across would name one the new harness cannot
+reach. **Create and launch** queues the runs and links to the experiment.
+
+### Workbench: the repository's own page
+
+**Repositories → the repository** now has everything in one place: its **Checkout**
+(re-pin, dirty-tree warnings), its **Readiness** and gate check, its **Cases** library,
+its **Experiments**, and its **Report**.
+
+The Experiments tab offers the two comparisons worth making, each with the checkout and
+commit already fixed so the only thing varying is the harness:
+
+- **Native vs native + skills** — same repository, same cases; the treatment arm gets
+  the skills you pick. Leave **Enforce skill use** on when you are evaluating one
+  specific skill: without it the arm measures the skill's *availability*, not its use
+  (ADR-0041). Turn it off when the question is which skills an agent reaches for
+  unasked.
+- **Native vs the lab harness** — `native` against `injected`. This answers the
+  question a client actually asks:
+
+  > What does your harness add over how we already work?
+
+  Injection copies the lab's skills, agents, adapter file and governance documents into
+  the clone before the baseline commit — so they never appear in the agent's own diff.
+  If their repo already ships a `CLAUDE.md`, it is displaced to `CLAUDE.md.native.bak`
+  and the collision is recorded in the run's manifest: replacing a team's governance
+  changes the thing being measured, so it is never silent.
+
+**Read the runs.** The **Scores** panel separates facts (a command exited) from
 observations (parsed from artifacts) from judgements (a model's opinion). The audit
-now reads **their** governance for a `native` run, not the lab's — so its
-rule-adherence findings are about the rules the agent was actually given.
+reads **their** governance for a `native` run, not the lab's — so its rule-adherence
+findings are about the rules the agent was actually given.
 
-**5. Compare against your harness.** Experiments → mode `harness_evaluation`, control
-`native`, treatment `injected`, same repository, same case, same model, N ≥ 5. That
-answers the question a client actually asks:
-
-> What does your harness add over how we already work?
-
-Injection copies the lab's skills, agents, adapter file and governance documents into
-the clone before the baseline commit — so they never appear in the agent's own diff —
-and it carries any skill ablation the run declares. If their repo already ships a
-`CLAUDE.md`, it is displaced to `CLAUDE.md.native.bak` and the collision is recorded
-in the run's manifest: replacing a team's governance changes the thing being measured,
-so it is never silent.
-
-**6. Turn what you saw into claims.** Findings → record what the runs showed, with the
-run ids as evidence, a recommendation, and the intervention that would implement it.
+**Turn what you saw into claims.** Findings → record what the runs showed, with the run
+ids as evidence, a recommendation, and the intervention that would implement it.
 **Draft experiment** turns a finding into a design to review. A finding citing no runs
 is labelled an observation; a finding an experiment **refuted** keeps its record.
 
+The **Report** tab assembles all of it — the pinned commit, the gate check, the case
+library, the experiments with their caveats, the accepted findings — as markdown you
+can download and hand over.
+
 ```
-Audit → Finding → Hypothesis → Experiment → Evidence → Recommendation
+Clone → Pin → Gate check → Case → Experiment → Finding → Report
 ```
 
 **What this does not do.** The lab observes how an agent behaves in a repository; it
@@ -152,19 +259,59 @@ redirect.
 | **Advanced** | Runs, Compare, Benchmarks, Improvements | the operational machinery underneath |
 | **System** | Health, Guide, Settings | the lab itself |
 
+### Look and feel
+
+The UI carries no third-party branding (ADR-0060). It uses Outfit for text,
+Space Grotesk for headings, one accent colour, and a dark theme grounded in
+`--brand-dark`; the mark in the sidebar and on the login page is the lab's own
+`LabMark` component, drawn from the design tokens rather than an imported
+logo. Everything visual lives in `frontend/src/styles.css` as tokens and
+shared classes; pages do not carry `style={{}}` attributes. The classes that
+every wizard shares:
+
+| Class | What it is | Rule of thumb |
+|---|---|---|
+| `.stepper` | the numbered progress pills | `--done` (green index), `--current` (accent), disabled = not reached yet |
+| `.pick-list` | a list of selectable rows | rows are full-width; the selected row tints (`accent-soft`) rather than fills, so its description stays readable |
+| `.checkbox` | a checkbox or radio with its label | the control sits on the left; the base text-field sizing does not apply to it |
+| `.tab-bar` / `.tab` | content switches | `.tab-bar--inline` when it sits next to a panel title |
+| `.primary` / `.secondary` / `.ghost` / `.button-link` | actions, in descending weight | all lay out as `inline-flex`, so an icon aligns with the label |
+| `.callout` (`--ok`, `--warning`, `--danger`) | inline notices | keep the icon as the first child |
+| `.assist-card` | an optional AI helper inside a form | accent border, never a required field |
+
+Icons come from `frontend/src/components/icons.tsx` (inline Lucide geometry),
+never from emoji or text glyphs: emoji ignore the theme and render differently
+on every platform. To check a change without opening a browser, screenshot the
+dev server headlessly:
+
+```sh
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new \
+  --window-size=1440,1400 --screenshot=out.png http://localhost:5173/evaluate/subject
+```
+
 ## Screens
 
 ### Home — what do you want to learn?
 
-The landing page asks one question and offers three answers, one per mode
-([ADR-0028](adr/0028-evaluation-modes.md)). Each card states the question it can
-answer, what it holds fixed, what it varies, and what it is **not** allowed to
-claim — so the choice of mode happens before any data is collected rather than
-after.
+The landing page asks one question and offers three answers. Each card states the
+question it can answer, what it holds fixed, what it varies, and what it is **not**
+allowed to claim — so the choice of mode happens before any data is collected
+rather than after.
 
+- **Validate your tool** → the five-step subject-validation wizard. First because
+  it is the only door that opens on a fresh instance — no repository needed — and
+  it leaves behind what the other two consume: a staged skill and a case with a
+  real validation command.
 - **Evaluate a harness change** → the wizard at **Evaluate → New evaluation**.
-- **Test across repositories** → the same wizard in cross-repo mode.
-- **Audit a repository** → the six-step guided audit.
+- **Audit a repository** → the three-step setup, then the repository's own page.
+
+Cross-repo evaluation keeps its mode but not its card: it needs two registered
+repositories, so its entry point lives on **Evidence → Repositories** and appears
+exactly when the second repository does.
+
+The **Validated runs passing** figure lower down pools every case, model, harness
+and arm in the window. It is labelled as such because it is a sign of activity, not
+an experiment result — the composite the lab refuses everywhere else.
 
 Below the cards, **What needs attention?** lists only what someone can act on —
 regressed cases, suggested findings waiting for review, findings with nothing
@@ -197,27 +344,96 @@ bundle: a win belongs to the bundle, not to any single member) — everything el
 is pinned across the arms, and in cross-repo mode each repository becomes its own
 arm and the results stay separated.
 
-**Full harness** is the founding comparison, as a factor: a bare arm (plain
-prompt variant, every governed skill hidden) against the whole harness (the
-governance-loaded variant with the full skill catalog). Two levers move
-together on purpose — the claim is about the harness as a unit; ablate factors
-afterwards to see which parts do the work. The prompt pair is drawn from the
-selected cases' own variants (`naive`→`sdlc`, `swe_default`→`swe_harness`), and
+#### The factors, and what each one can claim
+
+The harness is four things at once — a governance body (`CLAUDE.md`, the
+SessionStart hook, the subagents, `.github/`, `memory/`), a skill catalog, a
+prompt preamble that directs the agent through them, and an activation block
+that asks for the skills outright. **Full harness** moves all four together;
+the other factors move one.
+
+| Factor | Control → treatment | What a difference can be attributed to |
+|---|---|---|
+| **Full harness** | bare → everything | the harness as a unit, not to any part |
+| **Governance body** | bare → rulebook only, skills hidden on both arms | the governance body alone |
+| **Add / Remove skills** | catalog without → with the skill(s) | the skills, on top of a governed agent |
+| **Harness prompt** | plain prompt → governed prompt, catalog on both arms | the preamble's wording |
+| **Activation** | catalog available → catalog also asked for | being told to use it (ADR-0041) |
+| **Governance source** | the repo's own setup → the lab's injected | *external repository only* |
+
+Inside *This lab*, the control arm of **Full harness** and of **Governance body**
+is genuinely bare: it runs in an empty workspace with the lab's governance masked
+inside the runner container — no `CLAUDE.md`, no hooks, no subagents, no
+`.github/`, no MCP servers, and no skills
+([ADR-0049](adr/0049-a-bare-arm-is-a-masked-runner-not-a-lab-root-run.md)). It
+needs the Docker backend; on the host lane there is nothing to mask with and the
+run is refused rather than recorded as a condition it does not have.
+
+The prompt pair comes from the case's own two variants — `default` (the task, and
+nothing about the harness) and `harness` (the same task body with
+`benchmarks/_harness_preamble.md` prepended), or `swe_default`→`swe_harness` for
+imported SWE-bench instances
+([ADR-0047](adr/0047-a-case-exposes-two-prompt-variants-the-task-and-the-task-plus-the-harness.md)).
 `prompt_variant` is a first-class condition axis for exactly this reason.
 
-Setting **both arms to the same prompt** is allowed, and is often the better
-design: the bare arm still hides the whole governed catalog, so the arms remain
-distinct conditions and the experiment varies one axis instead of two — which is
-what the backend's own confounding rule asks for. The wizard says so rather than
-refusing, since the result is then a claim about the skills, not about the
-harness as a unit. It is refused only when the arms would be genuinely
-identical: same prompt with no governed skills to hide. "Add skills" offers the *staged* catalog and
+Setting **both arms to the same prompt** on *Full harness* is allowed and narrows
+the claim to "the governance body plus the catalog, with the wording held fixed".
+It is refused only when the arms would be genuinely identical.
+
+**The ladder.** Reading the four single-factor experiments together is what
+answers *how much* each part contributes. `make ladder MODEL=<model>` creates
+them as one **family** — bare → governance → +skills → +harness prompt →
++activation, each rung's control identical to the previous rung's treatment — and
+the experiments list filters by family
+([ADR-0051](adr/0051-the-harness-ladder-is-one-family-of-single-factor-experiments.md)).
+Rung 2 will report *the treatment never happened* when the agent opens no skill:
+that is the rung's finding, not a broken experiment, and it is why rung 4 exists.
+
+A rung is one **(harness CLI, model)** pair. The value of a harness is a function
+of the model: a small local model may lean on a rulebook that a capable one
+ignores, so a ladder on Haiku and a ladder on a 7B model are two measurements and
+are never compared to each other.
+
+**Ask the agent to use the harness** appears under the prompt pair whenever the
+factor is *Full harness*, and is **on by default** — as is *Enforce skill use* for
+*Add skills*. Both default on because the treatment there is a skill the arm already
+has, and an arm that never invokes it measured availability
+([ADR-0046](adr/0046-an-experiment-reports-validity-before-it-reports-a-verdict.md)).
+Turn it off only to ask the different question: whether the agent reaches for the
+skills unprompted. *Remove skills* leaves it off, since its treatment is removal. A prompt written in this UI says nothing about
+governance, so the full-harness arm may never open a skill and the pair would
+measure only what sat on disk. On *Full harness* the skill grid also starts with
+the **whole catalog selected** — what that factor names is the catalog, and an
+activation block built from an empty selection is empty, which is how a
+full-harness arm reached its runs with `skills_invoke: []` and invoked none of
+its skills. Untick individual skills to narrow the block. The selection is named in an
+activation block at the start of every step of that arm (`skills_invoke`,
+[ADR-0041](adr/0041-a-skill-under-test-is-invoked-not-just-available.md)). The
+bare arm never receives it — it cannot see those skills at all, and a run told
+to invoke a skill it cannot see is refused at preflight. "Add skills" offers the *staged* catalog and
 "Remove skills" the *governed* one, because that is what `skills_extra` and
 `skills_disabled` each accept.
 
+**Enforce skill use** sits under the skill list for both factors. Off, the
+selected skills are only *available* to the arm that has them, and the agent
+opens them only when the case or the skill's own triggers call for it — the
+test of "does it reach for them unasked", the right one for a whole harness of
+skills. On, that arm is also told at the start of every step to invoke them and
+follow them (`skills_invoke`, ADR-0041) — the test of "does it help when asked
+for", the usual one for a single skill. It applies to the whole selection: a
+multi-selection is either all asked for or all left to the agent. Whichever you
+choose, every run records `skill_invoked` and `skill_invocations`, and an arm
+that never opened its skills gets that said at the top of its verdict.
+
 **How it runs** carries the classic run form's own controls — the three-tier
-model picker, the harness, the prompt variant (union of the selected cases'
-variants), the step budget, dry run — so the wizard is the whole journey.
+model picker, the harness, the prompt variant, the step budget, dry run — so the
+wizard is the whole journey. The prompt pickers — the shared one here and the
+bare/governed pair under **What varies** — offer only the variants *every*
+selected case declares, not the union: an experiment runs one design across all
+of its cases, so a variant only some of them define would hand the rest an empty
+prompt and the launch would be refused (ADR-0059). Selecting cases from two
+prompt families — a hand-written lab case and a SWE-bench instance, say — leaves
+nothing in common, and the form blocks creation and names the families instead.
 **Create & launch runs** queues arms × cases × repetitions in one step;
 *Create without launching* leaves a draft the experiment page can launch later. The panel at
 the bottom shows the exact arms about to be created, and lists what is blocking
@@ -231,9 +447,9 @@ refusal is always shown, since it carries a reason the blockers cannot. Editing
 anything that shapes the arms voids the verdict, which describes only the
 configuration that produced it.
 
-Repetitions are chosen from three named levels — **2 (exploratory only)**,
-**5 (useful comparison)**, **10 (stronger evidence)**. Below five, the lab will
-describe the result as exploratory however large the difference looks.
+Repetitions are chosen from three named levels — **1 (exploratory)**,
+**2 (judgement)**, **5 (validation)**. A single repetition gets no directional
+headline however large the difference looks.
 
 The experiment's id is derived from the question. Asking the same question
 again — the usual case being *the same comparison, run on a different harness* —
@@ -248,25 +464,58 @@ an ordinary harness-evaluation experiment, read through the same case matrix. Th
 is how a harness release is validated: previous version vs new, over the suite,
 producing **fixed / broken / unchanged**.
 
-### Repository audit — Mode C, in six steps
+### Repository audit — Mode C: setup, then a workbench
 
-1. **Select repository** — register it, or pick one already known.
-2. **Repository readiness** — what the lab could actually read at the pinned
-   commit: reachability, validation gates, setup, and any AI governance already
-   there (rules files, skills, agents, commands, ADRs, CI). Anything it could not
-   observe says **Not detected** rather than being guessed at. "Ready" is a narrow
-   claim — a run would execute and be scored — and says nothing about how good
-   that governance is.
-3. **Derive cases** — proposed from the repository's own history
-   ([ADR-0032](adr/0032-cases-are-derived-from-a-targets-own-history.md)), reviewed
-   and accepted one at a time. An accepted candidate becomes a real case, validated
-   by the repository's own commands.
-4. **Run discovery** — an explicit `discovery` experiment with one `as-is` arm
-   against the repository's native governance.
-5. **Review findings** — strengths, gaps and unused resources arrive labelled
-   **suggested**. Nothing becomes a finding of record without a name on it.
-6. **Turn a finding into an experiment** — prefilled with the repository, the
-   cases and the hypothesis, and editable before it is created.
+Setup runs once per repository, at **Evaluate → Audit a repository**:
+
+1. **Point at the repository** — pick the folder you already have on this machine and
+   the lab registers, copies and freezes it in one press; or register a remote one and
+   run the `git clone` command it writes out in your own terminal, where your
+   credentials already work, and **pin** its commit
+   ([ADR-0042](adr/0042-the-lab-reads-a-repository-through-the-engineers-own-checkout.md),
+   [ADR-0045](adr/0045-a-checkout-the-lab-can-be-given-not-only-watched.md)).
+   Nothing after this reads the remote.
+2. **Harness audit** — an auditor model reads the tree at the pinned commit in two
+   passes ([ADR-0054](adr/0054-a-repository-is-audited-before-the-lab-runs-anything-on-it.md),
+   [ADR-0058](adr/0058-the-audit-maps-harness-components-to-claims.md)). The first
+   pass maps every **harness component** — skill, hook, rules file, agent, or a
+   deterministic command the harness invokes — to what it *claims*, when it *fires*,
+   what would be *observable* if it helped, which lab skill does the *same job*, and
+   what the claim *needs* outside the checkout (`jira`, `github`, `docker`,
+   `network`, `target_repo`, `browser`). It also says the harness's **shape**:
+   `in_place` (it governs work on this repository) or `installable` (it is copied
+   into another project), with the installer it found and the unit of work
+   (*a ticket → a PR*). Between passes the lab fills in what the model may not
+   decide: **evaluable here** from declared service capabilities, whether the
+   counterpart is a real lab skill, whether the installer exists — and it runs the
+   repository's own suite at the pin, so a red suite is a fact the second pass has
+   to work with. The second pass proposes cases that name the components they
+   exercise and say whether they measure a **harness claim** or **work on the
+   harness**; a case naming a component the lab cannot evaluate is kept on the page
+   as *dropped*, with the reason. For each kept case the lab derives the experiment
+   arms mechanically — `native-on`, `native-off` (`skills_disabled`) and
+   `lab-counterpart` (`skills_extra`) when the case exercises skills, the
+   `native`/`injected` pair otherwise — so the arms shown are arms the runner can
+   execute unchanged. The verdict under the report is still the lab's own, from the
+   evidence: an unsupported runtime ends the audit, a missing harness ends the
+   primary flow, and only a supported runtime with a harness goes on. Below it, the
+   deterministic readiness checklist — validation gates, setup, rules files, skills,
+   agents, commands, ADRs, CI — where anything not observed says **Not detected**,
+   and the **gate check**, which runs the repository's own commands at the pin with
+   no agent.
+3. **One case** — drafted by the assistant (from a description, or from a use case
+   the audit proposed), mined from the repository's own history
+   ([ADR-0032](adr/0032-cases-are-derived-from-a-targets-own-history.md)), written by
+   hand, or reused from the catalog.
+4. **Run an experiment** — the selected cases, N repetitions, either one `native` arm
+   (does it pass here at all) or `native` vs `injected` (the repository's own setup
+   against the lab harness). Setup ends with the experiment queued.
+
+Afterwards the repository has its own page under **Evidence → Repositories**, with
+its checkout, readiness, case library, experiments and report. Two experiment presets
+live there — `native` vs `native + skills`, and `native` vs the lab harness — both
+with the pinned commit fixed so the harness is the only thing that varies. Findings
+stay on **Evidence → Findings**, and the report links to them.
 
 ### Benchmarks (Advanced) — the leaderboard and the overview
 Leads with what the lab knows about itself, computed server-side
@@ -314,7 +563,7 @@ prompt variant + harness version) and ranked by **% resolved** with a
 proportional bar.
 
 - **% resolved is per-attempt**: resolved runs / objectively-validated runs of
-  that condition. Manual-score cases (e.g. tetris) have no objective verdict, so
+  that condition. Manual-score cases have no objective verdict, so
   they show avg/best score but no %.
 - **Filters**: lane (case type), harness, model, prompt variant, and **harness
   version** — so you can ask "does harness v0.4.0 + conductor + qwen3.6-35b beat
@@ -330,13 +579,16 @@ proportional bar.
   instances.
 
 ### Runs
-Where you launch and track runs. The **New run** form:
+Under **Advanced → Runs**, where single runs are launched and tracked. The
+everyday entry is **Evaluate → New evaluation** (an experiment with a control
+and a treatment); the **New run** form is the one-run alternative:
 
 - **Case** — what the agent is asked to do (see Cases). Selecting a case sets the
   available **Prompt variants**.
 - **Harness** — the agent scaffold under test: `opencode` (containerized,
-  gateway models) or `codex` / `claude` (run on your host CLI with native auth).
-  To test claude/codex, follow the
+  gateway models), `claude` (containerized too, with `CLAUDE_CODE_OAUTH_TOKEN`
+  or `ANTHROPIC_API_KEY` in `.env`; host mode also works) or `codex` (host mode
+  only, `make app-host`, native OpenAI login). To test claude/codex, follow the
   [claude/codex runbook](runbook-claude-codex.md); design in
   [harness-adapters.md](harness-adapters.md).
 - **Planner / Executor model** — chosen in three tiers, **source → provider → model**:
@@ -397,7 +649,7 @@ Where you launch and track runs. The **New run** form:
 - **Skills** ablation — disable governed skills or enable experimental staged
   skills *for this run only*, to A/B the harness. A non-empty ablation makes the
   run a distinct arm (`condition_hash`). See [ADR-0011](adr/0011-per-run-skill-ablation-and-staging.md).
-- **Validate config** — runs the creation preflight (`POST /api/runs/validate`)
+- **Validate config** — runs the creation preflight (`POST /api/runs/preflight`)
   without creating anything: case and harness availability, `GATEWAY_TOKEN`,
   whether the executor is routable and reachable, and the context window the
   backend is *actually serving* (ADR-0020). A green verdict means Create run will
@@ -428,8 +680,8 @@ batch starts as "what I was about to run" and you widen it from there:
   intersection: cases legitimately define different variant sets, and an
   intersection would empty the axis as soon as one case is unusual. Each case is
   then paired only with the selected variants it actually defines, so selecting
-  `tetris-v1` (which has `conductor`) alongside `cli-textstats-v1` (which does
-  not) queues `conductor` for the first case only. **The stated run count already
+  a SWE-Pro case (which has `swe_conductor`) alongside `cli-textstats-v1` (which
+  does not) queues `swe_conductor` for the first case only. **The stated run count already
   accounts for this**, which is why it can be lower than the product of the axes.
   A case that defines *none* of the selected variants is rejected rather than
   silently dropped — the batch would not be the one you asked for.
@@ -606,7 +858,7 @@ from this one's final state (`<parent>-C-001`). The parent is not modified,
 so its score and provenance keep describing what actually produced them.
 
 A continuation is a human intervention, so continued runs are hidden from
-the Dashboard by default — tick *include continuations* to see them. Full
+the **Benchmarks** page by default — tick *include continuations* to see them. Full
 walkthrough: [Continuing a run](guide-run-continuation.md),
 [ADR-0026](adr/0026-run-continuation-as-child-runs.md).
 
@@ -615,19 +867,104 @@ walkthrough: [Continuing a run](guide-run-continuation.md),
 Recorded automatically when a run reaches a terminal state, and refreshed by a
 re-validate. **Score this run** backfills a run that predates automatic scoring.
 
+Each row shows `name@version` and its **provenance**
+([ADR-0034](adr/0034-score-registry.md)):
 
-**Score this run** records its metrics against the versioned registry
-([ADR-0034](adr/0034-score-registry.md)). Each row shows `name@version` and its
-**provenance**:
-
-- **fact** — a command exited. Reproducible without judgement.
-- **observation** — parsed from the run's artifacts. True of the record, not
-  necessarily of the world.
-- **judgement** — a model's opinion. Defensible, not checkable.
+- **fact** — a command exited, a token was billed. Reproducible without judgement.
+- **observation** — parsed from the run's artifacts. True of *the record*, not
+  necessarily of the world: what the log did not capture did not happen, as far
+  as an observation is concerned.
+- **judgement** — a model's opinion. Defensible, not checkable, and not
+  reproducible run to run.
 
 They are drawn differently on purpose. `test_pass_rate = 1.0` and
 `skill_adherence = 0.81` look identical once both are numbers in a table, and the
 second borrows the authority of the first.
+
+##### Facts — what the machine did
+
+| Metric | What it is |
+|---|---|
+| `task_validation_pass` | every one of the case's validation commands exited 0. The success metric of every experiment |
+| `test_pass_rate` | passed ÷ *conclusive* checks. Its resolution is the number of validation commands the case declares: one command makes it binary, ten make it a gradient. A check that timed out or was killed is excluded, never counted as a failure ([ADR-0048](adr/0048-a-check-that-did-not-measure-is-not-a-failure.md)) |
+| `cost_usd` | what the provider charged, from the CLI's own accounting |
+| `billed_tokens` | **every token billed**: input + output + prompt cache written + prompt cache re-read. This is what a harness actually costs — a 25-skill catalog in the system prompt is re-read on every turn |
+| `total_tokens` | uncached input + output only. Kept for continuity with older runs; it can move *down* while cost moves up, so read `billed_tokens` |
+| `cache_read_tokens` | the prompt cache re-read across the run's turns, on its own |
+| `agent_steps` | harness **restarts**, not work: one invocation that ran fifty turns counts 1. Alone it reads a stop-criterion difference as an agent difference — read it with `agent_turns` and the run's `stop_reason` |
+| `agent_turns`, `agent_tool_calls` | the work measures |
+| `wall_time_minutes` | the agent's own duration, not created-to-ended (the worker runs at concurrency 1, so a run can sit queued for hours) |
+
+##### Observations — what the record shows
+
+| Metric | What it is, and its blind spot |
+|---|---|
+| `skill_invoked` | share of the skills *this run is about* that the agent opened — a `Skill` tool call or a read of the skill's `SKILL.md`. **A lower bound**: a harness that injects a skill's body without either leaves no trace and scores 0 ([ADR-0041](adr/0041-a-skill-under-test-is-invoked-not-just-available.md)). Emitted only when the run is about some skill; never a zero for "not observed" |
+| `skill_invocations` | the raw count, neutral direction |
+| `governance_read_coverage` | share of **that run's own** governance surface the agent opened. The denominator is resolved per run: a `native` arm is measured against the target repo's documents, never the lab's ([ADR-0036](adr/0036-audit-judges-a-run-against-its-own-governance.md)). Also a lower bound — context-injected content leaves no read event |
+| `expected_files_modified` / `forbidden_files_modified` | only when the case declares `files_expected` / `files_forbidden`. A correct solution may legitimately land elsewhere |
+| `diff_lines_changed`, `files_changed` | **neutral on purpose**: neither a big nor a small diff is good in itself |
+
+##### Judgements — what a model thought
+
+Three different judges look at three different things, and none of them is a
+fact. **All of them read free-form context**: the criteria are prose, the input
+is a *rendering* of the run rather than the run itself, and the judge is whatever
+model `AUDITOR_MODEL` / `DEEPEVAL_MODEL` names. Each metric is measured **once**
+— no retry, no second opinion, no agreement check between judges — so two runs
+that did the same thing can be scored differently, and the same run scored twice
+can move. (The rubric judge runs at temperature 0.2, the DeepEval judges at 0.0;
+neither makes the number reproducible, because the prompt is prose and the model
+is free to weigh it differently.) Read them as a reader's opinion of the record,
+never as a tiebreak between two facts.
+
+**`rubric_score` — the case's own ladder, judged from the diff.** One gateway
+call per run. The judge is given: the case's `scoring.md` rubric, the task
+prompt, the automated checks with their PASS / FAIL / **INCONCLUSIVE** verdicts,
+the diff (clipped to 24k characters) and the agent's own report — which it is
+told to treat as a *claim*, not a result.
+
+Rubric levels are tagged with what can establish them, and the judge obeys the
+tag ([ADR-0050](adr/0050-a-case-ships-its-own-tests.md)):
+
+- `[check]` — only a passing automated check can award it.
+- `[diff]` — the code can, and the judge must quote the lines that implement it.
+- `[manual]` — only a human running the program can. **The judge never awards
+  it** and stops at the highest level below.
+
+This is why a case whose upper levels are all `[manual]` honestly caps an
+automated score at "runs without crashing", however good the program is: the
+evidence to award more does not exist. The fix is a case that ships tests, not a
+more generous judge. `rubric_score` rides in the deltas table so a disagreement
+between two arms is visible; it is **never** the experiment's success metric.
+
+**DeepEval — three trajectory metrics, and only two of them use a model.** The
+input is `render_trajectory`: a text rendering of the run's tool calls, clipped
+to 120 steps (the first 60 and the last 60 when a run is longer), plus the task
+and the agent's closing message.
+
+| Metric | How it is computed |
+|---|---|
+| `task_completion` | **LLM (GEval)**. Free-text criterion: did the trajectory accomplish the stated task, judging only what is recorded — no assuming steps that are not there |
+| `step_efficiency` | **LLM (GEval)**. Free-text criterion: were the steps necessary? Penalises repeated identical reads, edits later undone, aimless searching, re-running a failing command unchanged. Explicitly does *not* penalise a long trajectory that is long because the task is large |
+| `tool_correctness` | **deterministic, no model.** Compares the tools actually called against `expected_tools`, which the case derives from its own declarations: `files_expected` implies `Edit`, `validation_commands` imply `Bash`. A case that declares neither implies nothing, and the metric is **skipped** rather than scored against an expectation nobody wrote down |
+
+Both GEval metrics score 0–1 with a written rationale, visible in the run's score
+rows — GEval writes its own evaluation steps from the criterion before scoring,
+so the rubric text above is the whole of what steers it. Set `DEEPEVAL_MODEL=off`
+to turn the judged pair off entirely; the deterministic one keeps working. A metric whose judge raised is recorded as
+**skipped with a reason** — never as a zero, because a failed judge has not
+scored, it has not scored *badly*.
+
+**The LLM audit — `skill_adherence`, `harness_items_useful`,
+`harness_items_redundant`.** A second pass over the run's logs, diff, usage and
+the governance surface it actually had. It emits one verdict per harness item
+(*useful · redundant · improve · unknown*) and those three metrics are the
+aggregate. `skill_adherence` is the share of the available harness the auditor
+judged genuinely used — a 24-skill harness an agent reaches two of is not a good
+harness, and no other figure on the page says so. It reads logs; it does not
+observe invocation, which is why it is a judgement and `skill_invoked` beside it
+is an observation. It runs only when you press **Run audit**.
 
 #### Send traces — read the run turn by turn
 
@@ -651,10 +988,23 @@ disabled with `0` (`HARNESS_LAB_RUN_STALL_SECONDS`,
 `run_model_wait_seconds` for a slow model.
 
 ### Cases
-The catalog of tasks. Three ways to get realistic cases:
+The catalog of tasks. Four ways to get realistic cases:
 
-- **tetris-v1** — the seeded pilot (build a game; smoke floor + a 0-10
-  rubric the LLM judge grades against, overwritable by hand).
+- **Draft it with AI** — describe the case in one sentence and the assistant
+  shapes the whole thing: case type, a free id, name, description, the
+  instruction the agent receives, the per-step plan for a `multi_step` case, the
+  step budget, and the validation commands. Every field lands editable, so the
+  draft is a starting point rather than a decision, and any command the lab
+  could not run is listed with the reason instead of being dropped in silence.
+  It uses the same transport as every other LLM call — your gateway, or the
+  Claude Code CLI when that is all that is configured
+  ([ADR-0043](adr/0043-one-llm-transport-gateway-first-claude-cli-second.md)).
+  Leave **Model** on *Transport default* unless you want a specific one.
+
+- **tetris-v2** — the seeded base case (build a Tetris through a `Game` contract;
+  ten shipped tests grade it, so `test_pass_rate` is the objective signal and the
+  LLM judge's rubric level rides beside it as `rubric_score`).
+- **cli-textstats-v1** — a small stdlib CLI with three exact-stdout checks.
 - **SWE-bench** — import a real GitHub issue+fix from SWE-bench Lite/Verified via
   the *Import SWE-bench* box or `make swebench-import INSTANCE=<id>`. These
   **auto-score objectively** (resolved → 10). Only a validated subset runs in the
@@ -663,6 +1013,11 @@ The catalog of tasks. Three ways to get realistic cases:
   exit-code validation, e.g. `benchmarks/cli-textstats/`
   (`make case-import TASK=…`). Great for trying a new model on a self-contained
   task with an objective floor.
+
+**Write the validation commands, whichever way you got there.** The New case
+form takes them one per line, and a case without any cannot score itself: every
+run of it stops in `awaiting_manual_score` waiting for a person
+([ADR-0038](adr/0038-every-run-leaves-with-a-score.md)).
 
 #### Managing a case from the browser
 
@@ -701,12 +1056,57 @@ an experiment makes a claim, so the lab checks the design against the declared m
 and **refuses one that cannot answer it** — a comparison varying both the harness and
 the repository produces a number attributable to neither.
 
-The detail view opens with a **verdict**: whether the treatment improved things, on
+The detail view opens with a **validity card whenever the comparison has a problem**,
+above the verdict and never inside it
+([ADR-0046](adr/0046-an-experiment-reports-validity-before-it-reports-a-verdict.md)).
+It answers a question the verdict cannot: *could this comparison have measured the
+thing it names?* Five things put a card there:
+
+- **The treatment never happened** — an arm carrying skills opened none of them in any
+  run. It measured the skills' availability, not the skills.
+- **These runs measured the connection** — half or more of an arm's runs died in the
+  harness (`harness_error`) or failed outright, or the arm has no scored runs at all.
+- **No headroom** — the control passed every repetition, so only "no change" or a
+  regression was ever representable.
+- **The arm mixes treated and untreated runs** — it invoked its skills in some and not
+  others.
+- **The design was objected to when it was created** — a warning the wizard showed you
+  and you created the experiment anyway.
+
+When any of these is severe, the headline becomes **Comparison not valid** and the
+sentence the lab would have led with moves down to *Measured: …*. Nothing is hidden:
+the deltas, highlights and case matrix are all still there. They stop being the first
+thing read, which is the whole change.
+
+Under it, the **verdict**: whether the treatment improved things, on
 which metrics, at what cost, and how much evidence stands behind it — "12 cases × 5
 repetitions" — plus the case movements as `fixed / broken / unchanged`. The wording
 is deliberately cautious. The lab runs no hypothesis test, so it never says
-*significant*; it says exploratory, useful comparison, stronger evidence, within
-observed variance, or improvement observed.
+*significant*; it says exploratory (1 repetition), a judgement (2–4), a validation
+(5 or more), within observed variance, or improvement observed.
+
+#### Reading — the experiment in plain language
+
+Below the verdict, **Read this experiment** hands the same evidence to an LLM and
+gets back prose, in six fixed sections
+([ADR-0053](adr/0053-an-experiment-is-read-back-as-prose.md)):
+
+1. **Veredicto** — did the harness help, by how much, and can this comparison be
+   trusted. An invalid comparison is said first.
+2. **Qué se comparó** — the arms, and what differs between them.
+3. **Resultado** — success and cost per arm, numbers copied verbatim.
+4. **Qué se usó y qué no** — per arm: which governance documents were read and
+   which were not; which skills were invoked, which were *asked for and not
+   invoked*, and which were available and never opened.
+5. **Por qué (no) se puede confiar** — every validity issue in plain words.
+6. **Qué hacer ahora** — two or three concrete next steps.
+
+The button stays disabled until **every run has stopped** — a reading of half an
+experiment would describe a comparison that does not exist yet and be stored as
+though it did. The evidence the model was given is saved beside the text and can
+be unfolded under it, so any sentence can be checked against the number it came
+from. It is one gateway call with `AUDITOR_MODEL`, it is labelled with the model
+that wrote it, and it never replaces the cards: it is a layer over them.
 
 Under that it keeps outcome, efficiency and behaviour in separate rows, shows every
 mean with its spread, colours a delta by the metric's **declared direction** (a drop
@@ -789,6 +1189,11 @@ A target's **validation commands** replace the case's when a run has one — the
 knows how it is tested better than a portable case does. Full walkthrough:
 [Target repositories](guide-target-repositories.md).
 
+Once two active repositories are registered the page header offers **Test the
+harness across these repositories**, the entry to a `cross_repo` experiment. It
+lives here rather than on the home page because this is where the thing it needs
+is created; with fewer than two, the header says so instead.
+
 ### Skills
 Two tiers: the **governed catalog** (read-only, shipped with the harness) and
 **staged skills** — experimental skills you trial per-run via the ablation panel
@@ -815,7 +1220,7 @@ stay distinguishable.
 
 ### Improvements
 Cross-run worklist for the improvement cycle: after a run's proposals are
-synthesized, the **Guardar** button on the run detail snapshots them here (one
+synthesized, the **Save** button on the run detail snapshots them here (one
 row per proposal, with run date and template version for comparing iterations).
 
 Each row shows the **harness** that produced the run (claude, opencode, …), and
@@ -859,6 +1264,21 @@ Line up runs of the same case across models or harness conditions:
 
 Typical use: run the same case with a new model and a previous one, then open
 Compare to see the objective and cost deltas.
+
+**Reading** ([ADR-0061](adr/0061-compare-can-ask-a-model-to-read-the-table.md)).
+Under the table, *Explain this comparison* asks an LLM to say what the numbers mean:
+whether anything improved, which cells were never measured rather than measured at
+zero, what was held constant and what varied between these runs, and why a hand-picked
+selection is not a causal claim. Six fixed sections, in English, over the same evidence
+the table renders plus the run context it cannot show — the configuration each run
+carried, its failed checks, the judge's rationale, and which governance docs and skills
+it actually opened.
+
+Nothing is generated until you press the button: an unread comparison is an empty box.
+Pressing it again replaces the reading rather than adding one. The reading is stored
+against the *set* of runs, so reordering the columns returns the same text and changing
+one empties the box again. It is a **judgement** and is badged as one. The button waits
+until every selected run has stopped.
 
 ### Health
 What the lab can reach, and where its generated state has drifted
@@ -958,6 +1378,65 @@ improvement" signals (skills, governance docs, subagents), and `CREATE=1` files
 them in `ml-python-base` / `harness-engineering-guide` on your approval. See
 [improvement-cycle.md](improvement-cycle.md).
 
+## Does the harness help? — worked example
+
+The founding question, end to end. This is what happens between picking a case
+and reading an answer.
+
+**1. Pick the case.** *Evaluate → New evaluation → Evaluate a harness change*,
+venue **This lab**. The case decides what can be measured at all:
+
+- `tetris-v2` — ships ten pytest assertions through a `Game` contract, so
+  `test_pass_rate` is a gradient and the judge's rubric is provable from checks.
+- `cli-textstats-v1` — three exact-stdout checks, fast and cheap.
+- An imported SWE-bench instance — one binary outcome (resolved / not).
+
+**Before spending anything, ask whether the case has headroom for this model.**
+If the bare model already solves it in every repetition, the design can only ever
+show "no change" or a regression — the summary will say **No headroom**, and it
+will be right. A case that a capable model passes bare is not a bad case; it is a
+bad case *for that model*. This is the lever that decides whether you will see
+anything: the same harness that does nothing for a strong model may carry a
+smaller one, so pair a hard case with a strong model, or an easy one with a
+small model.
+
+**2. Pick the factor.** *Full harness* asks "does the whole thing earn its
+keep?" — one number, attributable to no single part. If you want to know *which*
+part, run the ladder instead (see the factor table above).
+
+**3. Check the arms the wizard shows you.** With *Full harness* in the lab venue:
+
+| | control `bare` | treatment `full-harness` |
+|---|---|---|
+| workspace | empty, governance masked in the container | the lab root |
+| prompt | `default` — the task, nothing about the harness | `harness` — the same task with the preamble |
+| skills | none visible | the whole catalog |
+| activation | never | on by default, naming the catalog each step |
+
+**4. Repetitions.** 1 explores, 2 is a judgement, 5 is a validation. At roughly
+$0.25–$3 per run depending on the case and model, a 2-arm × 1-case × 2-repetition
+design is four runs.
+
+**5. Launch, then read in this order:**
+
+1. **The validity card**, if there is one. *The treatment never happened* means
+   the harness arm invoked no skill — the comparison measured availability, not
+   use, whatever the numbers below say. *No headroom* means the case could not
+   have shown an improvement.
+2. **The verdict's highlights**: success and `test_pass_rate` (did it work),
+   then `cost_usd` and `billed_tokens` (what it cost). ▲/▼ follow each metric's
+   declared direction, so a fall in cost is green and a fall in pass rate is not.
+3. **Read this experiment** for the same thing in prose, including the explicit
+   list of what each arm read and invoked and what it did not.
+4. **The case matrix**, when there is more than one case: an average of "+8
+   points" can be "fixed four, broke two".
+
+**What a null result means.** "Both arms passed, the harness cost 2.6×" is a real
+finding about *this case and this model*, not a broken experiment — and the two
+most common reasons for it are visible on the same page: the case had no headroom,
+or the harness was never actually used. Fix whichever the validity card names
+before concluding anything about the harness itself.
+
 ## Testing a new model — worked example
 
 Fastest path, no gateway: load the model in LM Studio with an explicit context
@@ -970,7 +1449,7 @@ when you want the run's traces and costs in Langfuse.
    immediately; `opencode.json` is not touched. (Once it earns its keep, run
    `make sync-gateway-models` to curate it into the tracked map for the CLI lane —
    that is a promotion, not a prerequisite.)
-3. Runs → New run → pick a case (e.g. `pytest-dev__pytest-10051` or
+3. Advanced → Runs → New run → pick a case (e.g. `pytest-dev__pytest-10051` or
    `cli-textstats-v1`), set **Executor model** to the new model, Create run.
 4. Repeat with the previous model (same case + prompt).
 5. Compare → select both runs → read the objective/score/cost deltas.

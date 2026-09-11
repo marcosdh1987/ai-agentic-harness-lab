@@ -21,5 +21,5 @@ Otherwise FAIL.
 
 ## Notes
 
-- Reuse the same functional ladder used in `benchmarks/tetris/scoring.md`.
+- Reuse the same functional ladder used in `benchmarks/_archive/tetris-v1/scoring.md`.
 - Keep scoring method consistent with other benchmark cells for comparability.

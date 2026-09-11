@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 from typing import TYPE_CHECKING, Any
 
 from sqlmodel import Session, select
@@ -17,12 +18,18 @@ from harness_lab_app.validation import (
     build_validation_spec,
     collect_cost,
     collect_effort,
+    command_deadline_seconds,
     compute_composite,
     parse_objective,
 )
 
 if TYPE_CHECKING:
     from harness_lab_app.executors import RunExecutor
+
+
+# How much of one validation command's output is kept. Two mebibytes is far
+# more than any real suite's summary and far less than a runaway loop's.
+_OUTPUT_CAP_BYTES = 2 * 1024 * 1024
 
 
 class ValidationService:
@@ -64,13 +71,22 @@ class ValidationService:
         executor: RunExecutor = (
             SubprocessRunExecutor() if spec.get("local") else self._executor_instance()
         )
+        # A "local" spec runs docker itself, from this process, against the
+        # worker's own socket — hardening it would strip the very environment
+        # that lets it reach the daemon. Everything else is an audited
+        # repository's own command and takes the hardened lane.
+        hardened = not spec.get("local")
         results: list[dict[str, Any]] = []
         for command in spec["commands"]:
             label = command[-1] if command else ""
             try:
-                handle = executor.start(f"{run_id}-validate", command)
-                output = "\n".join(message for _level, message in handle.iter_lines())
-                exit_code = handle.wait()
+                handle = executor.start(
+                    f"{run_id}-validate",
+                    command,
+                    hardened=hardened,
+                    phase="validate",
+                )
+                output, exit_code = self._drain(handle, label)
             except Exception as exc:  # record the failure, never crash the run
                 results.append(
                     {
@@ -82,6 +98,69 @@ class ValidationService:
                 continue
             results.append({"command": label, "exit_code": exit_code, "output": output})
         return parse_objective(results, spec["strategy"])
+
+    def _drain(self, handle: Any, label: str) -> tuple[str, int]:
+        """Collect a validation command's output under a hard deadline.
+
+        Neither ``iter_lines()`` nor ``wait()`` has a deadline of its own, so a
+        command that never returns blocked this loop forever — the state the
+        fourth run of experiment `...-on--2` sat in until it was killed by hand.
+        A watchdog calls ``handle.stop()`` (SIGTERM for the subprocess backend,
+        ``container.stop`` for docker, which escalates to SIGKILL on its own),
+        which is what lets the loop finish and record an exit code rather than
+        hang. The command's own ``timeout -k`` prefix remains the first line of
+        defence; this is the one that fires when that prefix cannot help.
+        """
+        expired = threading.Event()
+
+        def _kill() -> None:
+            expired.set()
+            with contextlib.suppress(Exception):
+                handle.stop()
+
+        watchdog = threading.Timer(command_deadline_seconds(label), _kill)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            output = self._capped(handle)
+            exit_code = handle.wait()
+        finally:
+            watchdog.cancel()
+        if expired.is_set():
+            # Whatever the terminated process reported on the way out, the
+            # check settled nothing — say so with a code parse_objective reads
+            # as inconclusive rather than as a failed assertion.
+            return (
+                f"{output}\nvalidation deadline exceeded; command terminated".strip(),
+                124,
+            )
+        return output, exit_code
+
+    def _capped(self, handle: Any) -> str:
+        """Read a command's output, keeping the head and dropping the rest.
+
+        An audited repository's suite can print without limit, and the whole
+        string is stored on the validation row and shown to a judge. The head
+        is what is worth keeping — a failure states itself early — but the
+        stream is drained to the end regardless: stopping early would leave the
+        container blocked on a full pipe and `wait()` would never return.
+        """
+        chunks: list[str] = []
+        size = 0
+        truncated = False
+        for _level, message in handle.iter_lines():
+            if size >= _OUTPUT_CAP_BYTES:
+                truncated = True
+                continue
+            chunks.append(message)
+            size += len(message) + 1
+        output = "\n".join(chunks)
+        if truncated:
+            output += (
+                f"\n[output truncated at {_OUTPUT_CAP_BYTES} bytes; "
+                "the command kept printing]"
+            )
+        return output
 
     def validate_run(self, run_id: str) -> Validation:
         """Run objective validation and record cost + effort (subjective stays)."""
@@ -120,10 +199,16 @@ class ValidationService:
         validation.composite = compute_composite(objective, validation.subjective)
         validation.updated_at = utc_now()
         self.session.add(validation)
+        # Three outcomes, three levels: a failure is an error, a check that
+        # settled nothing is a warning about the lab rather than the agent.
+        verdict = objective.get("passed")
+        level = "error" if verdict is False else "info"
+        if verdict is None and objective.get("checks"):
+            level = "warning"
         self.session.add(
             RunEvent(
                 run_id=run_id,
-                level="info" if objective.get("passed") is not False else "error",
+                level=level,
                 message=f"Objective validation: {objective.get('summary', 'done')}",
             )
         )

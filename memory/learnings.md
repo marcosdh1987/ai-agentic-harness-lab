@@ -3,6 +3,469 @@
 > Non-obvious facts discovered while working: gotchas, why-it-is-this-way, dead ends
 > to avoid. Append new entries at the top. One fact per entry.
 
+## The gate that stops a repository runs before anything can argue with it (2026-09-09)
+
+Shell repositories were ending the audit wizard with "the runner ships only Python and
+Node toolchains" while the runner had been executing bash all along: `python:3.11-slim`
+ships **bash 5.2.37** with its Debian base, so adding Shell support needed no line in
+`Dockerfile.runner`. Verified with `docker run --rm python:3.11-slim bash --version`.
+Check the base image before assuming a toolchain is missing — the block was a
+classification table, not a capability. (`/bin/sh` there is dash, which is a separate
+fact with teeth: a command using `[[`, `<(` or `pipefail` must be handed to `bash -c`
+or it fails for a reason that has nothing to do with the code under test.)
+
+The structural half is the ordering. In `tasks.py::_audit_repository_body`,
+`collect_evidence()` — and therefore `next_step` — runs **before** the LLM has proposed
+a single case, so per-case classification cannot feed the gate in one pass. Wanting it
+to is what makes this look like a rewrite. It is two stages instead: a deterministic
+pre-LLM gate that asks the capability table, and a post-LLM plan permitted exactly one
+transition, `unsupported_runtime → continue`. One direction only, or a model's proposal
+would be reopening a door a fact closed (ADR-0035).
+
+Three smaller ones found on the way:
+
+- **The validation lane was receiving the entire lab `.env`** — `GATEWAY_TOKEN`, GitHub
+  tokens, Langfuse keys — through `build_run_environment()`, while running an audited
+  repository's own `make test`. Shared helpers spread by being convenient; the lane
+  that runs untrusted code and the lane that calls a model had drifted into one
+  environment builder.
+- **`network_mode="none"` needs a phase, not a flag.** Cutting the validation lane's
+  egress outright breaks `git clone`, `npm ci` and `uv sync`. The existing
+  `provision`/`setup`/`validate` tag is what makes "no network, but only while running
+  their code" expressible at all.
+- **A test whose verdict depends on the developer's machine is not a test.** Two new
+  shell tests failed locally for host reasons — `get_executor()` resolving to Docker,
+  which cannot see a macOS `/var/folders` temp path, and `_portable_timeout` correctly
+  dropping its `timeout` prefix on a box with no coreutils `timeout`. Both were the
+  test reaching outside the repository, not the code being wrong: pin the executor and
+  shorten the deadline through `command_deadline_seconds` instead.
+
+**Why it matters:** the bug was one conflated question — *what is this repository
+written in* answering *what does this case need to run* — and it cost a whole class of
+repositories. Neither half was wrong on its own.
+
+**How to apply:** when a single boolean gates a whole flow, check whether it is
+answering one question or two. Then look at *when* it is computed: a gate that runs
+before the information that would correct it needs a second stage, and that stage must
+be allowed to move in one direction only. See
+[ADR-0056](../docs/adr/0056-cases-are-matched-against-runner-capabilities.md).
+
+## A file can be both the thing you hide and the thing you read (2026-09-09)
+
+Every `injected` arm was dying in provisioning with a message that pointed at the
+wrong repository:
+
+    SkillsSyncError: Adapter file is missing the generated-skills sentinels.
+
+Two correct decisions collided. ADR-0049 masks the lab's `CLAUDE.md` inside the
+runner, because the agent's cwd sits under the lab root and Claude Code collects
+`CLAUDE.md` from every ancestor. And `inject_harness` *reads* `CLAUDE.md` — it is
+the document the generated-skills region is spliced into. So the runner copied
+its own empty mask stub over the client repository's governance and then refused
+to splice it.
+
+The tell was already in the codebase. `RUNNER_GOVERNED_SOURCE_DIRS` carves
+`.github/` out of the same mask, with a comment saying that masking it would make
+an injected arm project nothing. The carve-out had been reasoned out for the
+*directories* the projection reads and never extended to the *files* it reads.
+
+Three things worth carrying:
+
+- **Ask of every mask: does anything on this machine still need to read what I am
+  hiding?** A mask is not a property of a file, it is a property of a file *for a
+  reader*. Here the agent must not see it and the projection must. The answer was
+  to give the projection a different root (the worker stages the real bytes into
+  the run directory, which no mask covers), not to weaken the mask.
+- **An error naming a file is not an error about that file.** `splice` complained
+  about the target's adapter file, which was the only innocent party; the reader
+  goes to the client repository and finds nothing wrong. A check that runs *before*
+  the copy, naming the source path and the tool, turns a six-frame traceback into
+  one sentence.
+- **Reproduce a container failure without the container.** Writing an empty
+  `CLAUDE.md` into a temp "lab root" and calling `project_harness` reproduced it in
+  seconds. The mask is just an empty file; nothing about the diagnosis needed
+  Docker.
+
+See [ADR-0055](../docs/adr/0055-the-projection-reads-its-adapter-files-from-outside-the-mask.md).
+Related: [[a-single-bind-mount-decides-what-use-my-local-repo-can-mean]].
+
+## A Docker bind mount is a watched tree, not a window (2026-09-07)
+
+Rooting the folder picker at `${HOME}` did not just widen what the API could read
+— it made Docker Desktop crash, twice, with the engine taking the whole lab with
+it:
+
+    service fs failed: injecting event blocked for 60s
+
+Docker Desktop injects filesystem events into the VM for **every path it shares**,
+so a shared home directory means it is watching `~/Library`, every cache and every
+synced folder. That volume of events blocks the `fs` service past its timeout and
+the engine dies. macOS confirms the diagnosis independently: sharing `$HOME` makes
+it pop the TCC prompt "Docker would like to access data from other apps".
+
+`:ro` does not help. Read-only limits writes, not the events the host generates.
+
+The rule: **a bind mount root is a working set, not a search space.** Size it by
+what the container needs to touch, not by what would be convenient to browse. The
+default is now the directory the lab itself sits in
+(`${HARNESS_LAB_LOCAL_SOURCES_DIR:-..}`), and the variable moves that root rather
+than narrowing it — one line of configuration is a much smaller cost than an
+engine that stops.
+
+The near-miss underneath it: this was chased for a while as "Docker being flaky",
+and I told Marcos there was no evidence in the logs pointing at the mount. There
+was — in the crash dialog, which I had not asked to see. A component named in an
+error message (`service fs`) is a hypothesis, and two crashes on the day one
+mount changed is not coincidence.
+
+Related: [[a-real-home-directory-is-not-a-fixture-path-is-dir-raises]],
+[[a-single-bind-mount-decides-what-use-my-local-repo-can-mean]].
+
+## A real home directory is not a fixture: `Path.is_dir` raises (2026-09-07)
+
+Turning the folder picker on by default meant rooting it at `${HOME}` instead of
+an explicitly configured directory. The listing worked in every test and then
+returned a 500 on the first real call:
+
+    OSError: [Errno 95] Operation not supported: '/host-sources/.obsidian-cli.sock'
+
+`Path.is_dir()` does not return False for things it cannot stat — it raises. A
+home directory is full of them: unix sockets seen through a shared mount, dead
+symlinks, and directories the container may list but not stat. One of them
+anywhere beside the repositories took down the whole picker, and no fixture built
+out of `tmp_path` and `mkdir` will ever contain one.
+
+Two consequences worth carrying:
+
+- Any code that walks a directory a *person* owns needs its stat calls guarded
+  and the entry skipped, not just its path checks. Same for `iterdir()` itself on
+  a directory that may be unreadable — answer with the service's own error so the
+  caller gets a message rather than a 500.
+- Reproduce that class of failure by monkeypatching `Path.is_dir` to raise for
+  one name. Building a real socket in `tmp_path` fails on macOS anyway:
+  `OSError: AF_UNIX path too long` — the 104-byte sun_path limit against pytest's
+  nested tmp directories.
+
+The wider lesson: a default that widens what the code sees (an opt-in root
+becoming `$HOME`) is not a config change. It is a new input domain, and the tests
+that passed were describing a directory nobody actually has.
+
+Related: [[a-single-bind-mount-decides-what-use-my-local-repo-can-mean]]
+
+## A single bind mount decides what "use my local repo" can mean (2026-09-07)
+
+The audit onboarding only knew one way to get source: the operator clones into
+`data/checkouts/<target_id>` and the lab watches that path. Two failures came
+out of it on a real machine — a repository already cloned under a different name
+was invisible, and the page waited forever without saying what it was watching.
+
+The design was not decided by preference. The API container mounts `.:/app` and
+nothing else, and the runner mounts the lab root the same way, so a repository
+anywhere else on the host is invisible to the API *and* to every run and gate
+check. That makes "point the lab at my folder" impossible and "copy my folder
+into `data/checkouts/`" the only shape that works. `git clone --no-hardlinks` is
+the copy: without `--no-hardlinks` git links the new object store into the
+operator's own repository, which is exactly the coupling ADR-0042 exists to
+avoid, and the flag costs nothing because the copy is local.
+
+Three things the tests only found once the endpoints were exercised:
+
+- **The endpoint shape is a silent failure mode.** `GET /api/checkouts` returned
+  `{"checkouts": [...]}` while the page rendered the response as an array. No
+  error, no list — an operator told to clone a repository they already had.
+  Service-level tests cannot see this; the API tests added alongside them can.
+- **A copy inherits the mount path as its origin.** The clone's `origin` came
+  out as `/host-sources/...`, a path that names nothing outside the container
+  and stops existing when the mount changes. It is now reset to the repository
+  URL the target declares — the same origin the guided clone leaves.
+- **Ordering, not validation, is what protects an attached checkout.**
+  `pin_checkout` writes back the path it inspected, so `inspect_checkout` had to
+  become path-aware *first*; otherwise pinning silently un-attaches the clone
+  the operator chose.
+
+**Why it matters:** the fence of ADR-0042 — a local source is accepted only
+under `data/checkouts/` — is what makes all of this safe, so it stayed untouched
+while everything around it changed. The picker is off unless
+`HARNESS_LAB_LOCAL_SOURCES_DIR` is set, mounted read-only, and resolves every
+path *before* checking containment, because a symlink would otherwise pass a
+textual check and read anything the container can see.
+
+**How to apply:** when a feature asks the lab to reach outside itself, look at
+the bind mounts before the API design — they usually decide the answer. And when
+a request is really a UI shape (a list, a wrapper), assert the shape at the
+endpoint: the service tests will pass either way. See
+[ADR-0045](../docs/adr/0045-a-checkout-the-lab-can-be-given-not-only-watched.md).
+
+## A form gate that contradicts its own next branch is a bug (2026-09-06)
+
+The *Full harness* wizard refused any selection whose cases defined fewer than
+two prompt variants, and the branch immediately after it documented — in a
+comment — that equal prompts are perfectly sound, since the bare arm still hides
+the whole governed catalog. Two branches of one `if`, disagreeing. The gate had
+been written for `tetris-v1`, the only case in the lab with a prompt *family*;
+every case written in the Cases screen defines exactly one variant, `default`,
+so the lab's founding comparison was unavailable on the cases the lab is used
+on.
+
+**Why it matters:** the same-prompt design is not a degraded version of the
+prompt-family one — it is the *cleaner* one. A hand-written `sdlc` prompt tells
+the agent to read governance, so `naive` vs `sdlc` moves the instruction and the
+harness together. A plain `default` prompt says nothing about governance, so
+running it on both arms isolates the harness. The gate blocked the better
+experiment and permitted the more confounded one.
+
+**How to apply:** when a validation rule and the comment next to it disagree,
+believe the comment and delete the rule — and when a user says a refusal makes
+no sense, check whether the refusal is defensible before offering workarounds
+around it. Two related habits this turned up:
+
+- **Say what a design measures instead of refusing it.** The same-prompt pair
+  now runs and carries two advisories: the treatment is the skill catalog, not
+  the harness as a unit; and inside the lab both arms keep the governance body
+  of `CLAUDE.md`, because the sync engine rewrites only its generated skills
+  region. A truly bare control needs `harness_source` against an external repo.
+- **Every cross-product needs per-case resolution.** `ExperimentService.launch`
+  applied each arm's `prompt_variant` without checking the case declares it; the
+  prompt lookup falls back to `""`, so the run went out with no task, inside one
+  arm, reading as that arm losing. Batch mode had resolved this per case since
+  ADR-0023 and experiments had not — the second copy of a rule is where it goes
+  missing. See
+  [ADR-0044](../docs/adr/0044-a-single-prompt-case-can-carry-the-full-harness-pair.md).
+
+## A transport migration is found by grepping the wire, not the helper names — 2026-09-04
+
+ADR-0043 collapsed "four" gateway call sites onto `llm_transport`. There were
+five: `case_draft_service.py` had its own `_call_gateway_chat`, so on a
+subscription-only lab every judged feature worked while **Draft it with AI** in
+the wizards still answered "Gateway not configured". The plan's inventory had
+been built from the helper names people remembered (`call_gateway`,
+`_worker_gateway`, `_gateway`), not from the request shape. The one string every
+copy shared was `chat/completions`.
+
+The same pass showed how documentation drifts in this repo: not by lying about
+a feature, but by describing a *previous* layout. The in-app Guide still walked
+"Cases → Runs → Score → Compare" after the nav had been regrouped around three
+questions; four guides said `claude` needs host mode a month after it moved into
+the runner image; two docs in the same directory disagreed on whether the API is
+on the LAN (it is not; the Vite dev UI on `0.0.0.0:5173` proxies it, so the
+answer is "yes until `make set-password`"). And `docs_catalog.py` is a
+whitelist: a new guide is invisible in the web Guide page until it is registered
+there, which is why the three newest workflows (target repositories, skill
+validation, run continuation) had docs nobody could reach from the UI.
+
+**Why it matters:** the UI, the docs served in-app and the markdown on disk are
+three copies of "how to use the lab". A change that lands in one place reads as
+a contradiction from the other two, and a reader cannot tell which copy is
+current.
+
+**How to apply:** when auditing docs against code, build the fact sheet from
+the code first (nav groups from `Shell.tsx`, routes from `api.py`, transports
+from `llm_transport.py`, harness rules from `run_service.preflight`) and check
+every document against that one sheet, so the fixes agree with each other.
+When migrating a duplicated call, grep for the wire format (`chat/completions`,
+`choices[0]`) rather than for function names. When adding a guide under
+`docs/`, register it in `docs_catalog._DOCS` or it does not exist in the app.
+
+## Under `native`, a lab-side skill is invisible to the agent — 2026-09-04
+
+`apply_skill_views()` writes into the LAB root; `inject_harness()` runs only for
+`harness_source == "injected"`. Under `native` the agent's cwd is the cloned
+target, so neither governed nor `--extra-skill` skills reach it. A
+`native` + `skills_extra` arm therefore equalled its own control while hashing
+as a distinct condition — the ADR-0041 failure one level down. Fixed by
+`add_skills_to_native()` in `bench_run.py` + `linker.add_skills()`, which copies
+only the named skills into the workspace's native skills dir and, unlike
+`link_tool`, **prunes nothing** (the target's own `.claude/skills/` is that
+team's work).
+
+Related: `validate_design` used to warn "more than one harness factor varies"
+on the most common correct design — staging a skill *and* asking for it. They
+now collapse to one axis when every pair of arms is comparable on both sets at
+once; crossing sets (one arm adds X unasked, another asks for a Y it already
+had) still warn.
+
+## A container cannot clone a private repo, and should not try — 2026-09-04
+
+Target repositories were cloned inside the run container, which runs with
+`GIT_TERMINAL_PROMPT=0`, no ssh agent and no tokens by design. Correct for a
+public repo, fatal for every private one — i.e. every client repository. The
+fix was not to teach the lab about credentials but to invert the direction:
+the engineer clones in their own terminal into `data/checkouts/<target_id>`,
+the lab detects and pins it, and `clone_source(target)` returns that path
+everywhere the repository URL used to be read (runner provisioning, readiness
+mirror, case derivation, ref resolution). Git takes a path anywhere it takes a
+URL, so no downstream code needed a second branch (ADR-0042).
+
+Three gotchas found doing it:
+- **`validate_repository_url` rejects local paths on purpose** (a URL starting
+  with `-` is remote command execution to git). Local sources needed their own
+  `validate_clone_source`, which accepts a path only under `data/checkouts/`.
+- **`target_id` becomes a directory name**, so it is a path boundary —
+  `../escape` would put a clone anywhere on the host. `validate_target_id`
+  refuses rather than sanitising, because a silently rewritten id would not
+  match the directory the operator was told to clone into.
+- **The API container and the operator's shell see different paths.** The
+  guided command must use `host_repo_root`, the same value the runner uses for
+  its bind mounts; printing the container's own `/app/...` view is useless in a
+  terminal.
+
+## A red run against an unfamiliar repo is ambiguous — 2026-09-04
+
+"The agent failed" and "this repository does not build in the runner image"
+look identical in a failed run and mean opposite things. The gate check
+(`gate_check_service` + the `gate_check_target` Celery task) provisions the
+pinned commit, runs setup and the repo's own validation commands with no agent
+and no model, and records **which phase** failed (provision / setup /
+validate). It runs through the same executor as objective validation, so it
+needed no new infrastructure. Refuses to run at all when the repository has no
+runnable validation command — a check that passes by running nothing reads as
+success and is worse than no check.
+
+## "With skill" means available, not invoked — 2026-09-04
+
+First real Lane B comparison (`does-adding-caveman-improve-outcomes`, 5+5 runs,
+claude/haiku, one AI-drafted snake case): verdict "No difference observed",
+success 100% both arms, every secondary delta within run-to-run variance. The
+person read it as "slightly worse". Parsing the step events told the real
+story: in **0 of 5** treatment runs did the agent call the `Skill` tool or read
+`caveman/SKILL.md`. The final messages were the usual "Perfect! ✅ ALL
+MILESTONES COMPLETE" prose. The treatment never happened.
+
+Mechanism: `--extra-skill` projects the staged skill into the agent's native
+skill view (the run's init event lists it among 40 skills). That makes it
+*available*. `caveman`'s description triggers on "/caveman", "caveman mode",
+"be brief"; the case instruction says none of that, so the model had no reason
+to open it. The lab's number was correct and its caveats honest, but the
+number measured "skill on the menu", not "skill in use".
+
+Two other things learned reading the same data:
+- **Baseline is the governed harness, not a bare model.** `build_effective_skills`
+  = every governed skill under `.github/skills*` minus `--disable-skill` plus
+  `--extra-skill`. "Without the staged skills" therefore means CLAUDE.md +
+  ~25 governed skills. Arm descriptions now say so.
+- **`total_tokens` ≈ output tokens for Claude Code runs.** `usage.json`
+  reports `input_tokens` in the hundreds because cache reads are not counted;
+  a context-reduction skill's main effect (less input re-read per turn) is
+  invisible in that metric. Reading `cache_read_input_tokens` from the stream
+  events would be needed to see it.
+
+**Why it matters:** a comparison can be statistically clean and still answer
+the wrong question when the treatment is conditional on the agent's choice.
+Skills are exactly that kind of treatment.
+
+**How to apply:** decide which question the experiment asks. "Does it help
+when asked for" → tick *Enforce skill use* (`skills_invoke`, the arm's prompt
+asks for it at every step; the case stays identical across arms). "Does it
+help unasked" → leave it off and read which skills the agent opened. Either
+way read `skill_invoked` per arm before the delta; an arm at zero now carries
+the caveat at the top of the verdict. Implemented in ADR-0041.
+
+## A validation "command" the assistant writes can pass the gate and still measure nothing — 2026-09-03
+
+The AI case assistant returned heredocs (`node - <<'NODE' … NODE`,
+`python - <<'PY' … PY`) as validation commands. The case stores one shell
+command per line, the wizard's textarea joins the array with newlines and
+splits it again on save, so the script body became twenty separate entries.
+Most were refused by `_looks_executable` (`NODE`, `}`, `const …`). The
+dangerous part was what survived: `node - <<'NODE'` on its own passes the
+heuristic (first token `node`), and `sh -c` runs it with an empty stdin — exit
+0, a pass with no assertion behind it. The gate from ADR-0040 forces a command
+to exist; it cannot see that a fragment is meaningless.
+
+Fix (in `case_draft_service.py`): the system prompt states the one-line rule,
+every returned command is screened with the runner's own heuristic
+(`is_executable_command`) plus a multi-line refusal, the model gets one
+corrective turn if nothing runnable is left, and the response carries
+`dropped_commands` with reasons so the wizard shows the gap under the draft.
+
+**Why it matters:** an LLM will happily satisfy a schema ("array of bash
+commands") with something the executor cannot run as a unit. Screening at the
+same line the runner uses is the only place the refusal is both early and
+consistent; prompt wording alone is a suggestion.
+
+**How to apply:** whenever a model-generated artifact feeds an executor, run
+the executor's own acceptance check on it before handing it to the person, and
+return the rejects with reasons rather than silently narrowing the output.
+Also: run pytest here as the Makefile does, `PYTHONPATH=$PWD/src pytest …` —
+the venv's editable install points at an older checkout path, so a bare
+`pytest` collects against stale code and reports modules as missing.
+
+## Two base CSS rules made the UI look inconsistent between pages — 2026-09-03
+
+After the visual-design pass the wizard pages looked broken in two ways
+that the short pages did not show: the sidebar groups drifted apart, and every
+checkbox or radio sat in the middle of its row with the label pushed to the far
+right. Neither was page-specific. Both were base rules in `frontend/src/styles.css`
+interacting with layout that only appears on long pages:
+
+- `.nav` is a grid with `flex: 1` so the sidebar footer sticks to the bottom. A
+  grid's default `align-content: stretch` then spreads the rows over the whole
+  sidebar height, which is the page height — invisible on a short page,
+  obvious on a long one. `align-content: start` fixes it.
+- The base `input { width: 100%; padding: 10px 12px }` is meant for text fields
+  but also hits `type="checkbox"` and `type="radio"`; the control fills the flex
+  row and its `<span>` label is shoved to the edge. `.skill-checkbox` had a local
+  override for exactly this; the fix is one global rule for both input types.
+
+The third symptom — pick-list rows of different widths, and a selected row whose
+description was unreadable — came from reusing `.primary` / `.secondary` (CTA
+buttons, `inline-flex`, width-to-content) as row selection states. Rows now have
+their own rule under `.pick-list > li > button`, and "selected" tints instead of
+filling.
+
+**Why it matters:** a page-level symptom that reproduces on several pages is a
+base-rule defect; fixing it in the page (inline styles, per-page overrides) hides
+the next occurrence. The inline styles in `SubjectValidation.tsx` also referenced
+tokens that do not exist (`--surface-sunken`, `--card-bg`, `--radius`), so they
+silently fell back to hard-coded colours that ignored the theme.
+
+**How to apply:** when a control looks wrong on one page, screenshot two other
+pages that use the same class before touching the page. Chrome headless
+(`--headless=new --screenshot=… <url>`) against the running dev server is enough
+to verify a CSS change without a browser session. Keep JSX free of `style={{}}`
+in this codebase: every value it needs already exists as a token or a class.
+
+## The mode is what licenses the conclusion, so a missing mode gets borrowed — 2026-09-03
+
+The most common thing an outside team brings to this lab is not a harness change.
+It is a thing they built — an agent behind a local API, an MCP server, a service
+wrapper — plus a skill that drives it, and the question "does it work reliably?".
+The lab ran that fine: cases, arms, repetitions, `task_validation_pass`, the
+sandbox. Every number was already computable. What was missing was a **name** for
+the question, and the three declared modes of
+[ADR-0028](../docs/adr/0028-evaluation-modes.md) all asked about the harness.
+
+A missing mode does not stay missing. It gets borrowed from the nearest one, and
+`harness_evaluation` was the nearest one. That produces a correctly computed pass
+rate attached to a claim the design cannot support — "the tool passed 8 of 9" read
+as evidence about the harness, when no arm was ablated and there is no baseline to
+subtract. It is the exact defect ADR-0028 was written to prevent, reintroduced
+through the label instead of through the display.
+
+The second finding sits underneath it: the hard gate of the new mode is not
+statistical, it is **a case with at least one executable validation command**. It
+has to be a block, not a warning, because the failure is silent and downstream.
+`build_validation_spec` skips non-executable entries without complaining, so a case
+whose validation is prose yields zero commands → `parse_objective` returns
+`passed=None` → `task_validation_pass` is never emitted → `scored_runs == 0` → the
+pass rate is `None`. The experiment runs in full, costs real money, and answers
+nothing without saying so.
+
+**Why it matters:** the modes are the product. Adding a fourth is not feature
+creep — it is the only way to stop a fourth question from being answered with a
+third question's authority. And the honesty of the number depends on a gate placed
+*before* money is spent, not on a caveat rendered after.
+
+**How to apply:** when a new use of the lab appears, ask what sentence it licenses
+before asking what it computes. If no declared mode's sentence fits, the mode is
+missing — do not run it under the closest label. When adding a gate, trace the
+failure path to where it surfaces: if the bad input degrades into an empty result
+rather than an error, it must be refused at creation. Known limit accepted here:
+the gate can force a validation command to exist and to be executable; it cannot
+force it to be able to fail (a smoke check that the game starts cannot fail once
+the game starts). That judgement stays with whoever writes the case. See
+[ADR-0040](../docs/adr/0040-subject-validation-mode.md).
+
 ## Resetting the database under a live stack splits it in two — 2026-09-02
 
 `make app-reset-db` runs `scripts/reset_db.py` from the **host** while the `api`
@@ -336,6 +799,354 @@ place a future field will be dropped: `_config_payload`, `_resume_config`,
 `clone_run` and `continue_run` must all be updated together when the schema
 grows. See [ADR-0026](../docs/adr/0026-run-continuation-as-child-runs.md) and
 [guide-run-continuation.md](../docs/guide-run-continuation.md).
+
+## claude stream-json per-turn usage undercounts output (2026-08-27)
+
+In `steps/step-N.events.jsonl`, each assistant message's `usage.output_tokens`
+is a streaming snapshot taken before the message finished: summing them across
+a run gives ~5% of the real total (`1348` vs `26987` on `tetris-v1-K-004`).
+`input_tokens` and the cache counters per turn are usable; output totals must
+come from the terminal `result` event or `usage.json`. The events also carry
+no timestamps of their own — `bench_run.stamp_event_line` now injects
+`_received_at` at capture time, and the Langfuse exporter labels anything
+older `timing_source: interpolated`. Also: `run_id` is not globally unique
+across copies of a run directory, which is why OTEL ids are salted with
+`condition_hash`. See
+[ADR-0028](../docs/adr/0028-step-traces-carry-per-call-detail.md).
+
+## A subscription token is a whole LLM transport (2026-09-04)
+
+The lab made four independent `POST /chat/completions` calls — the auditor, the
+SWE judge, the DeepEval judge, the case summariser — each with its own copy of
+the same twelve lines. Collapsing them into `llm_transport` was worth doing on
+its own, but the reason it mattered is that **one seam is one place to add a
+second transport**: `claude -p --output-format json --tools "" --strict-mcp-config`
+is a text-completion endpoint, so a teammate whose only credential is a Claude
+subscription now gets audits, judges and summaries with no paid API key and no
+gateway. `--tools ""` is the load-bearing flag: it makes the CLI a completion
+rather than an agent, so no permission prompt can ever block a worker.
+
+Three things that were not obvious until the code ran:
+
+- **The CLI reports failure in-band.** A bad model name comes back as exit 1
+  *plus* `"is_error": true` *plus* the error text sitting in `result`, exactly
+  where an answer would be. A parser that reads `result` without checking the
+  other two returns an error message as if it were an audit.
+- **The audit prompt must go on stdin.** The real one measured 86 KB (clipped
+  diff plus harness log). Not over the argv limit, but close enough that a
+  larger diff would be.
+- **Model names are transport-specific**, so defaults have to be too.
+  `gpt-5.4-mini` means nothing to the CLI and `claude-sonnet-5` means nothing to
+  a gateway that does not proxy it; a name that is not a Claude id is dropped so
+  the CLI picks its own default instead of sending a guaranteed 404.
+
+**Why it matters:** the ordering is the entire compatibility promise. The gateway
+is checked first, always, so adding a Claude credential to a multi-model lab can
+never move a judge — a test asserts it. Two labs judging the same run over
+different transports produce numbers that are only loosely comparable, which is
+why each judged score records its transport in provenance.
+
+**How to apply:** when a capability is duplicated more than twice, the third
+copy is the signal to extract a seam — the payoff is usually the *next* feature,
+not the deduplication. And validate a fallback path end to end before believing
+it: this one uncovered `ToolCorrectnessMetric()` being constructed outside its
+`try`, where DeepEval eagerly builds an OpenAI client and raises on a missing
+`OPENAI_API_KEY`, killing all three trajectory metrics on any lab without that
+key. Unit tests never saw it; a real subscription-only run did. See
+[ADR-0043](../docs/adr/0043-one-llm-transport-gateway-first-claude-cli-second.md)
+and [the plan](../docs/plans/2026-09-claude-native-llm-transport.md).
+
+## Three experiments that could not answer their own question (2026-09-08)
+
+**What happened:** three `harness_evaluation` experiments asked "does the full
+harness improve outcomes over the bare model on Tetris?". All three rendered a
+confident verdict; none of them could have measured it. The corpus is still in
+`data/app/harness_lab.db` and is the cheapest regression fixture this lab has —
+every guard below is verifiable against it with no new runs.
+
+**What the evidence showed, in the order it was found:**
+
+- All six full-harness runs carried `skill_invoked = 0.0` — *the treatment never
+  happened*. The score existed and the caveat sentence was already written. It
+  landed as a footnote under a headline that read as a result.
+- The summary never even reached that sentence. It rebuilt each arm's skill list
+  from that arm's own `skills_extra`/`skills_invoke`, and a full-harness
+  treatment stages nothing: the whole catalog is named on the **control's**
+  `skills_disabled`. `score_service.build_context` already unioned the siblings;
+  `summarize` did not, so the treatment's list came back empty and the
+  observation had nowhere to land. Two readers of the same fact, two rules.
+- Four of four opencode runs ended `stop_reason: harness_error` (SSE timeout)
+  and were recorded `state=completed, exit_code=0`, then auto-scored 0. The
+  worker reads the exit code, not `usage.json`; `bench_run` returned 0 on the
+  managed path regardless. A dead connection was averaged in as a model failing.
+- Two experiments had a control passing every repetition. Improvement above 100%
+  is unrepresentable — the design could not detect the thing it was built for.
+- The control arm was never bare. Venue `lab` means the governance body of
+  CLAUDE.md, the SessionStart hook, six subagents and `.github/` are present in
+  **both** arms; skill ablation rewrites only the generated catalog region. The
+  wizard's advisory about this was gated on "both arms run the same prompt",
+  which is unrelated to the property it describes.
+
+**Why it matters:** none of these was a missing measurement. Every fact was
+already computed, stored and even phrased correctly. The lab simply had no way
+to say *this comparison could not have measured the thing it names*, so
+everything it knew was expressed as a caveat under a confident sentence — the
+one place a reader will not weigh it.
+
+**How to apply:** when a check is worth making, decide where the reader meets it
+before deciding how to compute it; a correct sentence in the wrong slot is
+indistinguishable from silence. When two components read the same fact (here:
+"which skills is this arm about?"), extract the rule or they will drift — the
+scorer and the summariser disagreed for three experiments. And a guard computed
+on read needs no migration: the bad rows are re-read correctly where they stand,
+which is also the argument for never rewriting them. See
+[ADR-0046](../docs/adr/0046-an-experiment-reports-validity-before-it-reports-a-verdict.md).
+
+## A timeout is a fact about the lab, not about the agent (2026-09-08)
+
+Four Tetris runs — all four working games — scored 1/10. Nothing in the chain was
+about the code:
+
+- **`timeout` alone cannot kill an SDL program.** Plain `timeout <N>` sends SIGTERM;
+  SDL converts SIGTERM into an `SDL_QUIT` *event*, which an interactive loop is free
+  to ignore. The command wedged, exited 124, and `passed = exit_code == 0` read that
+  as "the code fails". Always `timeout -k <grace> <N>`.
+- **A `-k` escalation is not enough on its own.** The wedge can sit anywhere, and
+  `RunHandle` (executors.py) has no deadline: `wait()` takes no timeout and
+  `iter_lines()` is the blocking call. The only shape that works is a
+  `threading.Timer` watchdog calling `handle.stop()`, sized from the command's own
+  `timeout` budget.
+- **"0/1 checks passed" is the worst possible sentence to hand a judge.** It reads
+  identically whether an assertion returned the wrong number or the process was
+  killed before it could answer — and the judge, which *does* read the diff
+  (`judge.py:build_rubric_message`), had no reason to distrust it. Passing the full
+  per-check list with an explicit INCONCLUSIVE marker costs nothing and removes the
+  ambiguity.
+
+**Why it matters:** two-valued validation forces every unknown into "failed", and a
+false zero is worse than a missing one — it averages into `success_rate` and looks
+like a measured result. This is ADR-0046's *infrastructure entering the corpus as
+capability*, one layer below the crashed harness it was written about.
+
+**How to apply:** when a boolean summarizes a process that can be interrupted, check
+whether it can also express "did not run". Then propagate that third value all the
+way out — evaluator (exclude, do not zero), judge prompt (refutes nothing), UI (warn,
+not error) — because any layer that flattens it back to false undoes the other three.
+See [ADR-0048](../docs/adr/0048-a-check-that-did-not-measure-is-not-a-failure.md).
+
+## A different cwd is not isolation (2026-09-08)
+
+The lab assumed "the agent's cwd is the workspace, so it cannot see the lab's
+harness". Two archived `native` runs measured what that assumption actually buys:
+
+- **`.claude/` is genuinely not read from an ancestor.** Their `system/init`
+  events list only Claude Code's built-in agents, no lab slash commands, no lab
+  skills, and no `SessionStart` hook fired. That half of the assumption holds.
+- **`.mcp.json` is.** Both runs came up with the lab's `context7` and `git` MCP
+  servers while having no `.mcp.json` of their own. And `CLAUDE.md` memory lookup
+  walks ancestors by design — `workspace/<run>/` sits under the repo root, which
+  is bind-mounted whole at `/app`, so the lab's rulebook was one directory up the
+  entire time.
+- **`.claude/settings*.json` is read from the project dir, not from an ancestor
+  either** — so a workspace-cwd run never sees the lab's `env` block
+  (`ANTHROPIC_BASE_URL`, the LiteLLM gateway). Do **not** read
+  `apiKeySource: "none"` as proof of a bypass: OAuth-token auth reports that on
+  every arm, lab-root included (ADR-0049 erratum). A cwd change can move
+  routing, not only governance — so routing is injected as container env.
+
+**Why it matters:** the whole point of a control arm is that it *lacks* something,
+and nothing in the pipeline can detect a control arm that quietly kept it. The
+only fix that is both tool-agnostic and unbypassable is masking at the container
+level — empty tmpfs over directories, read-only empty-file binds over files. No
+CLI flag turns off ancestor `CLAUDE.md` lookup.
+
+**How to apply:** when isolating an agent, enumerate what its tools auto-load and
+from *where* — cwd, ancestors, `$HOME`, env — then verify against a run's own
+`system/init` event rather than against the docs. Two Docker details that cost
+time: a bind source must exist on the host first or Docker silently creates a
+*directory* there and the mount fails, and an empty `.json` mask is invalid JSON
+rather than "no config" (use `{}`). See
+[ADR-0049](../docs/adr/0049-a-bare-arm-is-a-masked-runner-not-a-lab-root-run.md).
+
+## The first valid bare-vs-harness run, and what the instrument got wrong (2026-09-08)
+
+The control arm was finally bare (masks verified in `system/init`: built-in agents
+only, no MCP servers, no hooks), and the experiment was still invalid — every reason
+was a defect of the *instrument*:
+
+- **The judge scored equivalent code 10 and 2 on identical evidence.** Not a
+  sampling problem: `tetris-v1`'s rubric levels 3-10 describe gameplay ("opens a
+  window", "rotation works") that neither a diff nor a headless smoke can establish,
+  and the prompt asked the judge both to award what the diff shows and to withhold
+  what only a check proves. Fix the *rubric* before sampling: levels now carry
+  `[check]`/`[diff]`/`[manual]` tags, `[manual]` is never awarded, `[diff]` needs a
+  quoted citation. `tetris-v1` honestly caps at level 2; `tetris-v2` ships ten
+  tests so the grade is objective (ADR-0050).
+- **The judge's number never reached the experiment page.** `Validation.subjective`
+  is not a score row, so the 10/2 split was invisible in the deltas. `rubric_score`
+  is now a JUDGEMENT-provenance registry score — visible, never the success metric.
+- **"Total tokens" showed the harness using *fewer* tokens while costing +71%.**
+  `collect_claude_usage` summed `input_tokens` (42-146 per run — the uncached
+  sliver) and ignored `cache_read_input_tokens` (724k vs 184k). A harness is paid
+  for in cache reads. `billed_tokens` is the new headline; `total_tokens` keeps its
+  meaning (ADR-0034: never redefine a name). Highlights now carry a direction.
+- **The case matrix kept the last repetition only** (`verdicts[label][case_id] =
+  passed`), so 1-of-5 and 5-of-5 rendered identically. Now all-pass per cell.
+- **`apiKeySource: "none"` is not a gateway bypass** — the lab-root arm shows it
+  too; it is how OAuth reports. Recorded as an erratum on ADR-0049.
+
+**Why it matters:** none of these would have shown up on a harness that helped; they
+showed up because the bare arm made the comparison sharp enough to notice.
+
+**How to apply:** before trusting a delta, ask three questions of the instrument —
+is the outcome metric graded finer than the thing being varied, does the opinion
+metric reach the page where the delta is read, and does the cost metric count what
+the treatment actually adds. `make ladder` (ADR-0051) now creates the four
+single-factor rungs consistently; `make harness-adopt REF=` (ADR-0052) makes every
+run attributable to a release.
+
+## Never write the live SQLite from the host (2026-09-09)
+
+`data/app/harness_lab.db` went "database disk image is malformed" after a day of
+host-side writes (`sqlite3` one-liners, `import_case.py`, `ladder.py`, a seed
+call) while the api and worker containers were writing the same file through a
+Docker bind mount on macOS. WAL over a bind mount with two hosts is a known
+corruption path. The symptoms before the diagnosis were subtle: imported cases
+"disappeared", Celery tasks "succeeded" in 0.14 s having done nothing (the
+exception was swallowed into a RunEvent), and re-validations never landed.
+
+**Recovery that worked:** `sqlite3 corrupt.db ".recover" | sqlite3 new.db`, then
+`PRAGMA integrity_check`, then `VACUUM INTO` the real path with api+worker
+stopped. Every row survived except one `case` row, which the startup seed
+re-imported from `task.yaml`.
+
+**How to apply:** when the app is up, go through the API (`POST /api/cases/seed`,
+`/validate`, `/experiments`) — never `sqlite3` or a script against the file.
+Also: `_autoscore_run` only scored `awaiting_manual_score` runs, so a re-validate
+never re-judged; it now re-scores a run whose previous score came from the judge
+or an objective verdict (never a human's). See ADR-0053.
+
+## A badly formed case reports a number about itself (2026-09-09)
+
+Two cases written from the talos audit ran four experiment arms and produced nothing
+about talos, and nothing about the lab's own template either. Every defect was silent:
+
+- **A shell `for` loop exits with its last command's status.**
+  `for t in {workspace}/tests/test_*.sh; do bash "$t"; done` reported
+  `task_validation_pass = 1` while the same run's stored detail read
+  `rc=2 CONFIG ERROR`. Fifty-four failures ahead of one pass is a green check. The
+  fix is `|| exit 1` **inside** the loop body.
+- **A repo-relative path with no `{workspace}` resolves against the lab's own root.**
+  `bash benchmark/model/run-model.sh` exited 127 in both arms. The file existed; the
+  path did not. Exit 127 in a validation check is almost always this.
+- **`source: "git_target"` is not a case type.** `bench_run.py` decided "is this
+  SWE-bench?" by calling `spec_provisions_repo()`, which answers *"does a repository
+  have to be cloned?"* — true for **every** case paired with an external target. So
+  from step 2 both talos cases were told to resolve a GitHub issue, shown an empty
+  list of target failing tests, and told to run `python -m pytest` in a repository
+  with no Python. Both arms. The injected arm reacted worse (6.6× turns, 9× cost,
+  zero diffs), which would have been reported as a treatment effect.
+- **A run parked in `awaiting_manual_score` with an empty rubric is a case defect, not
+  a scoring backlog.** `_llm_judge_rubric` returns at `if not rubric` — silently — and
+  the run looks like something a human just has not got to.
+- **Runner capabilities include POSIX tools, not only interpreters.** Every talos test
+  died because the image shipped no `jq`, and the agent's own `apt-get install jq`
+  lived in the *agent's* container, which the later validation container does not
+  inherit.
+- **A repository's harness may not be in a dotted directory.** talos keeps sixteen
+  skills in `skills/` and four hooks in `hooks/`; four drifted path taxonomies all
+  named only `.claude/`-style roots, so the audit reported "no harness at all" — worse
+  than "unknown", because it reads as a finding.
+
+**Why it matters:** none of these show up as an error. A false green occupies the same
+field, in the same colour, as a real one, and it averages into every aggregate above
+it. The lab was shaping every result it produced, on a repository it had audited once —
+and the whole point is to audit repositories it has never seen.
+
+**How to apply:** when a check is written, ask what would make it fail, and then make
+the lab ask the same thing — statically for the shapes that are always wrong, and
+empirically by running the check against the clean tree before any agent touches it. A
+check that passes on the untouched repository has told you nothing. And when one
+predicate is used to answer two questions, name the second one: the SWE-bench leak was
+a single `elif` reusing a function whose docstring already said it answered something
+else. See [ADR-0057](../docs/adr/0057-a-case-is-validated-before-it-can-measure-anything.md)
+and [the case-formation guide](../docs/guide-case-formation.md).
+
+## A source edit is not a deploy: api and worker do not reload (2026-09-10)
+
+The wizard kept proposing `bash tests/test_*.sh` and refusing to save it after the
+fix that repairs exactly that hint had landed. Nothing was wrong with the fix. The
+`api` (uvicorn, no `--reload`) and `worker` (celery) containers bind-mount `.:/app`,
+so the files on disk were current — and the *processes* were seven minutes older
+than the edit. `docker compose exec worker python -c "import …"` is no help here:
+it starts a fresh interpreter that reads the disk, not the memory of PID 1.
+Compare `/proc/1` start time with the source mtime instead.
+
+**Why it matters:** two rounds of the same defect look like the fix does not work,
+and "do we have to iterate like this on every repository?" is the right question
+to ask when a lab keeps contradicting itself. The answer was operational, not a
+design gap — but it read as one.
+
+**How to apply:** after editing anything under `src/`, `docker compose restart api
+worker` (the runner image needs `docker compose build runner` only when
+`Dockerfile.runner` changes). A stored audit keeps the case plan the old worker
+computed; re-run the audit once after restarting. Do not read a stale process as a
+failed fix.
+
+## A case that measures nothing costs the same as one that does (2026-09-10)
+
+`audit-talos-4` spent $4 and 43 minutes on two arms that both scored 0, and the
+gates all worked: the case they gated was "run talos's own suite", a suite that
+was already red at the pin (39 failures in `lib/evidence.sh` / `test_seal.sh`),
+under a `|| exit 1` loop the repository itself never uses. Nothing measured the
+harness's thesis — model judges, code certifies — because the audit asked *what
+could an agent do here* over 700 characters of each skill and the paths (not
+the text) of the hooks. Three lessons, now enforced (ADR-0058):
+
+- **Ask the auditor for claims, not tasks.** The unit is a harness component
+  with `claim / trigger / observable / lab_counterpart / needs`; cases name the
+  components they exercise. `use_cases` produced smoke tests for every repository.
+- **Run the suite at the pin before the model speaks.** `health_at_pin` is one
+  hardened validation-lane run; it would have flagged the red suite before any
+  case existed, and it is the only deterministic signal the auditor gets.
+- **A harness can be installable.** talos copies itself into a target project
+  (`scripts/talos-install.sh`); a bare checkout has its skills under `skills/`,
+  invisible to Claude Code, and no settings. A "native" arm on such a checkout
+  is a bare run, and an "injected" arm that overwrites its `CLAUDE.md` while
+  leaving `AGENTS.md` is a contradictory one. `shape: installable` + the
+  `target_repo` need make the audit say "not measurable here" instead.
+
+Costs to remember: two planner-tier passes per audit, and one container run
+for health. Still far cheaper than one experiment that cannot answer.
+
+## Three instrument defects inverted an experiment's reading (2026-09-10)
+
+`audit-talos` (1 case × 1 rep, native vs injected) reported 0 % success on both
+arms and rubric scores 0 vs 4. Both agents had in fact done the task; re-read
+with the instrument fixed, both are 2/2 checks and 8/10.
+
+- **`pytest {workspace}/tests/x.sh`** — the drafter wrote it, nothing refused it,
+  it exits 4 on every run. `case_validation` now refuses interpreter/file
+  mismatches (`pytest`/`python` on `.sh`, `bash` on `.py`, `node` on `.sh`) with
+  the right interpreter as the suggestion.
+- **`diff.patch` omitted new files.** `git diff <provisioned>` lists tracked
+  files only; a run whose whole deliverable is a new file shipped an empty patch,
+  and the judge scored the arm that *also* edited tracked files 0 for "not adding
+  the test" a PASS check had just executed. `write_diff_patch` now runs
+  `git add --intent-to-add --all` on the archive first; `.gitignore` still holds.
+  Old runs can be rewritten from their archive with the same function.
+- **The judge trusted the diff over the checks**, and graded the repository's
+  pre-existing behaviour that a check's *output* described (jq fail-open) as the
+  agent's shortfall. The prompt now states that a PASS check and the file list
+  decide existence, and that check output describes the repository; the judge
+  also receives `files_modified` from `usage.json`, workspace-relative.
+
+**How to apply:** when two arms tie at 0 with a cheap judge, read the checks
+and the archive before the verdict — an impossible check or an empty diff is the
+instrument, not the agent. After a fix, re-validate (`POST /api/runs/{id}/validate`)
+re-judges any run the judge scored before; a human score is never overwritten.
+The continuation loop (generic step-N prompts) still drives scope creep and cost —
+native spent a third step editing hooks the task said not to touch. Not fixed.
 
 <!-- Add new learnings above this line -->
 
@@ -957,5 +1768,181 @@ place a future field will be dropped: `_config_payload`, `_resume_config`,
 `clone_run` and `continue_run` must all be updated together when the schema
 grows. See [ADR-0026](../docs/adr/0026-run-continuation-as-child-runs.md) and
 [guide-run-continuation.md](../docs/guide-run-continuation.md).
+
+## claude stream-json per-turn usage undercounts output (2026-08-27)
+
+In `steps/step-N.events.jsonl`, each assistant message's `usage.output_tokens`
+is a streaming snapshot taken before the message finished: summing them across
+a run gives ~5% of the real total (`1348` vs `26987` on `tetris-v1-K-004`).
+`input_tokens` and the cache counters per turn are usable; output totals must
+come from the terminal `result` event or `usage.json`. The events also carry
+no timestamps of their own — `bench_run.stamp_event_line` now injects
+`_received_at` at capture time, and the Langfuse exporter labels anything
+older `timing_source: interpolated`. Also: `run_id` is not globally unique
+across copies of a run directory, which is why OTEL ids are salted with
+`condition_hash`. See
+[ADR-0028](../docs/adr/0028-step-traces-carry-per-call-detail.md).
+
+## A subscription token is a whole LLM transport (2026-09-04)
+
+The lab made four independent `POST /chat/completions` calls — the auditor, the
+SWE judge, the DeepEval judge, the case summariser — each with its own copy of
+the same twelve lines. Collapsing them into `llm_transport` was worth doing on
+its own, but the reason it mattered is that **one seam is one place to add a
+second transport**: `claude -p --output-format json --tools "" --strict-mcp-config`
+is a text-completion endpoint, so a teammate whose only credential is a Claude
+subscription now gets audits, judges and summaries with no paid API key and no
+gateway. `--tools ""` is the load-bearing flag: it makes the CLI a completion
+rather than an agent, so no permission prompt can ever block a worker.
+
+Three things that were not obvious until the code ran:
+
+- **The CLI reports failure in-band.** A bad model name comes back as exit 1
+  *plus* `"is_error": true` *plus* the error text sitting in `result`, exactly
+  where an answer would be. A parser that reads `result` without checking the
+  other two returns an error message as if it were an audit.
+- **The audit prompt must go on stdin.** The real one measured 86 KB (clipped
+  diff plus harness log). Not over the argv limit, but close enough that a
+  larger diff would be.
+- **Model names are transport-specific**, so defaults have to be too.
+  `gpt-5.4-mini` means nothing to the CLI and `claude-sonnet-5` means nothing to
+  a gateway that does not proxy it; a name that is not a Claude id is dropped so
+  the CLI picks its own default instead of sending a guaranteed 404.
+
+**Why it matters:** the ordering is the entire compatibility promise. The gateway
+is checked first, always, so adding a Claude credential to a multi-model lab can
+never move a judge — a test asserts it. Two labs judging the same run over
+different transports produce numbers that are only loosely comparable, which is
+why each judged score records its transport in provenance.
+
+**How to apply:** when a capability is duplicated more than twice, the third
+copy is the signal to extract a seam — the payoff is usually the *next* feature,
+not the deduplication. And validate a fallback path end to end before believing
+it: this one uncovered `ToolCorrectnessMetric()` being constructed outside its
+`try`, where DeepEval eagerly builds an OpenAI client and raises on a missing
+`OPENAI_API_KEY`, killing all three trajectory metrics on any lab without that
+key. Unit tests never saw it; a real subscription-only run did. See
+[ADR-0043](../docs/adr/0043-one-llm-transport-gateway-first-claude-cli-second.md)
+and [the plan](../docs/plans/2026-09-claude-native-llm-transport.md).
+
+## A timeout is a fact about the lab, not about the agent (2026-09-08)
+
+Four Tetris runs — all four working games — scored 1/10. Nothing in the chain was
+about the code:
+
+- **`timeout` alone cannot kill an SDL program.** Plain `timeout <N>` sends SIGTERM;
+  SDL converts SIGTERM into an `SDL_QUIT` *event*, which an interactive loop is free
+  to ignore. The command wedged, exited 124, and `passed = exit_code == 0` read that
+  as "the code fails". Always `timeout -k <grace> <N>`.
+- **A `-k` escalation is not enough on its own.** The wedge can sit anywhere, and
+  `RunHandle` (executors.py) has no deadline: `wait()` takes no timeout and
+  `iter_lines()` is the blocking call. The only shape that works is a
+  `threading.Timer` watchdog calling `handle.stop()`, sized from the command's own
+  `timeout` budget.
+- **"0/1 checks passed" is the worst possible sentence to hand a judge.** It reads
+  identically whether an assertion returned the wrong number or the process was
+  killed before it could answer — and the judge, which *does* read the diff
+  (`judge.py:build_rubric_message`), had no reason to distrust it. Passing the full
+  per-check list with an explicit INCONCLUSIVE marker costs nothing and removes the
+  ambiguity.
+
+**Why it matters:** two-valued validation forces every unknown into "failed", and a
+false zero is worse than a missing one — it averages into `success_rate` and looks
+like a measured result. This is ADR-0046's *infrastructure entering the corpus as
+capability*, one layer below the crashed harness it was written about.
+
+**How to apply:** when a boolean summarizes a process that can be interrupted, check
+whether it can also express "did not run". Then propagate that third value all the
+way out — evaluator (exclude, do not zero), judge prompt (refutes nothing), UI (warn,
+not error) — because any layer that flattens it back to false undoes the other three.
+See [ADR-0048](../docs/adr/0048-a-check-that-did-not-measure-is-not-a-failure.md).
+
+## A badly formed case reports a number about itself (2026-09-09)
+
+Two cases written from the talos audit ran four experiment arms and produced nothing
+about talos, and nothing about the lab's own template either. Every defect was silent:
+
+- **A shell `for` loop exits with its last command's status.**
+  `for t in {workspace}/tests/test_*.sh; do bash "$t"; done` reported
+  `task_validation_pass = 1` while the same run's stored detail read
+  `rc=2 CONFIG ERROR`. Fifty-four failures ahead of one pass is a green check. The
+  fix is `|| exit 1` **inside** the loop body.
+- **A repo-relative path with no `{workspace}` resolves against the lab's own root.**
+  `bash benchmark/model/run-model.sh` exited 127 in both arms. The file existed; the
+  path did not. Exit 127 in a validation check is almost always this.
+- **`source: "git_target"` is not a case type.** `bench_run.py` decided "is this
+  SWE-bench?" by calling `spec_provisions_repo()`, which answers *"does a repository
+  have to be cloned?"* — true for **every** case paired with an external target. So
+  from step 2 both talos cases were told to resolve a GitHub issue, shown an empty
+  list of target failing tests, and told to run `python -m pytest` in a repository
+  with no Python. Both arms. The injected arm reacted worse (6.6× turns, 9× cost,
+  zero diffs), which would have been reported as a treatment effect.
+- **A run parked in `awaiting_manual_score` with an empty rubric is a case defect, not
+  a scoring backlog.** `_llm_judge_rubric` returns at `if not rubric` — silently — and
+  the run looks like something a human just has not got to.
+- **Runner capabilities include POSIX tools, not only interpreters.** Every talos test
+  died because the image shipped no `jq`, and the agent's own `apt-get install jq`
+  lived in the *agent's* container, which the later validation container does not
+  inherit.
+- **A repository's harness may not be in a dotted directory.** talos keeps sixteen
+  skills in `skills/` and four hooks in `hooks/`; four drifted path taxonomies all
+  named only `.claude/`-style roots, so the audit reported "no harness at all" — worse
+  than "unknown", because it reads as a finding.
+
+**Why it matters:** none of these show up as an error. A false green occupies the same
+field, in the same colour, as a real one, and it averages into every aggregate above
+it. The lab was shaping every result it produced, on a repository it had audited once —
+and the whole point is to audit repositories it has never seen.
+
+**How to apply:** when a check is written, ask what would make it fail, and then make
+the lab ask the same thing — statically for the shapes that are always wrong, and
+empirically by running the check against the clean tree before any agent touches it. A
+check that passes on the untouched repository has told you nothing. And when one
+predicate is used to answer two questions, name the second one: the SWE-bench leak was
+a single `elif` reusing a function whose docstring already said it answered something
+else. See [ADR-0057](../docs/adr/0057-a-case-is-validated-before-it-can-measure-anything.md)
+and [the case-formation guide](../docs/guide-case-formation.md).
+
+## A source edit is not a deploy: api and worker do not reload (2026-09-10)
+
+The wizard kept proposing `bash tests/test_*.sh` and refusing to save it after the
+fix that repairs exactly that hint had landed. Nothing was wrong with the fix. The
+`api` (uvicorn, no `--reload`) and `worker` (celery) containers bind-mount `.:/app`,
+so the files on disk were current — and the *processes* were seven minutes older
+than the edit. `docker compose exec worker python -c "import …"` is no help here:
+it starts a fresh interpreter that reads the disk, not the memory of PID 1.
+Compare `/proc/1` start time with the source mtime instead.
+
+**Why it matters:** two rounds of the same defect look like the fix does not work,
+and "do we have to iterate like this on every repository?" is the right question
+to ask when a lab keeps contradicting itself. The answer was operational, not a
+design gap — but it read as one.
+
+**How to apply:** after editing anything under `src/`, `docker compose restart api
+worker` (the runner image needs `docker compose build runner` only when
+`Dockerfile.runner` changes). A stored audit keeps the case plan the old worker
+computed; re-run the audit once after restarting. Do not read a stale process as a
+failed fix.
+
+## A union is right for a batch and wrong for an experiment (2026-09-10)
+
+The New evaluation wizard built its prompt pickers from the union of the selected
+cases' variants, copying batch mode, where `_resolve_variants` legitimately drops the
+case/variant pairs a case cannot run. An experiment cannot drop them: it runs one
+declared design across every case it selected, and `ExperimentService.launch` refuses
+the whole launch if any case lacks the variant an arm asks for. Selecting one lab case
+(`default`/`harness`) beside three SWE-bench instances (`swe_default`) therefore put a
+prompt in the pickers that three quarters of the design could not run.
+
+**Why it matters:** the refusal read as an id problem. Creation and launch are two
+calls, so the refused design was already persisted, and the retry — same question, same
+derived id — was filed under a suffixed one. Every attempt cost a row and a slug, and
+the symptom pointed away from the cause.
+
+**How to apply:** when copying a rule from the batch path into the experiment path, ask
+whether the batch's freedom to drop a combination survives. Where it does not, the
+picker offers the intersection. And validate a design at creation for everything
+creation can already see — a refusal after the row exists is a refusal that leaves
+litter. See [ADR-0059](../docs/adr/0059-a-design-that-cannot-launch-is-not-created.md).
 
 <!-- Add new learnings above this line -->

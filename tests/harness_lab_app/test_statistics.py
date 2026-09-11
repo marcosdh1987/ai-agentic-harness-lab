@@ -12,6 +12,7 @@ import pytest
 
 from harness_lab_app.statistics import (
     aggregate_values,
+    assess_validity,
     compare,
     confidence_interval,
     evidence_strength,
@@ -51,12 +52,17 @@ def test_a_missing_value_is_counted_never_imputed():
     [
         (0, "No runs"),
         (1, "exploratory result"),
-        (3, "exploratory comparison"),
-        (7, "useful comparison"),
+        (3, "a judgement"),
+        (7, None),
     ],
 )
 def test_repetition_counts_state_what_they_do_not_support(n, fragment):
-    assert fragment in repetition_warnings(n)[0]
+    warnings = repetition_warnings(n)
+    if fragment is None:
+        # Five or more is a validation: nothing left to caveat about the count.
+        assert warnings == []
+    else:
+        assert fragment in warnings[0]
 
 
 def test_ten_repetitions_needs_no_caveat():
@@ -263,13 +269,14 @@ def test_a_clear_move_over_enough_repetitions_is_a_likely_improvement():
 
     assert answer["causal"] is True
     assert answer["headline"] == "Likely improvement"
-    assert answer["strength"] == "useful comparison"
+    assert answer["strength"] == "validation"
     assert answer["evidence"] == "1 case \u00d7 5 repetitions"
     # Never the vocabulary of proof.
     assert "significant" not in answer["claim"].lower()
 
 
-def test_the_same_move_over_two_repetitions_is_only_observed():
+def test_two_repetitions_are_a_judgement():
+    """Two per arm is the budget-sized level that earns a directional headline."""
     control, treatment = _pair([False, False], [True, True], reps=2)
     answer = verdict(
         mode="harness_evaluation",
@@ -280,9 +287,24 @@ def test_the_same_move_over_two_repetitions_is_only_observed():
         success=success_delta(control, treatment),
     )
 
+    assert answer["headline"] == "Likely improvement"
+    assert answer["strength"] == "judgement"
+    assert any("judgement" in caveat for caveat in answer["caveats"])
+
+
+def test_the_same_move_over_one_repetition_is_only_observed():
+    control, treatment = _pair([False], [True], reps=1)
+    answer = verdict(
+        mode="harness_evaluation",
+        cases=1,
+        repetitions=1,
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+    )
+
     assert answer["headline"] == "Improvement observed"
-    assert answer["strength"] == "exploratory comparison"
-    assert "within observed variance" in answer["caveats"][0].lower()
+    assert answer["strength"] == "exploratory"
 
 
 def test_arms_that_stopped_differently_carry_a_confound_caveat():
@@ -399,10 +421,308 @@ def test_headline_metrics_lead_with_success_then_cost():
     ("reps", "word"),
     [
         (1, "exploratory"),
-        (3, "exploratory comparison"),
-        (6, "useful comparison"),
-        (12, "stronger evidence"),
+        (3, "judgement"),
+        (6, "validation"),
+        (12, "validation"),
     ],
 )
 def test_evidence_strength_uses_prudent_words_only(reps, word):
     assert evidence_strength(reps) == word
+
+
+# --------------------------------------------------------------------------
+# Subject validation — a pass rate per arm, and no claim beyond it (ADR-0040)
+# --------------------------------------------------------------------------
+
+
+def test_subject_validation_reports_each_arm_and_never_pools_them():
+    """The sentence this mode licenses names the subject and one arm at a time.
+
+    Pooling "8 of 9 under claude" with "4 of 9 under opencode" into "12 of 18"
+    would describe a configuration nobody runs — the exact composite the lab
+    refuses everywhere else.
+    """
+    arms = [
+        _arm("claude/sonnet", [1.0] * 9, [True] * 8 + [False]),
+        _arm("opencode/sonnet", [1.0] * 9, [True] * 4 + [False] * 5),
+    ]
+    answer = verdict(
+        mode="subject_validation",
+        cases=3,
+        repetitions=3,
+        subject="notion-export skill",
+        arms=arms,
+    )
+
+    assert answer["causal"] is False
+    assert answer["headline"] == "Reliability per arm"
+    assert "notion-export skill passed 8 of 9 under claude/sonnet" in answer["claim"]
+    assert "4 of 9 under opencode/sonnet" in answer["claim"]
+    # One highlight per arm, each carrying its own numerator and denominator.
+    assert [h["label"] for h in answer["highlights"]] == [
+        "claude/sonnet",
+        "opencode/sonnet",
+    ]
+    assert [(h["successes"], h["scored_runs"]) for h in answer["highlights"]] == [
+        (8, 9),
+        (4, 9),
+    ]
+    assert any("says nothing about the harness" in c for c in answer["caveats"])
+
+
+def test_subject_validation_names_every_arm_even_on_a_tie():
+    """Two arms at the same rate are two arms, not one arm twice."""
+    answer = verdict(
+        mode="subject_validation",
+        cases=1,
+        repetitions=3,
+        subject="the exporter",
+        arms=[
+            _arm("claude", [1.0] * 3, [True] * 3),
+            _arm("opencode", [1.0] * 3, [True] * 3),
+        ],
+    )
+
+    assert "3 of 3 under claude and 3 of 3 under opencode" in answer["claim"]
+
+
+def test_subject_validation_with_one_arm_states_it_plainly():
+    answer = verdict(
+        mode="subject_validation",
+        cases=1,
+        repetitions=5,
+        subject="the MCP server",
+        arms=[_arm("claude", [1.0] * 5, [True] * 5)],
+    )
+
+    assert "the MCP server passed 5 of 5 scored run(s) under claude" in answer["claim"]
+
+
+def test_subject_validation_keeps_its_disclaimers_before_anything_is_scored():
+    """The design caveats hold at zero runs — when they matter most."""
+    answer = verdict(
+        mode="subject_validation",
+        cases=1,
+        repetitions=3,
+        subject="the MCP server",
+        arms=[_arm("claude", [], [])],
+    )
+
+    assert answer["headline"] == "Not enough evidence yet"
+    assert answer["causal"] is False
+    assert any("not pooled" in c for c in answer["caveats"])
+
+
+# --------------------------------------------------------------------------
+# Validity — read before the verdict
+# --------------------------------------------------------------------------
+
+
+def _codes(validity):
+    return [issue["code"] for issue in validity["issues"]]
+
+
+def test_a_treatment_arm_that_never_invoked_its_skill_invalidates_the_comparison():
+    """The treatment did not happen, so the delta is about something else."""
+    control, treatment = _pair([False] * 5, [True] * 5)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+        skill_usage={treatment.label: {"skills": ["caveman"], "runs": 5, "invoked": 0}},
+    )
+    assert validity["status"] == "invalid"
+    assert _codes(validity) == ["treatment_not_activated"]
+    assert validity["issues"][0]["arm"] == treatment.label
+
+
+def test_a_control_arm_that_opened_nothing_is_not_an_issue_by_itself():
+    """An ablated arm has no skills to open — the asymmetry is the design."""
+    control, treatment = _pair([False] * 5, [True] * 5)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+        skill_usage={control.label: {"skills": [], "runs": 5, "invoked": 0}},
+    )
+    assert validity["status"] == "valid"
+    assert validity["issues"] == []
+
+
+def test_a_control_that_passes_everything_leaves_no_headroom():
+    control, treatment = _pair([True] * 5, [True] * 5)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+    )
+    assert validity["status"] == "invalid"
+    assert _codes(validity) == ["no_headroom"]
+
+
+def test_a_ceiling_that_still_measured_a_regression_only_degrades():
+    """A regression *was* detectable, so the design answered something."""
+    control, treatment = _pair([True] * 5, [True, True, True, True, False])
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+    )
+    assert validity["status"] == "degraded"
+    assert _codes(validity) == ["no_headroom"]
+
+
+def test_a_two_run_ceiling_is_evidence_of_two_runs_not_of_a_ceiling():
+    control, treatment = _pair([True, True], [True, True], reps=2)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+    )
+    assert validity["status"] == "degraded"
+
+
+def test_an_arm_whose_runs_mostly_crashed_measured_the_connection():
+    control, treatment = _pair([False] * 5, [True] * 5)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+        run_health={
+            treatment.label: {
+                "runs": 4,
+                "harness_error": 4,
+                "failed": 4,
+                "scored_runs": 0,
+            }
+        },
+    )
+    assert validity["status"] == "invalid"
+    assert "infrastructure_failures" in _codes(validity)
+
+
+def test_one_bad_run_out_of_five_degrades_rather_than_invalidates():
+    control, treatment = _pair([False] * 5, [True] * 5)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+        run_health={
+            treatment.label: {
+                "runs": 5,
+                "harness_error": 1,
+                "failed": 1,
+                "scored_runs": 4,
+            }
+        },
+    )
+    assert validity["status"] == "degraded"
+
+
+def test_a_mode_that_makes_no_causal_claim_has_nothing_to_invalidate():
+    for mode in ("discovery", "cross_repo"):
+        validity = assess_validity(
+            mode=mode,
+            skill_usage={"arm": {"skills": ["caveman"], "runs": 5, "invoked": 0}},
+        )
+        assert validity == {"status": "valid", "issues": []}
+
+
+def test_subject_validation_reports_its_issues_but_never_invalidates():
+    """It has no control arm, so there is no comparison to break."""
+    validity = assess_validity(
+        mode="subject_validation",
+        skill_usage={"claude": {"skills": ["driver"], "runs": 3, "invoked": 0}},
+    )
+    assert validity["status"] == "degraded"
+    assert _codes(validity) == ["treatment_not_activated"]
+
+
+def test_an_invalid_verdict_replaces_the_headline_and_keeps_the_numbers():
+    """ADR-0041: the numbers are true. They stop leading, they do not vanish."""
+    control, treatment = _pair([False] * 5, [True] * 5)
+    success = success_delta(control, treatment)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success,
+        skill_usage={treatment.label: {"skills": ["caveman"], "runs": 5, "invoked": 0}},
+    )
+    answer = verdict(
+        mode="harness_evaluation",
+        cases=1,
+        repetitions=5,
+        control=control,
+        treatment=treatment,
+        success=success,
+        validity=validity,
+    )
+    assert answer["headline"] == "Comparison not valid"
+    assert "improvement" not in answer["headline"].lower()
+    assert "regression" not in answer["headline"].lower()
+    assert "+100 points" in answer["observed"]
+    assert answer["tone"] == "invalid"
+    assert answer["highlights"]
+    assert answer["movements"] == {
+        "fixed": 0,
+        "broken": 0,
+        "unchanged": 0,
+        "incomplete": 0,
+    }
+
+
+def test_a_valid_verdict_carries_a_tone_the_frontend_can_read():
+    control, treatment = _pair([False] * 5, [True] * 5)
+    answer = verdict(
+        mode="harness_evaluation",
+        cases=1,
+        repetitions=5,
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+        validity={"status": "valid", "issues": []},
+    )
+    assert answer["tone"] == "better"
+    assert "observed" not in answer
+
+
+# --------------------------------------------------------------------------
+# Highlights carry their direction (2026-09-08)
+# --------------------------------------------------------------------------
+
+
+def test_highlights_say_which_way_is_good():
+    """ "10,712 → 7,223 tokens" is an improvement for a cost and a regression for
+    a rate; the page used to leave that to the reader."""
+    from harness_lab_app.statistics import _highlight, summarize_condition
+
+    control = summarize_condition(
+        "c",
+        [{"task_validation_pass": True, "billed_tokens": 900_000.0}],
+    )
+    treatment = summarize_condition(
+        "t",
+        [{"task_validation_pass": True, "billed_tokens": 200_000.0}],
+    )
+
+    found = _highlight("Billed tokens", "billed_tokens", control, treatment)
+
+    assert found is not None
+    assert found["direction"] == "lower_is_better"
+
+
+def test_headline_metrics_lead_with_the_graded_outcome_and_the_billed_cost():
+    from harness_lab_app.statistics import HEADLINE_METRICS
+
+    assert HEADLINE_METRICS[0] == "test_pass_rate"
+    assert "billed_tokens" in HEADLINE_METRICS
+    # The uncached count hid a 71% cost increase behind a lower number.
+    assert "total_tokens" not in HEADLINE_METRICS

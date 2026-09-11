@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING
 import yaml
 from sqlmodel import Session, select
 
+from harness_lab_app.case_validation import check_case
 from harness_lab_app.config import get_settings
 from harness_lab_app.models import Case, CaseStatus, CaseSyncState, CaseType, utc_now
+from harness_lab_app.skill_import import safe_relpath
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -76,6 +78,55 @@ class CaseExistsError(ValueError):
     """A case with that id is already in the catalog."""
 
 
+class CaseValidationError(ValueError):
+    """The case's validation commands would not measure anything.
+
+    Distinct from every other ``ValueError`` the service raises (all of which
+    mean "no such case", and answer 404) because this one is a 422: the request
+    reached a real case and was refused on its content.
+    """
+
+    def __init__(self, problems: list[str]) -> None:
+        super().__init__(" ".join(problems))
+        self.problems = problems
+
+
+def resolve_prompt_variant_text(case: Case, variant: str) -> str | None:
+    """The literal prompt text for a variant, whatever form the case stores it in.
+
+    Cases created from the web (and every SWE-bench import) store the prompt
+    *text* in ``prompt_variants``. Cases imported from a ``benchmarks/<id>/
+    task.yaml`` store a repo-relative *path* instead, because that is what the
+    YAML says (mirrored by the runner in ``tasks._case_prompt_text``, which
+    falls back to the raw path string on failure — this function instead
+    returns ``None`` so a caller like the API can 404 rather than display a
+    path as if it were content).
+
+    ``case.prompt_variants`` is editable via the case editor, so the stored
+    value is treated as untrusted input: ``safe_relpath`` rejects traversal
+    and absolute paths, and the resolved path must still land inside
+    ``repo_root``.
+    """
+    raw = case.prompt_variants.get(variant)
+    if raw is None:
+        return None
+    if "\n" in raw:
+        return raw
+    relpath = safe_relpath(raw)
+    if relpath is None:
+        return None
+    repo_root = get_settings().repo_root.resolve()
+    candidate = (repo_root / relpath).resolve()
+    if candidate != repo_root and repo_root not in candidate.parents:
+        return None
+    try:
+        if candidate.is_file():
+            return candidate.read_text()
+    except OSError:
+        return None
+    return None
+
+
 class CaseService:
     def __init__(self, session: Session):
         self.session = session
@@ -130,6 +181,26 @@ class CaseService:
                 return child
         return None
 
+    def _validated(self, data: CaseCreate) -> None:
+        """Refuse a case whose checks could not measure the agent's work.
+
+        The lab used to store whatever arrived. Two cases written from a talos
+        audit then ran four experiments between them and produced numbers about
+        themselves: a loop that returned only its last script's status, a check
+        whose path resolved against the lab's own repository, a predicate that
+        could not fail, and an empty rubric that parked every run unscored.
+        None of that is visible in a result — it looks exactly like a
+        measurement — so it has to be refused where it is written.
+        """
+        problems = check_case(
+            list(data.validation_commands or []),
+            data.scoring_rubric or "",
+            dict(data.success_criteria or {}),
+            str(getattr(data.type, "value", data.type) or ""),
+        )
+        if problems:
+            raise CaseValidationError(problems)
+
     def create_case(self, data: CaseCreate) -> Case:
         # Named refusal, not an IntegrityError 500: "already exists" is an
         # ordinary answer (the audit flow re-offers candidates a past session
@@ -140,6 +211,7 @@ class CaseService:
         ).first()
         if existing is not None:
             raise CaseExistsError(f"Case already exists: {data.case_id}")
+        self._validated(data)
         case = Case(**data.model_dump())
         self.session.add(case)
         self.session.commit()
@@ -148,6 +220,9 @@ class CaseService:
 
     def update_case(self, case_id: str, data: CaseCreate) -> Case:
         case = self.get_case(case_id)
+        # Enforced on edit too: a case that passed once can be edited into the
+        # same shapes, and an edit is exactly when somebody is trying to fix one.
+        self._validated(data)
         payload = data.model_dump()
         for field_name, value in payload.items():
             setattr(case, field_name, value)
@@ -208,15 +283,41 @@ class CaseService:
         self.session.refresh(case)
         return case
 
-    def seed_tetris_case(self) -> Case:
-        existing = self.session.exec(
-            select(Case).where(Case.case_id == "tetris-v1")
-        ).first()
-        if existing is not None:
-            return existing
-        settings = get_settings()
-        task_path = settings.repo_root / "benchmarks" / "tetris" / "task.yaml"
-        return self.import_task_yaml(task_path)
+    def seed_benchmark_cases(self) -> list[Case]:
+        """Seed every ``benchmarks/*/task.yaml``, refreshing on re-seed.
+
+        The authored corpus is the source of truth for its cases (ADR-0025):
+        a fresh database gets all of them at startup, and an existing one has
+        its variant map and graded commands rebuilt from the file — a stale
+        variant list would keep offering prompts the benchmark no longer
+        declares. Only those two fields are rebuilt; name, description, tags
+        and status stay as the operator left them, because those are the
+        fields the case editor exists to change.
+        """
+        root = get_settings().repo_root / "benchmarks"
+        seeded: list[Case] = []
+        for task_path in sorted(root.glob("*/task.yaml")):
+            raw = yaml.safe_load(task_path.read_text()) or {}
+            case_id = raw.get("task_id")
+            if not case_id:
+                continue
+            existing = self.session.exec(
+                select(Case).where(Case.case_id == case_id)
+            ).first()
+            if existing is None:
+                seeded.append(self.import_task_yaml(task_path))
+                continue
+            existing.prompt_variants = dict(raw.get("prompts", {}))
+            if raw.get("validation_commands"):
+                existing.validation_commands = [
+                    str(cmd) for cmd in raw["validation_commands"]
+                ]
+            existing.updated_at = utc_now()
+            self.session.add(existing)
+            self.session.commit()
+            self.session.refresh(existing)
+            seeded.append(existing)
+        return seeded
 
     def import_task_yaml(self, task_path: Path) -> Case:
         raw = yaml.safe_load(task_path.read_text())

@@ -48,35 +48,35 @@ from create_run import (
 TRANSCRIPT_TEMPLATE = """\
 # Antigravity transcript — {run_id}
 
-> Paste the transcript / walkthrough from Antigravity's Agent Manager here if
-> you can export it (anything: the conversation, the task list, the steps).
-> If you cannot export it, leave this file empty and fill in notes.md — the
-> audit degrades gracefully and uses whatever is present.
+> Pegá acá el transcript / walkthrough del Agent Manager de Antigravity si lo
+> podés exportar (lo que sea: la conversación, la lista de tareas, los pasos).
+> Si no podés exportarlo, dejá este archivo vacío y completá notes.md — el audit
+> degrada elegante y usa lo que esté presente.
 
 """
 
 NOTES_TEMPLATE = """\
-# Human observations — {run_id}
+# Observaciones humanas — {run_id}
 
-Record what you can observe while running Antigravity. This feeds the
-prescriptive audit of `.agents/rules/GEMINI.md` and the skills.
+Completá lo que puedas observar mientras corrés Antigravity. Esto alimenta el
+audit prescriptivo de `.agents/rules/GEMINI.md` y las skills.
 
-## Did it read and apply the rules?
-- Did it mention or follow `.agents/rules/GEMINI.md` (governance, runtime rules)?:
-- Which skills did it discover or invoke?:
-- Which relevant skills did it ignore or never touch?:
+## ¿Leyó/aplicó las reglas?
+- ¿Mencionó o siguió `.agents/rules/GEMINI.md` (governance, runtime rules)?:
+- ¿Qué skills descubrió o invocó?:
+- ¿Qué skills relevantes ignoró o nunca tocó?:
 
-## Departures from the rules
-- Where did it depart from the SDLC (plan -> implement -> test -> verify)?:
-- Did it create or modify files outside `workspace/{run_id}/`?:
+## Desvíos de las reglas
+- ¿Dónde se desvió del SDLC (plan -> implement -> test -> verify)?:
+- ¿Creó/modificó archivos fuera de `workspace/{run_id}/`?:
 
-## Friction
-- Where did it get stuck or need human intervention?:
-- Interventions (what you had to fix by hand):
+## Fricciones
+- ¿Dónde se trabó o necesitó intervención humana?:
+- Intervenciones (qué tuviste que corregir a mano):
 
-## Other
-- Screenshots left in this dir (paths):
-- Free-form notes:
+## Otros
+- Screenshots dejadas en este dir (paths):
+- Notas libres:
 """
 
 
@@ -173,9 +173,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  2. Copy the prompt: cat {rel_out}/prompt.md | pbcopy")
         print("     then paste it into Antigravity.")
     print(f"  3. Do the task inside workspace/{args.run}/")
-    print(f"  4. Paste the transcript into {rel_out}/transcript.md, fill in notes.md")
+    print(f"  4. Paste the transcript into {rel_out}/transcript.md, fill notes.md")
     print()
-    print("  Al terminar:")
+    print("  When you are done:")
     print(f"    make bench-close RUN={args.run} SCORE=<0-10> INTERVENTIONS=<N>")
     print(f"    make bench-agents-audit RUN={args.run}")
     print("=" * 66)
