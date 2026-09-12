@@ -21,9 +21,9 @@ redesign of the web app.
 
 Almost all. The fork also carries its employer's identity: a company logo component,
 a company branding skill under `.github/skills-external/`, a CSS palette commented as
-that company's official brand palette with `--xl-*` token names, its favicon and page
-title, its name as a badge in the sidebar footer, and its org slug in every repository
-URL.
+that company's official brand palette under company-initialled token names, its
+favicon and page title, its name as a badge in the sidebar footer, and its org slug
+in every repository URL.
 
 That identity is not this repository's to carry. This lab is a personal, public
 project; shipping another organisation's mark would misattribute it, and the mark
@@ -51,9 +51,11 @@ the exclusion mechanically.**
    props (`variant`, `size`, `width`, `height`) and the same variant names, so every
    call site, layout and CSS rule the fork wrote ports across unchanged.
 3. **The token names.** The palette's **hex values are kept verbatim** — they are the
-   redesign, and the redesign is wanted — but `--xl-*` is renamed to `--brand-*` and
-   the brand-palette comment is dropped. The whole UI is token-driven, so this is a
-   rename at the definition plus five consumers.
+   redesign, and the redesign is wanted — but the fork's company-initialled token
+   prefix is renamed to `--brand-*` and the brand-palette comment is dropped. The whole
+   UI is token-driven, so this is a rename at the definition plus five consumers. As
+   with the name, the old prefix is not spelled here; the guard test holds it, assembled
+   from fragments, and is the authoritative definition.
 4. **The branding skill.** The fork's branding skill directory is never copied.
    Because `skills-lock.json`, `.agents/skills/.generated-manifest.tsv` and the
    `BEGIN GENERATED SKILLS` regions of the adapter files are all *derived* by walking

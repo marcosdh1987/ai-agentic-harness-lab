@@ -5,11 +5,13 @@ Everything in that fork is wanted except its employer's identity, and the identi
 would silently ride back in on the next port unless something fails when it does.
 This is that something.
 
-The banned name is assembled from fragments rather than written out, so that the
-grep below finds nothing *including in this file*. Spelling it here would make the
-test its own only violation, and every caller would then need a self-exclusion — an
-exclusion that the next person to add a doc about branding would be tempted to widen.
-One assembled constant keeps the invariant literally true: zero occurrences, anywhere.
+Both banned strings are assembled from fragments rather than written out, so that
+the greps below find nothing *including in this file*. Spelling either one here would
+make the test its own first violation, and every caller would then need a
+self-exclusion — an exclusion that the next person to add a doc about branding would be
+tempted to widen. The docs that describe the ban -- ADR-0060 and the fork-divergence
+guide -- name neither string for the same reason. Assembling them keeps the invariant
+literally true: zero occurrences, anywhere.
 """
 
 from __future__ import annotations
@@ -23,9 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: The forbidden name, never spelled as one literal. See the module docstring.
 BANNED_NAME = "xmart" + "labs"
 
-#: Token prefix the fork used for its brand palette. ADR-0060 renames these to
-#: ``--brand-*`` while keeping the hex values, so any survivor is an un-ported token.
-BANNED_TOKEN_PREFIX = "--xl-"
+#: Token prefix the fork used for its brand palette, assembled for the same reason as
+#: :data:`BANNED_NAME`. ADR-0060 renames these to ``--brand-*`` while keeping the hex
+#: values, so any survivor is an un-ported token.
+BANNED_TOKEN_PREFIX = "--" + "xl" + "-"
 
 
 def _tracked_matches(pattern: str) -> list[str]:
