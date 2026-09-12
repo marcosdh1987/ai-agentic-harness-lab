@@ -73,7 +73,7 @@ mechanics are:
 | Fork artifact | In this lab |
 |---|---|
 | Company logo component | `frontend/src/components/LabMark.tsx` — a neutral three-bar mark with the **same props** (`variant`, `size`, `width`, `height`) so call sites port unchanged |
-| `--xl-*` CSS tokens, "official brand palette" comment | `--brand-*`, **same hex values**, comment dropped (`frontend/src/styles.css`) |
+| Company-initialled CSS palette tokens, "official brand palette" comment | `--brand-*`, **same hex values**, comment dropped (`frontend/src/styles.css`) |
 | Company favicon and page title | Ladder glyph and "Agentic Harness Lab" (`frontend/index.html`) |
 | Company badge in the sidebar footer | `LOCAL` (`frontend/src/components/Shell.tsx`) |
 | Branding skill under `.github/skills-external/` | Never copied; `make sync-skills` then erases it from every derived artifact |
@@ -83,8 +83,9 @@ mechanics are:
 the source directory *is* the entire removal; everything downstream re-derives.
 
 Enforced by `tests/test_no_third_party_branding.py`, which greps the tracked tree and
-fails the gate if the name, or an `--xl-*` token, reappears. The banned string is
-assembled from fragments inside that test so the tree's true occurrence count is zero.
+fails the gate if the name, or one of the fork's palette tokens, reappears. Both
+banned strings are assembled from fragments inside that test, and no document spells
+them either, so the tree's true occurrence count is zero.
 
 Fonts are **not** branding. The fork's Outfit / Space Grotesk pairing, the accent
 colour, the spacing scale, the component library and the navigation regrouping are all
