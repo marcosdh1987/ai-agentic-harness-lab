@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,15 @@ from sqlmodel import Session, select
 
 from harness_lab_app import llm_transport, run_failures
 from harness_lab_app.audit_service import AuditService
+from harness_lab_app.case_profile import (
+    CaseProfileError,
+    agent_hidden_for,
+    play_command_for,
+    run_timeout_for,
+    runner_image_for,
+    sandbox_image_for,
+    slow_policy_for,
+)
 from harness_lab_app.case_service import CaseService, resolve_prompt_variant_text
 from harness_lab_app.celery_app import celery_app
 from harness_lab_app.config import get_settings
@@ -44,17 +54,29 @@ from harness_lab_app.models import (
     RunState,
     utc_now,
 )
+from harness_lab_app.phase_watch import (
+    LivePhaseGrader,
+    PhaseWatch,
+    expected_seconds,
+    phase_history,
+)
 from harness_lab_app.run_service import RunService, continuation_source_dir
 from harness_lab_app.runner_adapter import BenchRunAdapter
 from harness_lab_app.sandbox_service import SandboxService
 from harness_lab_app.schemas import RunConfigCreate
 from harness_lab_app.target_service import TargetError, TargetService, clone_source
-from harness_lab_app.validation import describe_objective_for_judge
+from harness_lab_app.validation import (
+    build_validation_spec,
+    describe_objective_for_judge,
+    spec_deadline_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
 _AUDIT_TIMEOUT_SECONDS = 300
-_SANDBOX_PORTS = {"terminal": "7681/tcp", "desktop": "6080/tcp"}
+# `play` is a desktop that starts the case's own game on boot (ADR-0078): the
+# same noVNC port, a different first window.
+_SANDBOX_PORTS = {"terminal": "7681/tcp", "desktop": "6080/tcp", "play": "6080/tcp"}
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -159,6 +181,25 @@ def _case_prompt_text(case: Case, prompt_variant: str) -> str:
     if resolved is not None:
         return resolved
     return case.prompt_variants.get(prompt_variant, "")
+
+
+def _phase_prompts_for_variant(case: Case, prompt_variant: str) -> list[str]:
+    """A case's later-step prompts, carrying the harness when the run's variant does.
+
+    Each step is a fresh agent session, so the harness preamble that opens the
+    ``harness`` variant's step 1 would otherwise govern only the first phase of
+    a phased case and leave every later phase to the bare task (ADR-0079). The
+    preamble is the same file ``make prompts`` builds that variant from, so the
+    two cannot drift.
+    """
+    phases = list(case.step_prompts)
+    if not phases or prompt_variant != "harness":
+        return phases
+    preamble_path = get_settings().repo_root / "benchmarks" / "_harness_preamble.md"
+    if not preamble_path.is_file():
+        return phases
+    preamble = preamble_path.read_text()
+    return [f"{preamble}\n{phase}" for phase in phases]
 
 
 def _stage_harness_adapters(
@@ -294,12 +335,14 @@ def _write_case_spec(
             "base_commit": case.base_commit or "",
             "prompt_variant": prompt_variant,
             "prompt": _case_prompt_text(case, prompt_variant),
-            "step_prompts": list(case.step_prompts),
+            "step_prompts": _phase_prompts_for_variant(case, prompt_variant),
             "max_steps": case.max_steps,
             "constraints": list(case.constraints),
             "success_criteria": dict(case.success_criteria),
             # The starter files a bug-fix case begins from (ADR-0068).
             "starter_dir": meta.get("starter_dir", ""),
+            # What the prompt names as the entry point; main.py when unset.
+            "entry_point": meta.get("entry_point", ""),
         }
     if target:
         # An external target repository (ADR-0029). Carried alongside the case
@@ -406,9 +449,28 @@ def _provision_pro_workspace(session: Session, run_id: str, case_id: str) -> Non
 
 
 def _cancel_requested(session: Session, run_id: str) -> bool:
+    return _run_controls(session, run_id)[0]
+
+
+def _run_controls(session: Session, run_id: str) -> tuple[bool, int]:
+    """``(cancel_requested, extra_wait_seconds)``: what a person asked of the run."""
     session.expire_all()
     run = session.exec(select(Run).where(Run.run_id == run_id)).first()
-    return bool(run and run.cancel_requested)
+    if run is None:
+        return False, 0
+    return bool(run.cancel_requested), int(run.extra_wait_seconds or 0)
+
+
+# `--- Step 3/5 ---`: bench_run's marker for the start of a step.
+_STEP_MARKER_RE = re.compile(r"---\s*Step\s+(\d+)/(\d+)\s*---")
+
+
+def _wall_clock() -> float:
+    """Seconds since the epoch: the clock every run budget is measured on.
+
+    A function rather than a bare ``time.time`` so tests can drive it.
+    """
+    return time.time()
 
 
 def _drain(handle: RunHandle, lines: Queue[tuple[str, str] | None]) -> None:
@@ -453,8 +515,15 @@ def _stream_run(
     model_wait_seconds: int = 0,
     max_stream_errors: int = 0,
     harness: str = "",
+    phase_watch: PhaseWatch | None = None,
+    live_grader: LivePhaseGrader | None = None,
 ) -> StreamOutcome:
     """Persist run output as RunEvents; watch for the four ways a run goes bad.
+
+    ``phase_watch`` adds a fifth, per phase rather than per run: a phase past
+    its expected time is flagged for a person to decide on, and stopped only
+    when nobody does (``slow_phase``). ``live_grader`` grades each phase as it
+    finishes. Both are optional, so a single-step case is watched as before.
 
     ``stall_seconds`` catches the failure ``timeout_seconds`` structurally
     cannot: a run that is not slow but *stuck*, producing nothing while its
@@ -491,16 +560,29 @@ def _stream_run(
     failed_requests = 0
     awaiting_model = False
     stopped = False
-    started = time.monotonic()
+    step: int | None = None
+    step_started: float | None = None
+    extra_wait = 0
+    # Wall-clock time, not `time.monotonic()`: the worker runs in Docker
+    # Desktop's VM, whose monotonic clock stops while the host sleeps. A run
+    # that spanned three hours of a laptop's sleep was measured at 28% of its
+    # real length and outlived its two-hour budget by three hours
+    # (racing3d-v1-K-001). Sleeping time is time the operator waited too.
+    started = _wall_clock()
     last_output = started
     last_cancel_check = 0.0
     while True:
-        now = time.monotonic()
+        now = _wall_clock()
         if stop_reason is None:
             if now - last_cancel_check >= 1.0:
                 last_cancel_check = now
-                if _cancel_requested(session, run_id):
+                cancelled, extra_wait = _run_controls(session, run_id)
+                if cancelled:
                     stop_reason = "cancelled"
+                elif phase_watch is not None:
+                    stop_reason = phase_watch.tick(step, step_started, extra_wait, now)
+                if live_grader is not None:
+                    live_grader.poll()
             if stop_reason is None and now - started >= timeout_seconds:
                 stop_reason = "timeout"
             if stop_reason is None:
@@ -529,13 +611,16 @@ def _stream_run(
             break
         # Any output at all resets the stall clock, including the blank lines
         # dropped just below — a run that is talking is a run that is alive.
-        last_output = time.monotonic()
+        last_output = _wall_clock()
         level, message = item
         if not message:
             continue
         session.add(RunEvent(run_id=run_id, level=level, message=message))
         session.commit()
         tail.append(message)
+        marker = _STEP_MARKER_RE.search(message)
+        if marker is not None:
+            step, step_started = int(marker.group(1)), last_output
         awaiting_model = run_failures.awaits_model_response(message, harness)
         if run_failures.is_model_request(message, harness):
             model_requests += 1
@@ -703,7 +788,66 @@ def _watchdog_failure(outcome: StreamOutcome, settings: Any, tail: str) -> str:
         )
     if outcome.stop_reason == "endpoint":
         return _endpoint_failure(outcome, tail)
+    if outcome.stop_reason == "slow_phase":
+        return _with_tail(
+            "Phase too slow: it ran past its expected time, nobody chose to keep "
+            "waiting within the grace period, and the case's policy is to stop. "
+            "The work it left was graded. Raise the case's phase_budget_minutes, "
+            "or keep waiting from the run page next time.",
+            tail,
+            "Last output:",
+        )
     return f"Run timed out after {settings.run_timeout_seconds}s"
+
+
+def _case_agent_machine(session: Session, case_id: str) -> tuple[str, list[str]]:
+    """The image a case's agent runs in and the grading it must not read.
+
+    The image is the case's own (ADR-0078) or ``""``; the hidden paths are the
+    case's ``agent_hidden`` (ADR-0079), to which the executor adds the lab-wide
+    calibration references. A case naming something the lab refuses fails the
+    run here, before a container starts, with the reason — never a silent fall
+    back, which would grade a Godot case in a runner that has no Godot, or let
+    an agent read the grader it was told was hidden.
+    """
+    try:
+        case = CaseService(session).get_case(case_id)
+    except ValueError:
+        # No case row. The runner can still load the case from its
+        # `task.yaml`, so a case that declares its own machine there must not
+        # fall back to the shared one: that would run a Godot case without
+        # Godot, and leave its grader readable (fail closed, not open).
+        if _task_declares_own_machine(case_id):
+            raise RuntimeError(
+                f"Case {case_id} declares its own image or hidden grading in "
+                "task.yaml but is not in the database; import it (restart the "
+                "API, or POST /api/cases/seed) before running it."
+            ) from None
+        return "", []
+    try:
+        return runner_image_for(case), agent_hidden_for(case)
+    except CaseProfileError as exc:
+        raise RuntimeError(f"Case {case_id}: {exc}") from exc
+
+
+def _task_declares_own_machine(case_id: str) -> bool:
+    """Whether ``benchmarks/<case_id>/task.yaml`` names an image or hidden paths."""
+    import yaml
+
+    benchmarks = getattr(get_settings(), "benchmarks_dir", None)
+    if benchmarks is None:
+        return False
+    task = Path(benchmarks) / case_id / "task.yaml"
+    if not task.is_file():
+        return False
+    try:
+        raw = yaml.safe_load(task.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        # Unreadable: the runner will not load it either, so nothing leaks.
+        return False
+    return isinstance(raw, dict) and bool(
+        raw.get("runner_image") or raw.get("agent_hidden")
+    )
 
 
 def _execute_run_body(
@@ -770,24 +914,70 @@ def _execute_run_body(
             # hides, so the worker — which is not masked — stages them where
             # the runner can still reach them.
             _stage_harness_adapters(run_id, config_payload.harness_source, mask)
-            handle = (
-                executor.start(run_id, command)
-                if mask == GOVERNANCE_MASK_NONE
-                else executor.start(run_id, command, governance_mask=mask)
-            )
-            outcome = _stream_run(
+            # The mask and the image are passed only when there is something to
+            # pass; `hidden` always is, because the agent's container is the one
+            # container the calibration references must never reach.
+            options: dict[str, Any] = {}
+            if mask != GOVERNANCE_MASK_NONE:
+                options["governance_mask"] = mask
+            image, hidden = _case_agent_machine(session, config_payload.case_id)
+            if image:
+                options["image"] = image
+            # Always passed for the agent's container — even empty, the lab's
+            # calibration references are masked out of it (ADR-0079).
+            options["hidden"] = hidden
+            handle = executor.start(run_id, command, **options)
+            phase_watch, live_grader = _phase_supervision(
                 session,
                 run_id,
-                handle,
-                settings.run_timeout_seconds,
-                getattr(settings, "run_stall_seconds", 0),
-                getattr(settings, "run_model_wait_seconds", 0),
-                getattr(settings, "run_max_stream_errors", 0),
-                harness=str(config_payload.harness or ""),
+                config_payload.case_id,
+                config_payload.max_steps,
+                settings,
             )
-            exit_code = _wait_bounded(handle, settings.run_timeout_seconds + 60)
+            # A paced case may need more than the lab's default total: its
+            # phases are watched one by one, and this is only the ceiling.
+            run_timeout = settings.run_timeout_seconds
+            with contextlib.suppress(ValueError):
+                run_timeout = run_timeout_for(
+                    CaseService(session).get_case(config_payload.case_id), run_timeout
+                )
+            try:
+                outcome = _stream_run(
+                    session,
+                    run_id,
+                    handle,
+                    run_timeout,
+                    getattr(settings, "run_stall_seconds", 0),
+                    getattr(settings, "run_model_wait_seconds", 0),
+                    getattr(settings, "run_max_stream_errors", 0),
+                    harness=str(config_payload.harness or ""),
+                    phase_watch=phase_watch,
+                    live_grader=live_grader,
+                )
+            finally:
+                if phase_watch is not None:
+                    phase_watch.close()
+                if live_grader is not None:
+                    # A grade in flight finishes before the final validation,
+                    # which reinstalls the same dependency folder and regrades
+                    # the same snapshots. Bounded by the longest a pass can
+                    # take (every command at its own deadline), so it waits
+                    # out a slow Godot harvest yet never holds the run forever.
+                    deadline = _live_grade_deadline(
+                        session, run_id, config_payload.case_id
+                    )
+                    if not live_grader.join(timeout=deadline):
+                        logger.warning(
+                            "Live grade of %s still running after %ss; final "
+                            "validation starts anyway",
+                            run_id,
+                            deadline,
+                        )
+            exit_code = _wait_bounded(handle, run_timeout + 60)
             if outcome.stop_reason == "cancelled":
                 service.mark_cancelled(run_id, exit_code)
+                if _cut_measures_the_agent(outcome.stop_reason):
+                    _grade_what_was_left(session, run_id, "cancelled")
             elif outcome.stop_reason is not None:
                 service.mark_finished(
                     run_id,
@@ -796,6 +986,11 @@ def _execute_run_body(
                         outcome, settings, "\n".join(outcome.tail)[-600:]
                     ),
                 )
+                # A run cut for time still built something, and the work it
+                # left is graded rather than thrown away. A run cut because the
+                # model never answered measured nothing and is not graded.
+                if _cut_measures_the_agent(outcome.stop_reason):
+                    _grade_what_was_left(session, run_id, outcome.stop_reason)
             else:
                 failure = None
                 if _model_never_answered(outcome):
@@ -834,6 +1029,162 @@ def _execute_run_body(
             _export_langfuse_traces(session, run_id)
         except Exception as exc:
             service.mark_finished(run_id, -1, f"Executor error: {exc!r}")
+
+
+def _phase_supervision(
+    session: Session, run_id: str, case_id: str, max_steps: int, settings: Any
+) -> tuple[PhaseWatch | None, LivePhaseGrader | None]:
+    """The phase watch and the live grader for a multi-step run, or ``(None, None)``.
+
+    A single-step run has no phases to watch: its total and silence budgets
+    are the whole supervision, as before.
+    """
+    if int(max_steps or 1) <= 1:
+        return None, None
+    run_dir = settings.data_runs_dir / run_id
+    floor = int(getattr(settings, "run_phase_floor_seconds", 0) or 0)
+    budget_minutes: int | None = None
+    on_slow = "stop"
+    with contextlib.suppress(ValueError, CaseProfileError):
+        budget_minutes, on_slow = slow_policy_for(
+            CaseService(session).get_case(case_id)
+        )
+    watch: PhaseWatch | None = None
+    if floor > 0 or budget_minutes:
+        history = phase_history(settings.data_runs_dir, case_id, run_id)
+
+        def budget_for(step: int) -> int:
+            return expected_seconds(
+                step,
+                case_budget_minutes=budget_minutes,
+                history=history,
+                floor_seconds=floor,
+            )
+
+        def flag(message: str) -> None:
+            # Its own session: the watchdog's is mid-loop and must stay clean.
+            with Session(session.get_bind()) as own:
+                own.add(RunEvent(run_id=run_id, level="warning", message=message))
+                own.commit()
+
+        watch = PhaseWatch(
+            run_dir=run_dir,
+            budget_for=budget_for,
+            grace_seconds=int(getattr(settings, "run_slow_grace_seconds", 900) or 0),
+            on_slow=on_slow,
+            on_flag=flag,
+        )
+
+    def grade(step: int, first: bool) -> dict[str, Any] | None:
+        from harness_lab_app.validation_service import ValidationService
+
+        # A thread of its own needs a session of its own.
+        with Session(session.get_bind()) as own:
+            return ValidationService(own).grade_step_live(
+                run_id, step, install_deps=first
+            )
+
+    return watch, LivePhaseGrader(run_dir, grade)
+
+
+# What a live grade is waited for when the case cannot be read: the default
+# deadline of one command, the floor below which no grade can finish.
+_LIVE_GRADE_FALLBACK_SECONDS = 900
+
+
+def _live_grade_deadline(session: Session, run_id: str, case_id: str) -> int:
+    """How long the final validation waits for a live grade still in flight.
+
+    A live grade is one pass over the case's validation spec (setup included,
+    the first time), so its longest possible run is the sum of its commands'
+    deadlines. A shorter fixed wait let the final validation start beside a
+    Godot harvest allowed 900 seconds, on the same dependency folder.
+    """
+    try:
+        case = CaseService(session).get_case(case_id)
+        return max(
+            _LIVE_GRADE_FALLBACK_SECONDS,
+            spec_deadline_seconds(build_validation_spec(case, run_id)),
+        )
+    except Exception:  # a wait bound must never fail the run
+        return _LIVE_GRADE_FALLBACK_SECONDS
+
+
+# Cuts after which the agent's work is still evidence about the agent: it was
+# working, and was stopped for taking too long or by a person. The other two
+# watchdog verdicts — the model never answered, the endpoint kept refusing —
+# measured nothing, so there is nothing of the agent's to grade.
+_GRADED_CUTS = frozenset({"timeout", "stalled", "slow_phase", "cancelled"})
+
+
+def _cut_measures_the_agent(stop_reason: str | None) -> bool:
+    return stop_reason in _GRADED_CUTS
+
+
+def _archive_cut_workspace(run_id: str) -> bool:
+    """Archive a stopped run's live workspace where validation looks for it.
+
+    ``bench_run`` archives the workspace in its last phase, which a stopped
+    container never reaches: the work stays in ``workspace/<run_id>/``. Copying
+    it to ``data/runs/<run_id>/workspace`` gives the cut run the same archive a
+    finished one has, so its grade, its Play tab and a continuation all find it.
+    The live copy is left in place; the next managed run resets it.
+    """
+    settings = get_settings()
+    live = settings.workspace_dir / run_id
+    archived = settings.data_runs_dir / run_id / "workspace"
+    if not live.is_dir() or not any(live.iterdir()):
+        # Nothing live: whatever was archived (a run that finished cleanly)
+        # is the work, and is graded as it is.
+        return archived.is_dir()
+    # The live tree is the run's latest state and replaces any archive. A
+    # retry resumes on the same workspace while the archive still holds the
+    # attempt before it: racing3d-v1-K-001's retry built a full game over
+    # five phases, and its archive was the two files the first attempt left
+    # when the network dropped. Copied to a sibling first, so a failed copy
+    # never leaves the run with no archive at all.
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    staging = archived.with_name("workspace.cut-tmp")
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(live, staging, symlinks=True, ignore_dangling_symlinks=True)
+    if archived.exists():
+        shutil.rmtree(archived)
+    staging.rename(archived)
+    return True
+
+
+def _grade_what_was_left(session: Session, run_id: str, reason: str) -> None:
+    """Grade a run that was cut short on the work it had done (best-effort).
+
+    The verdict stays the cut — the run is ``failed`` with its reason — and the
+    grade sits beside it, so a run stopped at phase 4 of 5 shows what phases 1
+    to 3 achieved instead of nothing at all.
+    """
+    try:
+        if not _archive_cut_workspace(run_id):
+            return
+        session.add(
+            RunEvent(
+                run_id=run_id,
+                level="info",
+                message=f"Run cut ({reason}): grading the work it left.",
+            )
+        )
+        session.commit()
+    except Exception as exc:  # grading a cut run must never fail the run
+        session.rollback()
+        session.add(
+            RunEvent(
+                run_id=run_id,
+                level="warning",
+                message=f"Could not archive the cut run's workspace: {exc!r}",
+            )
+        )
+        session.commit()
+        return
+    _run_objective_validation(session, run_id)
+    _run_step_validation(session, run_id)
 
 
 def _index_artifacts(session: Session, run_id: str) -> None:
@@ -2045,13 +2396,46 @@ def _sandbox_container_name(run_id: str, kind: str) -> str:
     return f"harness-sandbox-{kind}-{safe}"
 
 
-def _launch_sandbox(client: Any, run_id: str, kind: str) -> tuple[str, int, str]:
+def _sandbox_profile(run_id: str) -> tuple[str, str]:
+    """The run's case's sandbox image and play command (ADR-0078).
+
+    Read from the database by the run's config, so the same run always opens
+    in the image its case names now. Empty strings mean the shared image and
+    no game to launch.
+    """
+    with Session(engine) as session:
+        service = RunService(session)
+        try:
+            config = service.get_run_config(service.get_run(run_id).run_config_id)
+            case = CaseService(session).get_case(config.case_id)
+        except ValueError:
+            return "", ""
+        return sandbox_image_for(case), play_command_for(case)
+
+
+def _launch_sandbox(
+    client: Any,
+    run_id: str,
+    kind: str,
+    profile: tuple[str, str] = ("", ""),
+) -> tuple[str, int, str]:
     """Copy the run's workspace and launch a sandbox container (worker-side).
 
     Returns (container_name, host_port, url). The bind mount uses the HOST path
     (docker-out-of-docker), and the port is docker-assigned then read back.
+
+    ``profile`` is the case's ``(sandbox_image, play_command)`` as
+    :func:`_sandbox_profile` resolved it; empty strings mean the shared image
+    and no game. Passed in rather than read here, so this stays a Docker-only
+    function that needs no database (ADR-0078).
     """
     settings = get_settings()
+    image, play_command = profile
+    image = image or settings.sandbox_image
+    if kind == "play" and not play_command:
+        raise RuntimeError(
+            "This case declares no play_command, so there is no game to launch."
+        )
     host_repo_root = settings.host_repo_root or str(settings.repo_root)
     workspace = settings.data_runs_dir / run_id / "workspace"
     if not workspace.exists():
@@ -2070,11 +2454,15 @@ def _launch_sandbox(client: Any, run_id: str, kind: str) -> tuple[str, int, str]
         client.containers.get(name).remove(force=True)
 
     port_key = _SANDBOX_PORTS[kind]
+    environment = {"MODE": "desktop" if kind == "play" else kind}
+    if kind == "play":
+        # Launched by the entrypoint once the desktop is up (sandbox_entrypoint.sh).
+        environment["PLAY_COMMAND"] = play_command
     container = client.containers.run(
-        image=settings.sandbox_image,
+        image=image,
         detach=True,
         name=name,
-        environment={"MODE": kind},
+        environment=environment,
         volumes={host_sandbox: {"bind": "/work", "mode": "rw"}},
         ports={port_key: None},
         labels={"harness-lab.sandbox": run_id, "harness-lab.sandbox-kind": kind},
@@ -2091,7 +2479,9 @@ def _launch_sandbox(client: Any, run_id: str, kind: str) -> tuple[str, int, str]
     if not host_port:
         raise RuntimeError("Sandbox container did not expose a host port")
 
-    path = "/vnc.html?autoconnect=1&resize=remote" if kind == "desktop" else "/"
+    path = (
+        "/vnc.html?autoconnect=1&resize=remote" if kind in ("desktop", "play") else "/"
+    )
     return name, host_port, f"http://localhost:{host_port}{path}"
 
 
@@ -2112,16 +2502,25 @@ def start_sandbox(run_id: str, kind: str) -> None:
     with Session(engine) as session:
         service = SandboxService(session)
         try:
-            client.images.get(settings.sandbox_image)
+            profile = _sandbox_profile(run_id)
+        except CaseProfileError as exc:
+            service.mark_error(run_id, kind, str(exc))
+            return
+        image = profile[0] or settings.sandbox_image
+        try:
+            client.images.get(image)
         except Exception:
+            build = (
+                "`make sandbox-build`"
+                if image == settings.sandbox_image
+                else "`make images-3d` (this case has its own image)"
+            )
             service.mark_error(
-                run_id,
-                kind,
-                "Sandbox image not found. Build it with `make sandbox-build`.",
+                run_id, kind, f"Sandbox image {image} not found. Build it with {build}."
             )
             return
         try:
-            name, port, url = _launch_sandbox(client, run_id, kind)
+            name, port, url = _launch_sandbox(client, run_id, kind, profile)
             service.mark_running(run_id, kind, name, port, url)
         except Exception as exc:
             service.mark_error(run_id, kind, repr(exc)[:800])
@@ -2162,7 +2561,7 @@ def cleanup_run_container(run_id: str) -> None:
     client = docker.from_env()
     _stop_orphan_container(client, run_id)
     # Also tear down any validation sandboxes the run left running.
-    for kind in ("terminal", "desktop"):
+    for kind in ("terminal", "desktop", "play"):
         with contextlib.suppress(Exception):
             container = client.containers.get(_sandbox_container_name(run_id, kind))
             with contextlib.suppress(Exception):

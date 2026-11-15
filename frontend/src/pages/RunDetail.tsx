@@ -9,6 +9,8 @@ import { ScoresPanel } from "../components/ScoresPanel";
 import { StepRewardPanel } from "../components/StepRewardPanel";
 import { LogViewer } from "../components/LogViewer";
 import { Markdown } from "../components/Markdown";
+import { PlayGuide } from "../components/PlayGuide";
+import { RunProgressPanel } from "../components/RunProgressPanel";
 import { SandboxPanel } from "../components/SandboxPanel";
 import { StateBadge } from "../components/StateBadge";
 import { formatDuration, formatRunDate } from "../dates";
@@ -102,7 +104,7 @@ const MESSAGES = defineMessages({
       sentSpans: (spans: number, sessionId: string) => `Sent ${spans} spans to session ${sessionId}.`,
       exportFailed: "Export failed."
     },
-    tabs: { detail: "Detail", terminal: "Terminal", desktop: "Desktop" },
+    tabs: { detail: "Detail", terminal: "Terminal", desktop: "Desktop", play: "Play" },
     summary: {
       score: "Score",
       interventions: "Interventions",
@@ -373,7 +375,7 @@ const MESSAGES = defineMessages({
       sentSpans: (spans: number, sessionId: string) => `Se enviaron ${spans} spans a la sesión ${sessionId}.`,
       exportFailed: "Falló la exportación."
     },
-    tabs: { detail: "Detalle", terminal: "Terminal", desktop: "Escritorio" },
+    tabs: { detail: "Detalle", terminal: "Terminal", desktop: "Escritorio", play: "Jugar" },
     summary: {
       score: "Puntaje",
       interventions: "Intervenciones",
@@ -735,9 +737,15 @@ export function RunDetail({
   // at it. Read once, at mount — after that the tab is yours.
   const [searchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
-  const [tab, setTab] = useState<"detail" | "terminal" | "desktop">(
-    requestedTab === "terminal" || requestedTab === "desktop" ? requestedTab : "detail"
+  const [tab, setTab] = useState<"detail" | "terminal" | "desktop" | "play">(
+    requestedTab === "terminal" || requestedTab === "desktop" || requestedTab === "play"
+      ? requestedTab
+      : "detail"
   );
+  // `?tab=play` is only honoured once the run is known to ship a game: before
+  // its context loads, or on a run with no play_command, the Play tab does not
+  // exist, and showing its panel would offer a Launch the worker must refuse.
+  const shownTab = tab === "play" && !runContext?.play_command ? "detail" : tab;
   const consoleRef = useRef<HTMLDivElement | null>(null);
   // A claude run with events-based attribution has real tool counts; only fall
   // back to the summary-only explainer when there is nothing to show.
@@ -1290,9 +1298,13 @@ export function RunDetail({
         </p>
       </div>
       <div className="run-tabs">
-        {(["detail", "terminal", "desktop"] as const).map((name) => (
+        {/* Play only when the case ships a game to start (ADR-0078). */}
+        {(runContext?.play_command
+          ? (["detail", "play", "terminal", "desktop"] as const)
+          : (["detail", "terminal", "desktop"] as const)
+        ).map((name) => (
           <button
-            className={tab === name ? "run-tab active" : "run-tab"}
+            className={shownTab === name ? "run-tab active" : "run-tab"}
             key={name}
             onClick={() => setTab(name)}
             type="button"
@@ -1301,10 +1313,17 @@ export function RunDetail({
           </button>
         ))}
       </div>
-      {tab !== "detail" ? <SandboxPanel key={tab} kind={tab} runId={run.run_id} /> : null}
-      {tab === "detail" ? (
+      {shownTab === "play" && runContext ? <PlayGuide context={runContext} /> : null}
+      {shownTab !== "detail" ? (
+        <SandboxPanel key={shownTab} kind={shownTab} runId={run.run_id} />
+      ) : null}
+      {shownTab === "detail" ? (
         <>
       {runContext ? <RunConditionStrip context={runContext} /> : null}
+      <RunProgressPanel
+        live={run.state === "running" || run.state === "pending"}
+        runId={run.run_id}
+      />
       <div className="detail-grid">
         <div>
           <span>{m.summary.score}</span>

@@ -24,6 +24,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from harness_lab_app.case_profile import runner_image_for
 from harness_lab_app.config import get_settings
 from harness_lab_app.models import CaseType
 from harness_lab_app.runner_capabilities import (
@@ -83,6 +84,24 @@ def command_deadline_seconds(
     if match:
         return int(match.group(1)) + _KILL_GRACE_SECONDS + _WATCHDOG_MARGIN_SECONDS
     return default
+
+
+def spec_deadline_seconds(spec: dict[str, Any]) -> int:
+    """The longest one pass over a spec can take: every command at its deadline.
+
+    The commands run one after another, each under the watchdog of
+    :func:`command_deadline_seconds`, so their sum bounds the whole pass. A
+    caller that must not overlap a pass in flight (the final validation after a
+    live phase grade) waits this long, never a guess shorter than one command.
+    """
+    setup = sum(
+        command_deadline_seconds("validation setup") for _ in spec.get("setup") or []
+    )
+    checks = sum(
+        command_deadline_seconds(argv[-1] if argv else "")
+        for argv in spec.get("commands") or []
+    )
+    return setup + checks
 
 
 # Exit codes that mean "we did not get an answer", not "the answer was wrong":
@@ -431,6 +450,11 @@ def build_validation_spec(
         "strategy": strategy,
         "setup": setup,
         "commands": commands,
+        # The image the checks run in: the case's own when it names one
+        # (ADR-0078) — its grader drives the engine the agent built for —
+        # and the shared runner otherwise. A target's gates run in the shared
+        # runner whatever the case says: they are the repository's commands.
+        "image": "" if target_commands else runner_image_for(case),
         "workspace": workspace,
         # Where the gate ran. Informational — the `cd` is already in the argv —
         # but a run whose checks all failed should be able to say from where.

@@ -159,6 +159,12 @@ export type RunContext = {
   validation_commands: string[];
   max_steps: number;
   parent_run_id: string;
+  // The command a case's game starts with (ADR-0078); "" when there is no game.
+  play_command?: string;
+  // How to play it (ADR-0078): the case's guide, and the keys the game really
+  // bound to each action, read from the grader's harvest of its InputMap.
+  play_guide?: { goal: string; controls: [string, string][]; tips: string[] } | Record<string, never>;
+  bound_keys?: Record<string, string[]>;
 };
 
 export type RunEventRecord = {
@@ -589,9 +595,56 @@ export type RunMetadata = {
   condition_hash?: string;
 };
 
+// A live run, read from the files it is writing (run_progress.py, ADR-0080).
+export type RunPhaseGrade = {
+  passed?: number;
+  total?: number;
+  progress?: number | null;
+  unmeasured?: boolean;
+  error?: string;
+};
+
+export type RunPhaseProgress = {
+  step: number;
+  phase: number;
+  phase_total: number | null;
+  name: string;
+  done: boolean;
+  seconds: number | null;
+  turns: number;
+  output_tokens: number;
+  cost_usd: number | null;
+  last_action: string | null;
+  last_event_at: number | null;
+  grade: RunPhaseGrade | null;
+};
+
+export type RunSlowPhase = {
+  step: number;
+  expected_seconds: number;
+  extra_seconds: number;
+  slow_since: number;
+  decide_by: number;
+  on_slow: "stop" | "wait";
+};
+
+export type RunProgress = {
+  state: string;
+  steps: RunPhaseProgress[];
+  current_step: number | null;
+  phase_total: number | null;
+  cost_usd: number | null;
+  cost_complete: boolean;
+  quiet_seconds: number | null;
+  last_action: string | null;
+  slow: RunSlowPhase | null;
+  extra_wait_seconds: number;
+  extend_seconds: number;
+};
+
 export type SandboxRecord = {
   run_id: string;
-  kind: "terminal" | "desktop";
+  kind: "terminal" | "desktop" | "play";
   status: "starting" | "running" | "stopped" | "failed";
   container_name: string;
   host_port: number | null;
