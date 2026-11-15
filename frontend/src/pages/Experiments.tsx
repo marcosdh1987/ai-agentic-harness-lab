@@ -9,6 +9,7 @@ import { CapabilityPanel } from "../components/CapabilityPanel";
 import { FactorialPanel } from "../components/FactorialPanel";
 import { HelpPanel } from "../components/HelpPanel";
 import { Markdown } from "../components/Markdown";
+import { EffortPicker } from "../components/EffortPicker";
 import { ModelPicker } from "../components/ModelPicker";
 import { Spinner } from "../components/Spinner";
 import {
@@ -137,6 +138,8 @@ const MESSAGES = defineMessages({
     harness: "Harness",
     executorModel: "Executor model",
     harnessDefault: "harness default",
+    reasoningEffort: "Reasoning effort",
+    cliDefault: "CLI default",
     plannerModel: "Planner model",
     none: "none",
     promptVariant: "Prompt variant",
@@ -380,6 +383,8 @@ const MESSAGES = defineMessages({
     harness: "Arnés",
     executorModel: "Modelo ejecutor",
     harnessDefault: "por defecto del arnés",
+    reasoningEffort: "Esfuerzo de razonamiento",
+    cliDefault: "por defecto del CLI",
     plannerModel: "Modelo planificador",
     none: "ninguno",
     promptVariant: "Variante de prompt",
@@ -1031,6 +1036,8 @@ function LaunchPanel({
   const [harness, setHarness] = useState("opencode");
   const [plannerModel, setPlannerModel] = useState("");
   const [executorModel, setExecutorModel] = useState("");
+  // Reasoning effort shared by every arm (ADR-0081); "" = the CLI default.
+  const [executorEffort, setExecutorEffort] = useState("");
   const [gatewayDefault, setGatewayDefault] = useState("");
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
   const [directErrors, setDirectErrors] = useState<Record<string, string>>({});
@@ -1131,7 +1138,7 @@ function LaunchPanel({
   // voids it rather than leaving a stale green tick above the Launch button.
   useEffect(() => {
     setCheck(null);
-  }, [promptVariant, harness, plannerModel, executorModel, maxSteps, dryRun]);
+  }, [promptVariant, harness, plannerModel, executorModel, executorEffort, maxSteps, dryRun]);
 
   const nativeIndex = useNativeModelIndex();
   const handleHarnessChange = (next: string) => {
@@ -1146,6 +1153,7 @@ function LaunchPanel({
     harness,
     planner_model: plannerModel || null,
     executor_model: executorModel || null,
+    executor_effort: executorEffort,
     // The one mode the web API accepts. Runs with objective validation score
     // themselves from it; the rest land in awaiting_manual_score.
     score_mode: "manual",
@@ -1186,6 +1194,9 @@ function LaunchPanel({
               harness: locked.harness,
               planner_model: locked.planner_model,
               executor_model: locked.executor_model,
+              // Part of the lock (ADR-0081): dropping it relaunches an
+              // explicit level as the CLI default, which the backend refuses.
+              executor_effort: locked.executor_effort ?? "",
               score_mode: "manual",
               max_steps: locked.max_steps,
               resume: false,
@@ -1223,6 +1234,12 @@ function LaunchPanel({
             <span>{m.executorModel}</span>
             <strong>{locked.executor_model ?? m.harnessDefault}</strong>
           </div>
+          {locked.harness === "claude" ? (
+            <div>
+              <span>{m.reasoningEffort}</span>
+              <strong>{locked.executor_effort || m.cliDefault}</strong>
+            </div>
+          ) : null}
           <div>
             <span>{m.plannerModel}</span>
             <strong>{locked.planner_model ?? m.none}</strong>
@@ -1376,6 +1393,12 @@ function LaunchPanel({
               : m.heldFixedHint}
           </small>
         </ModelPicker>
+        <EffortPicker
+          harness={harness}
+          model={executorModel}
+          onChange={setExecutorEffort}
+          value={executorEffort}
+        />
         <ModelPicker
           allowNone
           label={m.plannerModel}

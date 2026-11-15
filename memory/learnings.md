@@ -3388,4 +3388,39 @@ asked to do. ADR-0073.
   drops. Compare normalised positions. Calibration on a reference caught this and a
   wrong light/dark square choice — both grader bugs, not engine bugs.
 
+## 2026-11-14 — Reasoning effort is a model setting, and the run axes have more sinks than they seem
+
+Adding `executor_effort` (ADR-0081) showed that "an axis is carried by clone, retry,
+continuation and batch" is incomplete. An experiment has three more sinks that an
+axis must reach, plus two hand-written copies that drift. None of them fails loudly
+when it is missed:
+
+- `experiment_service.CONDITION_FIELDS`: the allow-list for condition overrides.
+  Without it, a condition naming the field is refused.
+- `ExperimentService._LOCKED_FIELDS` and `launch_config`: the relaunch lock. Without
+  them, an experiment relaunched at another level files two measurements under one
+  name, which is the exact thing the lock exists to stop.
+- `validate_design`: decide whether the axis is a *harness* lever or a *model*
+  setting. Effort is a model setting, so `harness_evaluation` must refuse a varying
+  effort, as it refuses a varying model. Otherwise a skills-and-effort design passes
+  and attributes an effort effect to the harness.
+- The experiment launch's preflight de-duplication key. It was a hand-written copy of
+  `run_service._preflight_key` and missed the new field, so an arm differing from its
+  control only in effort reused the control's preflight answer and skipped
+  `_check_effort`. It now calls `_preflight_key` itself; never re-copy that tuple.
+- The frontend's locked relaunch payload in `Experiments.tsx`. It is built field by
+  field from `launch_config`, so a locked field it does not copy relaunches as the
+  default and the lock refuses it.
+- The CLI resume in `bench_run.py`. Models fall back to runs.yaml when the flag is
+  unset, but effort is in neither runs.yaml nor the case spec, so `RESUME=1` ran the
+  rest at the default. A field outside those sources must be restored from the
+  run's own `metadata.json` (`resumed_effort`).
+
+Also: the arm-comparison UI is Subject validation, not New evaluation. A new
+condition axis that should be compared from the UI belongs on its per-arm editor.
+
+Claude Code's stream-json `init` event does not report the effort it applied
+(only `per_turn_effort_active`), so record effort as *requested* (ADR-0073). The CLI
+accepts `--effort` from 2.1.285. Haiku 4.5 has no effort control.
+
 <!-- Add new learnings above this line -->
