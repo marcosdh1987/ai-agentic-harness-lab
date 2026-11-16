@@ -36,7 +36,9 @@ from harness_lab_app.run_failures import classify_failure, failure_label
 from harness_lab_app.run_progress import (
     LIVE_STEPS_FILE,
     SLOW_STATE_FILE,
+    fill_final_grades,
     phase_title,
+    progress_clock,
     read_progress,
 )
 from harness_lab_app.run_service import RunService
@@ -176,6 +178,181 @@ def test_progress_shows_each_phase_grade_and_the_slow_flag(tmp_path: Path) -> No
     assert progress["steps"][0]["grade"] == {"passed": 12, "total": 39}
     assert progress["steps"][1]["grade"] == {"unmeasured": True}
     assert progress["slow"]["step"] == 3
+
+
+def _opencode_log(*lines: str) -> str:
+    return "\n".join(lines) + "\n"
+
+
+def test_progress_reads_a_harness_that_writes_only_a_log(tmp_path: Path) -> None:
+    """opencode writes no events.jsonl: its phases still show (chess3d-v1-K-002)."""
+    steps = tmp_path / "steps"
+    steps.mkdir()
+    (steps / "step-1.log").write_text(
+        _opencode_log(
+            "# opencode run started 2026-11-15T01:47:16Z",
+            "timestamp=2026-11-15T01:47:17.000Z level=INFO run=a message=loop "
+            "session.id=s step=0",
+            "\x1b[0m$ \x1b[0mgodot --headless --version",
+            "timestamp=2026-11-15T02:27:00.000Z level=INFO run=a message=loop "
+            "session.id=s step=1",
+        )
+    )
+    (steps / "step-1.meta.json").write_text(json.dumps({"step": 1, "seconds": 2429.2}))
+    (steps / "step-1.snapshot").mkdir()
+    (steps / "step-2-prompt.md").write_text("## Phase 2 of 5 — notation\n")
+    (steps / "step-2.log").write_text(
+        _opencode_log(
+            "timestamp=2026-11-15T02:27:46.000Z level=INFO run=b message=loop "
+            "session.id=s step=0",
+            "\x1b[0m→ \x1b[0mRead workspace/chess3d-v1-K-002/Chess.gd",
+            "\x1b[0m← \x1b[0mEdit workspace/chess3d-v1-K-002/Chess.gd",
+            "Index: /app/workspace/chess3d-v1-K-002/Chess.gd",
+            "timestamp=2026-11-15T02:30:00.000Z level=INFO run=b message=loop "
+            "session.id=s step=1",
+        )
+    )
+    (tmp_path / LIVE_STEPS_FILE).write_text(
+        json.dumps({"steps": {"1": {"passed": 3, "total": 40}}})
+    )
+    from datetime import datetime
+
+    now = datetime.fromisoformat("2026-11-15T02:40:00+00:00").timestamp()
+    progress = read_progress(
+        tmp_path,
+        max_steps=5,
+        first_prompt="## Phase 1 of 5 — the rules core (do only this now)\n",
+        now=now,
+    )
+    steps_out = progress["steps"]
+    assert [s["name"] for s in steps_out] == ["the rules core", "notation"]
+    assert [s["done"] for s in steps_out] == [True, False]
+    assert steps_out[0]["seconds"] == 2429.2
+    assert steps_out[0]["grade"] == {"passed": 3, "total": 40}
+    assert steps_out[1]["turns"] == 2 and steps_out[1]["cost_usd"] is None
+    # Running since its first log line, 12 min 14 s before `now`.
+    assert steps_out[1]["seconds"] == 734.0
+    assert progress["current_step"] == 2 and progress["phase_total"] == 5
+    # No step reported a cost: the total is unknown, never US$0.00.
+    assert progress["cost_usd"] is None
+    assert progress["last_action"] == "← Edit workspace/chess3d-v1-K-002/Chess.gd"
+    assert progress["quiet_seconds"] == 600.0
+
+
+def test_a_finished_runs_open_phase_stops_at_the_run_end(tmp_path: Path) -> None:
+    """racing3d-v1-K-002 showed "10 h 39 min" for a phase cut after 40."""
+    from datetime import datetime
+
+    _write_run(tmp_path)
+    # Phase 3's first event was at 10:15:10; the run was cut at 10:55:10,
+    # stored naive, as SQLite hands it back.
+    ended = datetime(2026, 11, 14, 10, 55, 10)
+    progress = read_progress(tmp_path, max_steps=3, now=progress_clock(ended))
+    assert progress["steps"][2]["seconds"] == 2400.0
+    # A live run has no end yet: the clock is the present.
+    assert progress_clock(None) is None
+
+
+def test_a_phase_without_a_live_grade_shows_its_final_grade(tmp_path: Path) -> None:
+    """opencity3d-v1-K-001 ran before live grading; its per-step reward is the grade."""
+    _write_run(tmp_path)
+    (tmp_path / LIVE_STEPS_FILE).write_text(
+        json.dumps({"steps": {"1": {"passed": 12, "total": 39}}})
+    )
+    progress = read_progress(tmp_path, max_steps=3)
+    fill_final_grades(
+        progress,
+        {
+            "per_step": {
+                "steps": [
+                    {"step": 1, "passed": 30, "total": 39, "progress": 0.77},
+                    {"step": 2, "passed": 21, "total": 39, "progress": 0.54},
+                    {"step": 3, "progress": None, "source": "unmeasured"},
+                ]
+            }
+        },
+    )
+    grades = [step["grade"] for step in progress["steps"]]
+    # The live grade stays; the final one fills the gap; unmeasured stays empty.
+    assert grades[0] == {"passed": 12, "total": 39}
+    assert grades[1] == {"passed": 21, "total": 39, "progress": 0.54}
+    assert grades[2] is None
+    fill_final_grades(progress, {})  # a run never validated changes nothing
+
+
+def _tool_use(at: str, tool_id: str, command: str) -> str:
+    return _event(
+        "assistant",
+        at,
+        message={
+            "usage": {"output_tokens": 5},
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "Bash",
+                    "input": {"command": command},
+                }
+            ],
+        },
+    )
+
+
+def _tool_result(at: str, tool_id: str) -> str:
+    return _event(
+        "user",
+        at,
+        message={"content": [{"type": "tool_result", "tool_use_id": tool_id}]},
+    )
+
+
+def test_a_command_still_running_is_not_mistaken_for_activity(tmp_path: Path) -> None:
+    """chess3d-v1-K-004: "quiet for 3 s" while a command had run for 2 minutes.
+
+    Claude Code sends a `tool_progress` heartbeat every 30 s while a tool runs.
+    Those are not the agent doing anything: the page must say a command is
+    running and for how long, and count quiet time from the agent's last turn.
+    """
+    from datetime import datetime
+
+    steps = tmp_path / "steps"
+    steps.mkdir()
+    (steps / "step-1.events.jsonl").write_text(
+        _tool_use("2026-11-15T12:58:00Z", "t1", "cat main.tscn")
+        + _tool_result("2026-11-15T12:58:01Z", "t1")
+        + _tool_use(
+            "2026-11-15T12:58:55Z",
+            "t2",
+            "timeout 180 godot --headless -e test_perft 2>&1 | grep perft",
+        )
+        + _event("tool_progress", "2026-11-15T12:59:25Z", tool_use_id="t2")
+        + _event("tool_progress", "2026-11-15T13:00:55Z", tool_use_id="t2")
+    )
+    now = datetime.fromisoformat("2026-11-15T13:00:58+00:00").timestamp()
+    progress = read_progress(tmp_path, max_steps=1, now=now)
+
+    # Quiet since the agent's own last event, not since the heartbeat.
+    assert progress["quiet_seconds"] == 123.0
+    waiting = progress["waiting_on"]
+    assert waiting["tool"] == "Bash"
+    assert waiting["detail"].startswith("timeout 180 godot --headless -e test_perft")
+    assert waiting["seconds"] == 123.0
+
+
+def test_a_finished_command_leaves_nothing_to_wait_on(tmp_path: Path) -> None:
+    steps = tmp_path / "steps"
+    steps.mkdir()
+    (steps / "step-1.events.jsonl").write_text(
+        _tool_use("2026-11-15T12:58:00Z", "t1", "godot --version")
+        + _tool_result("2026-11-15T12:58:02Z", "t1")
+    )
+    from datetime import datetime
+
+    now = datetime.fromisoformat("2026-11-15T12:58:12+00:00").timestamp()
+    progress = read_progress(tmp_path, max_steps=1, now=now)
+    # The model is thinking after the result: no command to wait on.
+    assert progress["waiting_on"] is None
+    assert progress["quiet_seconds"] == 10.0
 
 
 def test_a_phase_heading_drops_its_instruction() -> None:

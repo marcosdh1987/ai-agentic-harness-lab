@@ -24,7 +24,11 @@ const MESSAGES = defineMessages({
     pending: "pending",
     lastAction: "Last action",
     quiet: (s: string) => `quiet for ${s}`,
+    runningCommand: (tool: string) => `Waiting on ${tool}`,
+    runningFor: (s: string) => `running for ${s}`,
     cost: "Cost",
+    costUnknown: "not reported by this model",
+    turns: (n: number) => `${n} turns`,
     costPartial: "so far (the running phase adds its cost when it ends)",
     grade: (p: number, t: number) => `${p}/${t} checks`,
     grading: "grading…",
@@ -48,7 +52,11 @@ const MESSAGES = defineMessages({
     pending: "pendiente",
     lastAction: "Última acción",
     quiet: (s: string) => `sin actividad hace ${s}`,
+    runningCommand: (tool: string) => `Esperando a ${tool}`,
+    runningFor: (s: string) => `corriendo hace ${s}`,
     cost: "Costo",
+    costUnknown: "este modelo no lo reporta",
+    turns: (n: number) => `${n} turnos`,
     costPartial: "hasta ahora (la fase en curso suma su costo al terminar)",
     grade: (p: number, t: number) => `${p}/${t} chequeos`,
     grading: "calificando…",
@@ -106,7 +114,13 @@ function PhaseCell({ row, current }: { row: RunPhaseProgress; current: boolean }
       <div className="run-phase-name">{row.name || " "}</div>
       <div className="run-phase-stats">
         <span>{duration(row.seconds)}</span>
-        <span>{row.cost_usd !== null ? money(row.cost_usd) : `${row.turns} turns`}</span>
+        <span>
+          {row.cost_usd !== null
+            ? money(row.cost_usd)
+            : row.turns > 0
+              ? m.turns(row.turns)
+              : "—"}
+        </span>
       </div>
       {gradeText ? (
         <div className="run-phase-grade">
@@ -241,7 +255,24 @@ export function RunProgressPanel({ runId, live, onStopped }: Props) {
         ))}
       </ol>
       <div className="run-progress-foot">
-        {live && progress.last_action ? (
+        {live && progress.waiting_on ? (
+          <span className="run-progress-action">
+            <span className="muted">{m.runningCommand(progress.waiting_on.tool)}:</span>{" "}
+            <code>{progress.waiting_on.detail}</code>
+            {progress.waiting_on.seconds !== null ? (
+              <span
+                className={
+                  progress.waiting_on.seconds > 300
+                    ? "run-progress-quiet warn"
+                    : "run-progress-quiet"
+                }
+              >
+                {" "}
+                · {m.runningFor(duration(progress.waiting_on.seconds))}
+              </span>
+            ) : null}
+          </span>
+        ) : live && progress.last_action ? (
           <span className="run-progress-action">
             <span className="muted">{m.lastAction}:</span> <code>{progress.last_action}</code>
             {progress.quiet_seconds !== null ? (
@@ -259,7 +290,12 @@ export function RunProgressPanel({ runId, live, onStopped }: Props) {
           <span />
         )}
         <span>
-          <span className="muted">{m.cost}:</span> {money(progress.cost_usd)}
+          <span className="muted">{m.cost}:</span>{" "}
+          {progress.cost_usd !== null ? (
+            money(progress.cost_usd)
+          ) : (
+            <span className="muted">{m.costUnknown}</span>
+          )}
           {!progress.cost_complete && live ? (
             <span className="muted small"> {m.costPartial}</span>
           ) : null}

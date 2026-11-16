@@ -230,6 +230,9 @@ class RunConfigCreate(BaseModel):
     score_mode: str = "manual"
     max_steps: int = 1
     resume: bool = False
+    # Set only by a "continue where it stopped" retry (ADR-0083): the step the
+    # loop starts at, the earlier ones kept as they ran. 0 runs every step.
+    resume_from_step: int = Field(default=0, ge=0)
     dry_run: bool = False
     # Follow-up instruction that replaces the case prompt for a continuation
     # run (ADR-0026). Set by RunService.continue_run, not by the run form.
@@ -281,6 +284,8 @@ class ExperimentLaunch(BaseModel):
     """Settings every arm of the launch shares; conditions override on top."""
 
     config: RunConfigCreate
+    # How many runs execute at once: 1, the lab's one lane, or 2 (ADR-0082).
+    parallel: int = Field(default=1, ge=1, le=2)
 
 
 class FindingCreate(BaseModel):

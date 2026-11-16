@@ -1383,3 +1383,153 @@ def test_write_step_meta_writes_one_file_per_step(tmp_path):
     bench_run.write_step_meta(tmp_path, {"step": 2, "kind": "snapshot", "seconds": 3})
     data = json.loads((tmp_path / "step-2.meta.json").read_text())
     assert data == {"kind": "snapshot", "seconds": 3, "step": 2}
+
+
+def test_two_runs_never_rewrite_the_skill_views_at_once(tmp_path, monkeypatch) -> None:
+    """A parallel model comparison starts two runs over one repo (ADR-0082).
+
+    Both re-sync the lab's native skill views; interleaved, one unlinks a
+    symlink the other just made and fails with FileExistsError. The second
+    process must wait for the first to release the lock.
+    """
+    import multiprocessing
+    import threading
+    import time
+
+    lock = tmp_path / "data" / "app" / "skill-views.lock"
+    monkeypatch.setattr(bench_run, "SKILL_VIEWS_LOCK", lock)
+    held = multiprocessing.Event()
+    release = multiprocessing.Event()
+
+    def holder() -> None:
+        with bench_run._skill_views_lock():
+            held.set()
+            release.wait(5)
+
+    process = multiprocessing.get_context("fork").Process(target=holder)
+    process.start()
+    try:
+        assert held.wait(5)
+        waited = time.monotonic()
+        threading.Timer(0.3, release.set).start()
+        with bench_run._skill_views_lock():
+            assert time.monotonic() - waited >= 0.25
+        assert not lock.exists()
+    finally:
+        release.set()
+        process.join(5)
+
+
+def test_the_skill_views_lock_is_a_file_created_exclusively(
+    tmp_path, monkeypatch
+) -> None:
+    """Not flock: on Docker Desktop's bind mount it excludes nothing at all.
+
+    A run killed while holding the lock leaves the file behind, so one older
+    than the staleness bound is taken over instead of waited on forever.
+    """
+    import os
+    import time
+
+    lock = tmp_path / "data" / "app" / "skill-views.lock"
+    lock.parent.mkdir(parents=True)
+    monkeypatch.setattr(bench_run, "SKILL_VIEWS_LOCK", lock)
+    lock.write_text("12345\n")
+    old = time.time() - bench_run.SKILL_VIEWS_LOCK_STALE_SECONDS - 5
+    os.utime(lock, (old, old))
+
+    with bench_run._skill_views_lock():
+        assert lock.read_text() == f"{os.getpid()}\n"
+    assert not lock.exists()
+
+
+def test_a_run_writes_its_own_opencode_overlay(tmp_path, monkeypatch) -> None:
+    """Two runs at once must not share the provider map opencode loads.
+
+    With one lab-wide `opencode-effective.json`, a run with another direct
+    model or context window could rewrite it while the other's opencode was
+    loading it, and start on the other arm's providers.
+    """
+    from harness_lab_app import opencode_overlay
+
+    written: list = []
+
+    def build(repo_root, direct, limits, path=None):
+        written.append(path)
+        return {}, None
+
+    monkeypatch.setattr(opencode_overlay, "build_overlay", build)
+    monkeypatch.setattr(bench_run, "detected_context_windows", lambda _m: ())
+    monkeypatch.setattr(bench_run, "_ACTIVE_RUN", "chess3d-v1-K-031")
+    bench_run.apply_gateway_overlay.cache_clear()
+    try:
+        bench_run.apply_gateway_overlay(("lmstudio/x",), ())
+    finally:
+        bench_run.apply_gateway_overlay.cache_clear()
+
+    assert written == [
+        bench_run.DATA_DIR / "chess3d-v1-K-031" / "opencode-effective.json"
+    ]
+
+
+def _kept_step(steps_dir, n: int, seconds: float, kind: str = "case_step") -> None:
+    steps_dir.mkdir(parents=True, exist_ok=True)
+    (steps_dir / f"step-{n}.meta.json").write_text(
+        json.dumps(
+            {"step": n, "kind": "snapshot", "seconds": seconds, "prompt_kind": kind}
+        )
+    )
+
+
+def test_a_continuing_retry_starts_after_the_kept_steps(tmp_path) -> None:
+    """`--from-step 4` runs steps 4..max, steps 1-3 kept as they ran (ADR-0083)."""
+    import argparse
+
+    steps = tmp_path / "steps"
+    for n, seconds in ((1, 611.0), (2, 1333.0), (3, 477.0)):
+        _kept_step(steps, n, seconds, "case" if n == 1 else "case_step")
+    args = argparse.Namespace(from_step=4)
+
+    assert bench_run.kept_steps_start(args, 5, steps) == 4
+    seconds, kinds = bench_run.kept_steps_record(steps, 4)
+    assert seconds == 611.0 + 1333.0 + 477.0
+    assert kinds == ["case", "case_step", "case_step"]
+
+
+def test_a_continuing_retry_with_a_missing_step_runs_every_step(tmp_path, capsys):
+    """A gap means the early steps cannot be accounted for: start at 1, loudly."""
+    import argparse
+
+    steps = tmp_path / "steps"
+    _kept_step(steps, 1, 60.0)
+    _kept_step(steps, 3, 60.0)
+
+    assert bench_run.kept_steps_start(argparse.Namespace(from_step=4), 5, steps) == 1
+    assert "no record of step(s) 2" in capsys.readouterr().out
+
+
+def test_an_ordinary_run_starts_at_step_one(tmp_path) -> None:
+    import argparse
+
+    assert bench_run.kept_steps_start(argparse.Namespace(from_step=1), 5, tmp_path) == 1
+    assert bench_run.kept_steps_start(argparse.Namespace(), 5, tmp_path) == 1
+
+
+def test_from_step_past_the_budget_is_refused(tmp_path) -> None:
+    import argparse
+
+    with pytest.raises(SystemExit):
+        bench_run.kept_steps_start(argparse.Namespace(from_step=6), 5, tmp_path)
+
+
+def test_from_step_reaches_the_command_only_for_a_continuing_retry() -> None:
+    from harness_lab_app.runner_adapter import BenchRunAdapter
+    from harness_lab_app.schemas import RunConfigCreate
+
+    base = {"case_id": "chess3d-v1", "prompt_variant": "harness", "max_steps": 5}
+    plain = BenchRunAdapter().build_command("K-1", RunConfigCreate(**base))
+    assert "--from-step" not in plain
+    cont = BenchRunAdapter().build_command(
+        "K-1", RunConfigCreate(**base, resume=True, resume_from_step=4)
+    )
+    assert cont[cont.index("--from-step") + 1] == "4"

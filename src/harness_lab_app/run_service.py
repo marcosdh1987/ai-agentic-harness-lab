@@ -8,8 +8,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
-from sqlalchemy import desc
-from sqlmodel import Session, select
+from sqlalchemy import (
+    desc,
+    update as sa_update,
+)
+from sqlmodel import Session, col, select
 
 from harness_lab_app.config import get_settings, read_env_file_value
 from harness_lab_app.constants import EXAMPLE_LMSTUDIO_URL, EXAMPLE_OLLAMA_URL
@@ -42,6 +45,8 @@ from harness_lab_app.target_service import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
+    from sqlalchemy import CursorResult
+
 
 # Tokens that mean "no real gateway credential configured yet".
 _PLACEHOLDER_TOKENS = {"", "sk-local-change-me"}
@@ -65,6 +70,18 @@ class RunBatchTooLargeError(ValueError):
 
 class RunContinueError(ValueError):
     """Raised when a run cannot be continued (not terminal, or no workspace)."""
+
+
+class RunRetryError(ValueError):
+    """Raised when a retry cannot run as asked (wrong state, nothing to keep)."""
+
+
+# How a stopped run is run again (ADR-0083). `resume` is the original retry:
+# from step 1 over whatever workspace the attempt left. `scratch` wipes the
+# attempt and runs it as new. `continue` restores the last completed step and
+# runs only the steps after it.
+RETRY_MODES = ("resume", "scratch", "continue")
+RETRYABLE_STATES = frozenset({RunState.failed, RunState.cancelled})
 
 
 # States a run can be continued from: it has stopped, and whatever it built is
@@ -247,6 +264,7 @@ def _resume_config(config: RunConfig) -> RunConfigCreate:
         score_mode=config.score_mode,
         max_steps=config.max_steps,
         resume=True,
+        resume_from_step=config.resume_from_step,
         dry_run=config.dry_run,
         continuation_prompt=config.continuation_prompt,
         skills_disabled=list(config.skills_disabled),
@@ -1230,13 +1248,39 @@ class RunService:
         self._publish(run_id)
         return run
 
-    def mark_running(self, run_id: str) -> Run:
+    def mark_running(self, run_id: str, lane: str | None = None) -> Run:
         run = self.get_run(run_id)
         run.state = RunState.running
         run.started_at = utc_now()
+        # The queue of the worker driving it (ADR-0082), for reconciliation.
+        run.lane = lane
         self.session.add(run)
         self.session.add(RunEvent(run_id=run_id, message="Run started"))
         self.session.commit()
+        self.session.refresh(run)
+        return run
+
+    def claim_pending(self, run_id: str, lane: str | None = None) -> Run | None:
+        """``mark_running``, but only for a run that is still ``pending``.
+
+        One conditional UPDATE, so a cancellation committed after the worker
+        last read the row cannot be overwritten: the worker learns it lost the
+        race (``None``) instead of resurrecting a cancelled run.
+        """
+        claimed = cast(
+            "CursorResult[Any]",
+            self.session.execute(
+                sa_update(Run)
+                .where(col(Run.run_id) == run_id, col(Run.state) == RunState.pending)
+                .values(state=RunState.running, started_at=utc_now(), lane=lane)
+            ),
+        )
+        if claimed.rowcount != 1:
+            self.session.rollback()
+            return None
+        self.session.add(RunEvent(run_id=run_id, message="Run started"))
+        self.session.commit()
+        run = self.get_run(run_id)
         self.session.refresh(run)
         return run
 
@@ -1337,9 +1381,22 @@ class RunService:
                 RunEvent(run_id=run_id, level="info", message="Cancellation requested")
             )
         else:
-            run.state = RunState.cancelled
-            run.ended_at = utc_now()
-            self.session.add(run)
+            # Conditional on the state just read: the worker may claim the run
+            # (`claim_pending`) in between, and an unconditional write would
+            # mark a started run cancelled with nothing asking it to stop.
+            observed = run.state
+            moved = cast(
+                "CursorResult[Any]",
+                self.session.execute(
+                    sa_update(Run)
+                    .where(col(Run.run_id) == run_id, col(Run.state) == observed)
+                    .values(state=RunState.cancelled, ended_at=utc_now())
+                ),
+            )
+            if moved.rowcount != 1:
+                self.session.rollback()
+                self.session.expire_all()
+                return self.cancel_run(run_id)
             self.session.add(
                 RunEvent(run_id=run_id, level="info", message="Run cancelled")
             )
@@ -1347,16 +1404,83 @@ class RunService:
         self.session.refresh(run)
         return run
 
-    def retry_run(self, run_id: str) -> Run:
+    def retry_options(self, run_id: str) -> dict[str, Any]:
+        """Which retries a run offers, and from which step it would continue."""
+        from harness_lab_app.run_resume import resume_point
+
         run = self.get_run(run_id)
         config = self.get_run_config(run.run_config_id)
-        # Persist resume on the config: the Celery task rebuilds the command
-        # from RunConfig at execution time, so the flag must survive there.
-        config.resume = True
+        point = resume_point(
+            get_settings().data_runs_dir / run_id, int(config.max_steps or 1)
+        )
+        retryable = run.state in RETRYABLE_STATES
+        return {
+            "retryable": retryable,
+            "max_steps": config.max_steps,
+            "continue_from_step": (
+                point.last_step + 1 if point.last_step is not None else None
+            ),
+            "last_completed_step": point.last_step,
+            "continue_reason": point.reason,
+        }
+
+    def retry_run(self, run_id: str, mode: str = "resume") -> Run:
+        """Run a stopped run again under the same id (ADR-0083).
+
+        ``resume`` reruns every step over the workspace the attempt left — the
+        retry this lab always had. ``scratch`` wipes that attempt (workspace,
+        steps, validation, scores) and runs it as new. ``continue`` restores the
+        workspace as the last completed step left it and runs only the steps
+        after it, keeping the finished ones as they ran.
+        """
+        if mode not in RETRY_MODES:
+            raise RunRetryError(
+                f"Unknown retry mode '{mode}': {', '.join(RETRY_MODES)}"
+            )
+        run = self.get_run(run_id)
+        if mode != "resume" and run.state not in RETRYABLE_STATES:
+            raise RunRetryError(
+                f"Run '{run_id}' is {run.state.value}; only a failed or cancelled "
+                "run is retried."
+            )
+        config = self.get_run_config(run.run_config_id)
+        settings = get_settings()
+        run_dir = settings.data_runs_dir / run_id
+        workspace = settings.workspace_dir / run_id
+        message = "Run retried"
+        if mode == "continue":
+            from harness_lab_app.run_resume import restore_step, resume_point
+
+            point = resume_point(run_dir, int(config.max_steps or 1))
+            if not point.available or point.last_step is None:
+                raise RunRetryError(point.reason)
+            self._guard_run_paths(run_dir, workspace)
+            restore_step(run_dir, workspace, point.last_step)
+            config.resume = True
+            config.resume_from_step = point.last_step + 1
+            message = (
+                f"Run continued from step {point.last_step + 1}: steps 1-"
+                f"{point.last_step} are kept as they ran, the workspace restored "
+                f"from step {point.last_step}'s snapshot"
+            )
+        elif mode == "scratch":
+            from harness_lab_app.run_resume import wipe_for_scratch
+
+            self._guard_run_paths(run_dir, workspace)
+            wipe_for_scratch(run_dir, workspace)
+            self._clear_results(run_id)
+            config.resume = False
+            config.resume_from_step = 0
+            message = "Run retried from scratch: the previous attempt was discarded"
+        else:
+            # Persist resume on the config: the Celery task rebuilds the command
+            # from RunConfig at execution time, so the flag must survive there.
+            config.resume = True
+            config.resume_from_step = 0
         self.session.add(config)
         run.command = self.adapter.build_command(
             run_id,
-            _resume_config(config),
+            _resume_config(config) if config.resume else self._config_create(config),
         )
         run.state = RunState.pending
         run.exit_code = None
@@ -1364,12 +1488,35 @@ class RunService:
         run.started_at = None
         run.ended_at = None
         run.cancel_requested = False
+        run.score = None
+        run.lane = None
         self.session.add(run)
-        self.session.add(RunEvent(run_id=run_id, level="info", message="Run retried"))
+        self.session.add(RunEvent(run_id=run_id, level="info", message=message))
         self.session.commit()
         self.session.refresh(run)
         self._publish(run_id)
         return run
+
+    @staticmethod
+    def _config_create(config: RunConfig) -> RunConfigCreate:
+        payload = _resume_config(config).model_dump()
+        payload.update({"resume": False, "resume_from_step": 0})
+        return RunConfigCreate(**payload)
+
+    @staticmethod
+    def _guard_run_paths(*paths: Path) -> None:
+        """Refuse any path a retry would rewrite that is outside the repo root."""
+        repo_root = get_settings().repo_root.resolve()
+        for path in paths:
+            target = path.resolve()
+            if repo_root == target or repo_root not in target.parents:
+                raise RunRetryError(f"Refusing to touch {path}: outside the lab.")
+
+    def _clear_results(self, run_id: str) -> None:
+        """Drop what a previous attempt measured, keeping the run's own events."""
+        for model in (Validation, Attribution, Audit, Artifact, Score):
+            for row in self.session.exec(select(model).where(model.run_id == run_id)):
+                self.session.delete(row)
 
     @staticmethod
     def _remove_run_dirs(run_id: str) -> None:

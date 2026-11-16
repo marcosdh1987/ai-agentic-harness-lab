@@ -26,6 +26,7 @@ Direct:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import functools
 import json
@@ -204,6 +205,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Allow running into an existing workspace (skip workspace existence check). "
         "Use when a previous run was interrupted and you want to continue.",
+    )
+    p.add_argument(
+        "--from-step",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Start the step loop at step N, keeping steps 1..N-1 as they ran "
+        "(a retry that continues where the run stopped, ADR-0083). The worker "
+        "has already restored the workspace from step N-1's snapshot.",
     )
     p.add_argument(
         "--fresh",
@@ -437,6 +447,52 @@ def _within(target: Path, root: Path) -> bool:
     return target == resolved or resolved in target.parents
 
 
+# Held while the lab's native skill views are rewritten. Two runs may start at
+# once in a parallel model comparison (ADR-0082), each from its own container
+# over the same repo bind; without it both unlink-and-relink the same symlinks
+# and one fails with FileExistsError half-way. A run that would change the set
+# holds the worker's exclusive shared-tree lease (shared_tree.py), so this only
+# serialises identical writes.
+#
+# A file created with O_EXCL, not flock: on Docker Desktop's bind mount flock and
+# lockf exclude nothing, not even two processes of one container, while O_EXCL
+# creation is refused across containers (probed 2026-11-15).
+SKILL_VIEWS_LOCK = REPO_ROOT / "data" / "app" / "skill-views.lock"
+# A rewrite takes seconds; a lock older than this was left by a killed run.
+SKILL_VIEWS_LOCK_STALE_SECONDS = 300
+SKILL_VIEWS_LOCK_WAIT_SECONDS = 600
+
+
+@contextlib.contextmanager
+def _skill_views_lock():
+    SKILL_VIEWS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + SKILL_VIEWS_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fd = os.open(SKILL_VIEWS_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            with contextlib.suppress(OSError):
+                age = time.time() - SKILL_VIEWS_LOCK.stat().st_mtime
+                if age > SKILL_VIEWS_LOCK_STALE_SECONDS:
+                    SKILL_VIEWS_LOCK.unlink()
+                    continue
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"{SKILL_VIEWS_LOCK} is still held after "
+                    f"{SKILL_VIEWS_LOCK_WAIT_SECONDS}s"
+                ) from None
+            time.sleep(0.2)
+            continue
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.close(fd)
+        break
+    try:
+        yield
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            SKILL_VIEWS_LOCK.unlink()
+
+
 def apply_skill_views(skills: list) -> None:
     """Project `skills` into every tool's native view + adapter files."""
     from ml_python_base.skills_sync.config import DEFAULT_REGISTRY_PATH, load_registry
@@ -445,11 +501,12 @@ def apply_skill_views(skills: list) -> None:
     from ml_python_base.skills_sync.renderer import render_tool
 
     registry = load_registry(REPO_ROOT / DEFAULT_REGISTRY_PATH)
-    for tool in registry.tools:
-        hashes = link_tool(REPO_ROOT, tool, skills)
-        if tool.needs_manifest and tool.manifest_path:
-            write_manifest(REPO_ROOT / tool.manifest_path, hashes)
-        render_tool(REPO_ROOT, registry, tool, skills=skills)
+    with _skill_views_lock():
+        for tool in registry.tools:
+            hashes = link_tool(REPO_ROOT, tool, skills)
+            if tool.needs_manifest and tool.manifest_path:
+                write_manifest(REPO_ROOT / tool.manifest_path, hashes)
+            render_tool(REPO_ROOT, registry, tool, skills=skills)
 
 
 def add_skills_to_native(workspace: Path, skills: list, tool_id: str) -> dict:
@@ -570,6 +627,21 @@ def detected_context_windows(models: tuple[str, ...] = ()) -> tuple:
         return ()
 
 
+# Where a run's opencode overlay lives, under its own directory. One lab-wide
+# file was safe while one run executed at a time; two at once (ADR-0082) could
+# each rewrite it while the other's opencode was still loading it, and a run
+# could start on the other arm's provider map.
+RUN_OVERLAY_FILE = "opencode-effective.json"
+
+# Set by main() from --run before the overlay is first written.
+_ACTIVE_RUN: str = ""
+
+
+def _overlay_path() -> Path | None:
+    """This run's overlay file, or None outside a run (the lab-wide default)."""
+    return DATA_DIR / _ACTIVE_RUN / RUN_OVERLAY_FILE if _ACTIVE_RUN else None
+
+
 @functools.cache
 def apply_gateway_overlay(
     direct_models: tuple[str, ...] = (), run_models: tuple[str, ...] = ()
@@ -600,7 +672,9 @@ def apply_gateway_overlay(
     windows = detected_context_windows(run_models)
     for window in windows:
         print(f"  ✓ {describe(window)}")
-    env, digest = build_overlay(REPO_ROOT, direct_models, limits_by_model(windows))
+    env, digest = build_overlay(
+        REPO_ROOT, direct_models, limits_by_model(windows), path=_overlay_path()
+    )
     os.environ.update(env)
     return digest
 
@@ -1231,6 +1305,46 @@ def snapshot_step(
         return {"step": step_n, "kind": "too_large"}
     except Exception as exc:  # a snapshot must never stop the run
         return {"step": step_n, "kind": "error", "error": repr(exc)[:200]}
+
+
+def kept_steps_start(args: argparse.Namespace, max_steps: int, steps_dir: Path) -> int:
+    """The step the loop starts at: 1, or where a continuing retry picks up.
+
+    A continuing retry (``--from-step N``, ADR-0083) is honoured only when steps
+    1..N-1 are all on record; otherwise it starts at 1, loudly, rather than
+    filing a run whose early steps cannot be accounted for.
+    """
+    wanted = int(getattr(args, "from_step", 1) or 1)
+    if wanted <= 1:
+        return 1
+    if wanted > max_steps:
+        sys.exit(f"❌ --from-step {wanted} is past the last step ({max_steps}).")
+    missing = [
+        n for n in range(1, wanted) if not (steps_dir / f"step-{n}.meta.json").is_file()
+    ]
+    if missing:
+        print(
+            f"  ⚠️  --from-step {wanted}: no record of step(s) "
+            f"{', '.join(map(str, missing))} — running every step instead."
+        )
+        return 1
+    return wanted
+
+
+def kept_steps_record(steps_dir: Path, first_step: int) -> tuple[float, list[str]]:
+    """The seconds and prompt kinds of the steps a continuing retry keeps."""
+    seconds = 0.0
+    kinds: list[str] = []
+    for n in range(1, first_step):
+        try:
+            meta = json.loads((steps_dir / f"step-{n}.meta.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        value = meta.get("seconds")
+        if isinstance(value, int | float):
+            seconds += float(value)
+        kinds.append(str(meta.get("prompt_kind") or "case"))
+    return seconds, kinds
 
 
 def write_step_meta(steps_dir: Path, meta: dict) -> None:
@@ -3008,7 +3122,9 @@ def close_run(
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _ACTIVE_RUN
     args = parse_args(argv)
+    _ACTIVE_RUN = str(args.run or "")
     _load_env()
     # Headless by default for everything this process spawns, in both lanes.
     # The docker image and the run container already set these, but a host-mode
@@ -3539,7 +3655,21 @@ def main(argv: list[str] | None = None) -> int:
 
         last_swe_eval: dict | None = None
         last_workspace_fp: str | None = None
-        for step_n in range(1, max_steps + 1):
+        first_step = kept_steps_start(args, max_steps, steps_dir)
+        if first_step > 1:
+            kept_seconds, kept_kinds = kept_steps_record(steps_dir, first_step)
+            harness_seconds += kept_seconds
+            completed_steps += first_step - 1
+            prompt_kinds.extend(kept_kinds)
+            # The kept step's state is the baseline the no-progress check
+            # compares the next step against, as it would have been.
+            last_workspace_fp = workspace_fingerprint(workspace)
+            print(
+                f"\n  Continuing at step {first_step}/{max_steps}: steps 1-"
+                f"{first_step - 1} are kept as they ran "
+                f"({kept_seconds / 60:.0f} min)."
+            )
+        for step_n in range(first_step, max_steps + 1):
             if max_steps > 1:
                 if step_n == 1:
                     step_prompt_path = prompt_path

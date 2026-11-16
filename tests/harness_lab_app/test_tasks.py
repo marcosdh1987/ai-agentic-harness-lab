@@ -1,21 +1,22 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 from sqlmodel.pool import StaticPool
 
 from harness_lab_app import case_service, tasks
 from harness_lab_app.executors import SubprocessRunExecutor
-from harness_lab_app.models import HarnessSource, RunState
+from harness_lab_app.models import HarnessSource, RunEvent, RunState
 from harness_lab_app.run_failures import is_unmeasured
 from harness_lab_app.run_service import RunService
 from harness_lab_app.schemas import RunConfigCreate, RunCreate
-from harness_lab_app.tasks import _execute_run_body, reconcile_stale_runs
+from harness_lab_app.tasks import InFlight, _execute_run_body, reconcile_stale_runs
 
 
 class RunSettings:
@@ -615,13 +616,20 @@ class FakeReconcileClient:
         self.containers = FakeReconcileContainers()
 
 
+def _answered(*run_ids: str, lanes: tuple[str, ...] = ("runs", "runs-parallel")):
+    """An inspection every run lane answered, executing ``run_ids``."""
+    return InFlight(frozenset(run_ids), frozenset(lanes))
+
+
 def test_reconcile_marks_orphaned_running_runs_failed():
     engine = make_engine()
     create_pending_run(engine, "task-orphan-1")
     with Session(engine) as session:
         RunService(session).mark_running("task-orphan-1")
 
-    reconciled = reconcile_stale_runs(client=FakeReconcileClient(), db_engine=engine)
+    reconciled = reconcile_stale_runs(
+        client=FakeReconcileClient(), db_engine=engine, in_flight=_answered()
+    )
 
     assert reconciled == 1
     state, exit_code, failure = get_run_state(engine, "task-orphan-1")
@@ -629,6 +637,191 @@ def test_reconcile_marks_orphaned_running_runs_failed():
     assert exit_code == -1
     assert failure is not None
     assert "retry to resume" in failure
+
+
+def test_reconcile_spares_a_run_another_live_worker_is_executing():
+    """Three workers now (ADR-0082): one restarting must not kill another's run.
+
+    Every worker reconciles on boot. With one worker any `running` row was an
+    orphan; with a second lane and an interactive worker, a restart of either
+    would fail — and stop the container of — a run the other is still driving.
+    """
+    engine = make_engine()
+    for run_id in ("task-live-1", "task-orphan-2"):
+        create_pending_run(engine, run_id)
+        with Session(engine) as session:
+            RunService(session).mark_running(run_id)
+
+    reconciled = reconcile_stale_runs(
+        client=FakeReconcileClient(),
+        db_engine=engine,
+        in_flight=_answered("task-live-1"),
+    )
+
+    assert reconciled == 1
+    assert get_run_state(engine, "task-live-1")[0] == RunState.running
+    assert get_run_state(engine, "task-orphan-2")[0] == RunState.failed
+
+
+def test_reconcile_touches_nothing_when_the_workers_cannot_be_asked(monkeypatch):
+    """Unknown is not empty: failing every `running` row would kill the other lane."""
+    from harness_lab_app import tasks
+
+    engine = make_engine()
+    create_pending_run(engine, "task-unknown-1")
+    with Session(engine) as session:
+        RunService(session).mark_running("task-unknown-1")
+    monkeypatch.setattr(tasks, "runs_in_flight", lambda: None)
+
+    assert reconcile_stale_runs(client=FakeReconcileClient(), db_engine=engine) == 0
+    assert get_run_state(engine, "task-unknown-1")[0] == RunState.running
+
+
+def test_a_lane_that_did_not_answer_keeps_its_runs():
+    """A partial reply is complete only for the lanes in it.
+
+    `inspect().active()` returns the workers that replied in time. If the
+    second lane is slow to answer, its running row must not read as an orphan.
+    """
+    engine = make_engine()
+    for run_id, lane in (
+        ("task-main-orphan", "runs"),
+        ("task-second", "runs-parallel"),
+    ):
+        create_pending_run(engine, run_id)
+        with Session(engine) as session:
+            RunService(session).mark_running(run_id, lane=lane)
+
+    reconciled = reconcile_stale_runs(
+        client=FakeReconcileClient(),
+        db_engine=engine,
+        in_flight=_answered(lanes=("runs",)),
+    )
+
+    assert reconciled == 1
+    assert get_run_state(engine, "task-main-orphan")[0] == RunState.failed
+    assert get_run_state(engine, "task-second")[0] == RunState.running
+
+
+def test_a_run_from_before_the_second_lane_belongs_to_the_main_one():
+    """No lane recorded: it ran on `runs`, and only that lane may judge it."""
+    engine = make_engine()
+    create_pending_run(engine, "task-old")
+    with Session(engine) as session:
+        RunService(session).mark_running("task-old")
+
+    assert (
+        reconcile_stale_runs(
+            client=FakeReconcileClient(),
+            db_engine=engine,
+            in_flight=_answered(lanes=("runs-parallel",)),
+        )
+        == 0
+    )
+    assert get_run_state(engine, "task-old")[0] == RunState.running
+
+
+def test_a_lone_worker_still_recovers_its_own_orphans_on_boot(monkeypatch):
+    """The host mode runs one worker, which cannot answer while it boots.
+
+    Read as "no lane answered", the restart would never fail a run it left
+    behind. The booting worker answers for its own lanes.
+    """
+    from harness_lab_app import tasks
+
+    engine = make_engine()
+    create_pending_run(engine, "task-host-orphan")
+    with Session(engine) as session:
+        RunService(session).mark_running("task-host-orphan", lane="runs")
+    monkeypatch.setattr(tasks, "runs_in_flight", lambda: None)
+
+    reconciled = reconcile_stale_runs(
+        client=FakeReconcileClient(), db_engine=engine, own_lanes=frozenset({"runs"})
+    )
+
+    assert reconciled == 1
+    assert get_run_state(engine, "task-host-orphan")[0] == RunState.failed
+
+
+def test_the_booting_worker_knows_its_own_lanes():
+    from types import SimpleNamespace
+
+    from harness_lab_app import tasks
+
+    sender = SimpleNamespace(
+        app=SimpleNamespace(
+            amqp=SimpleNamespace(
+                queues=SimpleNamespace(consume_from={"runs": 1, "interactive": 2})
+            )
+        )
+    )
+    assert tasks._own_lanes(sender) == frozenset({"runs"})
+    assert tasks._own_lanes(None) == frozenset()
+
+
+def _inspector(active, queues):
+    class Inspect:
+        def active(self):
+            return active
+
+        def active_queues(self):
+            return queues
+
+    return Inspect()
+
+
+def test_active_tasks_are_read_whether_celery_reports_args_as_a_list_or_a_string(
+    monkeypatch,
+):
+    from harness_lab_app import tasks
+
+    active = {
+        "runs@a": [
+            {"name": "harness_lab_app.tasks.execute_run", "args": ["chess3d-v1-K-020"]}
+        ],
+        "parallel@b": [
+            {
+                "name": "harness_lab_app.tasks.execute_run",
+                "args": "['chess3d-v1-K-021']",
+            },
+            {"name": "harness_lab_app.tasks.start_sandbox", "args": ["x"]},
+        ],
+        "interactive@c": [],
+    }
+    queues = {
+        "runs@a": [{"name": "runs"}],
+        "parallel@b": [{"name": "runs-parallel"}],
+        "interactive@c": [{"name": "interactive"}],
+    }
+    monkeypatch.setattr(
+        tasks.celery_app.control, "inspect", lambda **_kw: _inspector(active, queues)
+    )
+    reply = tasks.runs_in_flight()
+    assert reply == InFlight(
+        frozenset({"chess3d-v1-K-020", "chess3d-v1-K-021"}),
+        frozenset({"runs", "runs-parallel"}),
+    )
+
+
+def test_a_worker_counts_for_its_lane_only_if_both_answers_came_back(monkeypatch):
+    """Active list from one worker, queues from another: neither lane is complete."""
+    from harness_lab_app import tasks
+
+    active = {"runs@a": []}
+    queues = {"parallel@b": [{"name": "runs-parallel"}]}
+    monkeypatch.setattr(
+        tasks.celery_app.control, "inspect", lambda **_kw: _inspector(active, queues)
+    )
+    assert tasks.runs_in_flight() == InFlight(frozenset(), frozenset())
+
+
+def test_no_reply_from_any_worker_is_unknown_not_empty(monkeypatch):
+    from harness_lab_app import tasks
+
+    monkeypatch.setattr(
+        tasks.celery_app.control, "inspect", lambda **_kw: _inspector(None, None)
+    )
+    assert tasks.runs_in_flight() is None
 
 
 def test_reconcile_ignores_finished_runs():
@@ -639,7 +832,9 @@ def test_reconcile_ignores_finished_runs():
         service.mark_running("task-done-1")
         service.mark_finished("task-done-1", 0)
 
-    reconciled = reconcile_stale_runs(client=FakeReconcileClient(), db_engine=engine)
+    reconciled = reconcile_stale_runs(
+        client=FakeReconcileClient(), db_engine=engine, in_flight=_answered()
+    )
 
     assert reconciled == 0
     state, _, _ = get_run_state(engine, "task-done-1")
@@ -998,3 +1193,440 @@ def test_the_worker_stops_waiting_on_a_process_that_will_not_end():
     assert exit_code == -1, "no exit code was observed, and none may be invented"
     assert handle.stopped is True
     assert elapsed < 10.0, "the worker was still parked on a run that was over"
+
+
+# --- The shared-tree lease (ADR-0082) -------------------------------------
+
+
+class MemoryLeases:
+    """The lease rules of `RedisTreeLeases`, in memory and without expiry."""
+
+    def __init__(self) -> None:
+        self.writer: str | None = None
+        self.readers: set[str] = set()
+        self.waiting: str | None = None
+        self.calls: list[tuple[str, str, bool]] = []
+
+    def _wait_in_line(self, run_id: str) -> str | None:
+        if self.waiting is None or self.waiting == run_id:
+            self.waiting = run_id
+            return None
+        return self.waiting
+
+    def try_acquire(self, run_id: str, exclusive: bool) -> str | None:
+        self.calls.append(("acquire", run_id, exclusive))
+        if exclusive and self.writer == run_id:
+            return None
+        if self.writer and self.writer != run_id:
+            if exclusive:
+                self._wait_in_line(run_id)
+            return self.writer
+        if exclusive:
+            ahead = self._wait_in_line(run_id)
+            if ahead:
+                return ahead
+            if self.readers:
+                return sorted(self.readers)[0]
+            self.writer = run_id
+            self.waiting = None
+            return None
+        if self.waiting and self.waiting != run_id and run_id not in self.readers:
+            return self.waiting
+        self.readers.add(run_id)
+        return None
+
+    def refresh(self, run_id: str, exclusive: bool) -> bool:
+        return self.writer == run_id if exclusive else run_id in self.readers
+
+    def release(self, run_id: str, exclusive: bool) -> None:
+        self.calls.append(("release", run_id, exclusive))
+        if exclusive:
+            if self.writer == run_id:
+                self.writer = None
+            if self.waiting == run_id:
+                self.waiting = None
+        else:
+            self.readers.discard(run_id)
+
+
+def test_a_plain_run_takes_the_tree_shared_and_gives_it_back():
+    engine = make_engine()
+    create_pending_run(engine, "lease-plain", command=["true"])
+    leases = MemoryLeases()
+
+    from harness_lab_app.tasks import _execute_run_body
+
+    _execute_run_body(
+        "lease-plain",
+        FakeExecutor(FakeHandle([], 0)),
+        db_engine=engine,
+        lane="runs-parallel",
+        leases=leases,
+    )
+
+    assert leases.calls[0] == ("acquire", "lease-plain", False)
+    assert leases.calls[-1] == ("release", "lease-plain", False)
+    assert leases.readers == set()
+    with Session(engine) as session:
+        assert RunService(session).get_run("lease-plain").lane == "runs-parallel"
+
+
+def test_an_ablation_waits_for_the_other_lane_and_stays_pending(monkeypatch):
+    """The other lane holds the tree: the ablating run waits, still `pending`."""
+    from harness_lab_app import tasks
+
+    engine = make_engine()
+    create_pending_run(engine, "lease-ablation", command=["true"])
+    leases = MemoryLeases()
+    leases.try_acquire("model-run-on-the-other-lane", exclusive=False)
+    monkeypatch.setattr(tasks, "rewrites_shared_tree", lambda _config: True)
+    monkeypatch.setattr(tasks, "SHARED_TREE_POLL_SECONDS", 0)
+    polls: list[RunState] = []
+
+    def sleep(_seconds: float) -> None:
+        polls.append(get_run_state(engine, "lease-ablation")[0])
+        # The other lane's run ends after two polls.
+        if len(polls) == 2:
+            leases.release("model-run-on-the-other-lane", exclusive=False)
+
+    monkeypatch.setattr(tasks.time, "sleep", sleep)
+
+    tasks._execute_run_body(
+        "lease-ablation",
+        FakeExecutor(FakeHandle([], 0)),
+        db_engine=engine,
+        leases=leases,
+    )
+
+    assert polls == [RunState.pending, RunState.pending]
+    assert get_run_state(engine, "lease-ablation")[0] != RunState.pending
+    assert ("release", "lease-ablation", True) in leases.calls
+    with Session(engine) as session:
+        messages = [e.message for e in session.exec(select(RunEvent)).all()]
+    assert any("waits for the lab's shared tree" in m for m in messages)
+
+
+def test_a_run_cancelled_while_it_waits_never_starts(monkeypatch):
+    from harness_lab_app import tasks
+
+    engine = make_engine()
+    create_pending_run(engine, "lease-cancelled", command=["true"])
+    leases = MemoryLeases()
+    leases.try_acquire("an-ablation", exclusive=True)
+    monkeypatch.setattr(tasks, "SHARED_TREE_POLL_SECONDS", 0)
+
+    def sleep(_seconds: float) -> None:
+        with Session(engine) as session:
+            RunService(session).cancel_run("lease-cancelled")
+
+    monkeypatch.setattr(tasks.time, "sleep", sleep)
+    executor = FakeExecutor(FakeHandle([], 0))
+
+    tasks._execute_run_body(
+        "lease-cancelled", executor, db_engine=engine, leases=leases
+    )
+
+    assert get_run_state(engine, "lease-cancelled")[0] == RunState.cancelled
+    assert executor.started_with is None
+
+
+def test_a_run_cancelled_just_after_it_gets_the_lease_never_starts():
+    """The lease is free, but a cancel lands before the run is marked running.
+
+    `mark_running` used to overwrite whatever state the row had, so the
+    cancelled run came back to life and its container started.
+    """
+    engine = make_engine()
+    create_pending_run(engine, "lease-cancel-race", command=["true"])
+
+    class CancelOnAcquire(MemoryLeases):
+        def try_acquire(self, run_id: str, exclusive: bool) -> str | None:
+            holder = super().try_acquire(run_id, exclusive)
+            with Session(engine) as session:
+                RunService(session).cancel_run(run_id)
+            return holder
+
+    leases = CancelOnAcquire()
+    executor = FakeExecutor(FakeHandle([], 0))
+
+    _execute_run_body("lease-cancel-race", executor, db_engine=engine, leases=leases)
+
+    assert get_run_state(engine, "lease-cancel-race")[0] == RunState.cancelled
+    assert executor.started_with is None
+    # The lease it took is given back.
+    assert leases.readers == set()
+
+
+def test_a_broken_lease_store_holds_the_run_pending(monkeypatch):
+    """No lease store, no shared tree: the run waits rather than risk the tree.
+
+    Running anyway would let an ablation rewrite the skill catalog under a model
+    comparison on the other lane, which corrupts both measurements.
+    """
+    from harness_lab_app import tasks
+
+    engine = make_engine()
+    create_pending_run(engine, "lease-broken", command=["true"])
+    monkeypatch.setattr(tasks, "SHARED_TREE_POLL_SECONDS", 0)
+    outages = iter([True, True, False])
+
+    class Flaky(MemoryLeases):
+        def try_acquire(self, run_id: str, exclusive: bool) -> str | None:
+            if next(outages):
+                raise ConnectionError("redis down")
+            return super().try_acquire(run_id, exclusive)
+
+    polls: list[RunState] = []
+    monkeypatch.setattr(
+        tasks.time,
+        "sleep",
+        lambda _s: polls.append(get_run_state(engine, "lease-broken")[0]),
+    )
+    executor = FakeExecutor(FakeHandle([], 0))
+
+    tasks._execute_run_body("lease-broken", executor, db_engine=engine, leases=Flaky())
+
+    # It waited out the outage `pending`, then ran once the store answered.
+    assert polls == [RunState.pending, RunState.pending]
+    assert executor.started_with is not None
+    with Session(engine) as session:
+        messages = [e.message for e in session.exec(select(RunEvent)).all()]
+    assert sum("lease store unavailable" in m for m in messages) == 1
+
+
+def test_a_run_cancelled_while_the_lease_store_is_down_never_starts(monkeypatch):
+    from harness_lab_app import tasks
+
+    engine = make_engine()
+    create_pending_run(engine, "lease-down-cancel", command=["true"])
+    monkeypatch.setattr(tasks, "SHARED_TREE_POLL_SECONDS", 0)
+
+    class Broken(MemoryLeases):
+        def try_acquire(self, run_id: str, exclusive: bool) -> str | None:
+            raise ConnectionError("redis down")
+
+    def sleep(_seconds: float) -> None:
+        with Session(engine) as session:
+            RunService(session).cancel_run("lease-down-cancel")
+
+    monkeypatch.setattr(tasks.time, "sleep", sleep)
+    executor = FakeExecutor(FakeHandle([], 0))
+
+    tasks._execute_run_body(
+        "lease-down-cancel", executor, db_engine=engine, leases=Broken()
+    )
+
+    assert get_run_state(engine, "lease-down-cancel")[0] == RunState.cancelled
+    assert executor.started_with is None
+
+
+def test_the_lease_is_refreshed_while_the_run_lasts(monkeypatch):
+    from harness_lab_app import tasks
+
+    leases = MemoryLeases()
+    leases.try_acquire("long-run", exclusive=False)
+    refreshed = threading.Event()
+
+    def refresh(run_id: str, exclusive: bool) -> bool:
+        refreshed.set()
+        return True
+
+    monkeypatch.setattr(leases, "refresh", refresh)
+    monkeypatch.setattr(tasks, "REFRESH_SECONDS", 0.01)
+    stop = threading.Event()
+    lost = threading.Event()
+    keeper = threading.Thread(
+        target=tasks._keep_lease, args=(leases, "long-run", False, stop, lost)
+    )
+    keeper.start()
+    assert refreshed.wait(2)
+    stop.set()
+    keeper.join(2)
+    assert not keeper.is_alive()
+    assert not lost.is_set()
+
+
+@pytest.mark.parametrize(
+    "refresh_result",
+    [False, ConnectionError("redis down")],
+    ids=["lease-expired", "store-unreachable"],
+)
+def test_a_lease_that_cannot_be_refreshed_is_reported_lost(monkeypatch, refresh_result):
+    """A refresh that fails or finds no lease means the run is unprotected."""
+    from harness_lab_app import tasks
+
+    def refresh(run_id: str, exclusive: bool) -> bool:
+        if isinstance(refresh_result, Exception):
+            raise refresh_result
+        return refresh_result
+
+    leases = MemoryLeases()
+    monkeypatch.setattr(leases, "refresh", refresh)
+    monkeypatch.setattr(tasks, "REFRESH_SECONDS", 0.01)
+    # One bad refresh is not yet a lost lease: it outlives two missed ones.
+    monkeypatch.setattr(tasks, "LEASE_SECONDS", 0.05)
+    stop = threading.Event()
+    lost = threading.Event()
+    keeper = threading.Thread(
+        target=tasks._keep_lease, args=(leases, "long-run", False, stop, lost)
+    )
+    keeper.start()
+    assert lost.wait(2)
+    keeper.join(2)
+    assert not keeper.is_alive(), "a lost lease is not refreshed any further"
+
+
+def test_a_lease_unreachable_for_one_refresh_is_not_lost(monkeypatch):
+    """Redis blinking once must not kill an hour-long run."""
+    from harness_lab_app import tasks
+
+    answers = iter([ConnectionError("blip"), True, True, True, True, True])
+    calls: list[int] = []
+
+    def refresh(run_id: str, exclusive: bool) -> bool:
+        calls.append(1)
+        answer = next(answers, True)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    leases = MemoryLeases()
+    monkeypatch.setattr(leases, "refresh", refresh)
+    monkeypatch.setattr(tasks, "REFRESH_SECONDS", 0.01)
+    monkeypatch.setattr(tasks, "LEASE_SECONDS", 10)
+    stop = threading.Event()
+    lost = threading.Event()
+    keeper = threading.Thread(
+        target=tasks._keep_lease, args=(leases, "long-run", False, stop, lost)
+    )
+    keeper.start()
+    deadline = time.monotonic() + 2
+    while len(calls) < 4 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop.set()
+    keeper.join(2)
+    assert len(calls) >= 4
+    assert not lost.is_set()
+
+
+def test_a_run_whose_lease_is_lost_is_stopped_as_a_lab_failure(monkeypatch):
+    """Past its lease the run no longer owns the tree; it must not go on."""
+    from harness_lab_app import tasks
+
+    monkeypatch.setattr(tasks, "get_settings", lambda: RunSettings())
+    monkeypatch.setattr(tasks, "REFRESH_SECONDS", 0.01)
+    monkeypatch.setattr(tasks, "LEASE_SECONDS", 0.02)
+    engine = make_engine()
+    create_pending_run(engine, "lease-lost", command=["true"])
+
+    class Expiring(MemoryLeases):
+        def refresh(self, run_id: str, exclusive: bool) -> bool:
+            return False
+
+    class Hanging(SubprocessRunExecutor):
+        def start(self, run_id: str, command: list[str], **kwargs):
+            return super().start(
+                run_id,
+                [
+                    "python3",
+                    "-c",
+                    "import time\nwhile True:\n print('working', flush=True)\n"
+                    " time.sleep(0.05)",
+                ],
+            )
+
+    started = time.monotonic()
+    _execute_run_body("lease-lost", Hanging(), db_engine=engine, leases=Expiring())
+
+    state, _, failure = get_run_state(engine, "lease-lost")
+    assert time.monotonic() - started < 30
+    assert state == RunState.failed
+    assert failure is not None and failure.startswith("Shared-tree lease lost:")
+    # The lab lost its own lock; nothing about the model was measured.
+    assert is_unmeasured(failure)
+
+
+def test_a_lease_is_given_up_before_redis_could_expire_it(monkeypatch):
+    """Redis drops the lease LEASE_SECONDS after the last refresh it saw.
+
+    Waiting a full lease period to notice left a window where another run could
+    already hold the tree. One refresh period of margin closes it, and still
+    tolerates a single missed refresh.
+    """
+    from harness_lab_app import tasks
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(tasks.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(tasks, "REFRESH_SECONDS", 30)
+    monkeypatch.setattr(tasks, "LEASE_SECONDS", 120)
+    failures: list[float] = []
+
+    class Down(MemoryLeases):
+        def refresh(self, run_id: str, exclusive: bool) -> bool:
+            failures.append(clock["now"])
+            raise ConnectionError("redis down")
+
+    class Ticks:
+        """`stop.wait` that advances the fake clock one refresh period."""
+
+        def wait(self, seconds: float) -> bool:
+            clock["now"] += seconds
+            return clock["now"] > 1000
+
+    lost = threading.Event()
+    tasks._keep_lease(Down(), "long-run", False, Ticks(), lost)  # type: ignore[arg-type]
+
+    assert lost.is_set()
+    assert failures[-1] < 120
+    assert len(failures) >= 2, "one missed refresh alone must not lose it"
+
+
+def test_a_cancelled_waiting_run_gives_up_its_waiting_place(monkeypatch):
+    """Or new shared runs stay blocked behind a run that will never start."""
+    from harness_lab_app import tasks
+
+    engine = make_engine()
+    create_pending_run(engine, "lease-cancel-waiting", command=["true"])
+    leases = MemoryLeases()
+    leases.try_acquire("model-1", exclusive=False)
+    monkeypatch.setattr(tasks, "rewrites_shared_tree", lambda _config: True)
+    monkeypatch.setattr(tasks, "SHARED_TREE_POLL_SECONDS", 0)
+
+    def sleep(_seconds: float) -> None:
+        with Session(engine) as session:
+            RunService(session).cancel_run("lease-cancel-waiting")
+
+    monkeypatch.setattr(tasks.time, "sleep", sleep)
+
+    tasks._execute_run_body(
+        "lease-cancel-waiting",
+        FakeExecutor(FakeHandle([], 0)),
+        db_engine=engine,
+        leases=leases,
+    )
+
+    assert leases.waiting is None
+    assert leases.try_acquire("model-2", exclusive=False) is None
+
+
+def test_a_worker_with_no_lease_store_does_not_run_unprotected(monkeypatch):
+    """A Redis URL that cannot even be parsed is an outage, not a free pass."""
+    from harness_lab_app import tasks
+
+    def broken(_url: str) -> Any:
+        raise ValueError("bad redis url")
+
+    monkeypatch.setattr(tasks, "redis_leases", broken)
+    monkeypatch.setattr(tasks, "init_db", lambda: None)
+    monkeypatch.setattr(tasks, "get_executor", lambda: "executor")
+    seen: dict[str, Any] = {}
+
+    def body(run_id: str, executor: Any, **kwargs: Any) -> None:
+        seen.update(kwargs)
+
+    monkeypatch.setattr(tasks, "_execute_run_body", body)
+    tasks.execute_run("lease-no-store")
+
+    assert seen["leases"] is not None
+    with pytest.raises(ConnectionError):
+        seen["leases"].try_acquire("lease-no-store", False)

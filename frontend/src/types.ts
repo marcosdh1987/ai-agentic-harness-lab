@@ -639,6 +639,8 @@ export type RunProgress = {
   cost_complete: boolean;
   quiet_seconds: number | null;
   last_action: string | null;
+  /** The tool call still running (asked for, no result yet), and for how long. */
+  waiting_on: { tool: string; detail: string; seconds: number | null } | null;
   slow: RunSlowPhase | null;
   extra_wait_seconds: number;
   extend_seconds: number;
@@ -883,6 +885,38 @@ export type FactorialBlock = {
     established: boolean;
   };
   reading: string;
+};
+
+/** One run of one model in a model comparison (`GET /model-comparison`). */
+export type ModelComparisonRun = {
+  run_id: string;
+  state: string;
+  /** Final checks passed and counted; null until the run is validated. */
+  passed: number | null;
+  total: number | null;
+  pass_rate: number | null;
+  /** Null when the model reports no cost (a local model), never 0. */
+  cost_usd: number | null;
+  minutes: number | null;
+  /** Checks passed after each phase, from the per-step reward. */
+  phases: { step: number; passed: number | null; total: number | null }[];
+};
+
+export type ModelComparisonArm = {
+  label: string;
+  harness: string;
+  executor_model: string;
+  executor_effort: string;
+  runs: ModelComparisonRun[];
+  mean_pass_rate: number | null;
+  best_pass_rate: number | null;
+};
+
+export type ModelComparison = {
+  experiment_id: string;
+  case_id: string;
+  family_id: string;
+  arms: ModelComparisonArm[];
 };
 
 export type ExperimentRecord = {
@@ -2301,4 +2335,16 @@ export type LocalModelLoadCheck = {
   loaded: boolean | null;
   size_gb: number | null;
   guard: LocalGuardReport | null;
+};
+
+/** How a stopped run is run again (ADR-0083). */
+export type RetryMode = "scratch" | "continue";
+
+/** Whether a run can continue where it stopped, and from which step. */
+export type RetryOptions = {
+  retryable: boolean;
+  max_steps: number;
+  continue_from_step: number | null;
+  last_completed_step: number | null;
+  continue_reason: string;
 };

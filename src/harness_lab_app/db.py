@@ -117,6 +117,10 @@ def _apply_sqlite_compat_migrations() -> None:
                     "NOT NULL DEFAULT 0"
                 )
             )
+        if "lane" not in columns:
+            # Null for every earlier run: they all ran on the one lane, `runs`,
+            # which is how reconciliation reads a null (ADR-0082).
+            connection.execute(text("ALTER TABLE run ADD COLUMN lane VARCHAR"))
         if "parent_run_id" not in columns:
             # Nullable for the same reason as batch_id: a run that predates
             # continuations had no parent, and inventing one would fabricate
@@ -259,6 +263,15 @@ def _apply_sqlite_compat_migrations() -> None:
                 text(
                     "ALTER TABLE runconfig ADD COLUMN executor_effort "
                     "VARCHAR NOT NULL DEFAULT ''"
+                )
+            )
+        # A retry that continues after the last completed step (ADR-0083). 0 is
+        # every run before it: it ran its steps from the first.
+        if runconfig_columns and "resume_from_step" not in runconfig_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE runconfig ADD COLUMN resume_from_step "
+                    "INTEGER NOT NULL DEFAULT 0"
                 )
             )
         if runconfig_columns and "continuation_prompt" not in runconfig_columns:
