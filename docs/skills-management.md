@@ -171,6 +171,61 @@ Only that block is generated; the surrounding governance prose stays hand-writte
 lock file, or projected agent is stale relative to the governed sources — so the
 lists can never silently drift. Fix drift with `make sync-skills`.
 
+## Skill profiles
+
+Every listed skill costs context on every run: its description sits in each
+adapter file whether or not the agent opens it. A **profile** names the subset a
+project carries ([ADR-0085](adr/0085-a-project-carries-a-skill-profile-not-the-whole-catalog.md)).
+
+| File | Owner | Holds |
+|---|---|---|
+| `.github/skill-profiles.toml` | governed (travels with template syncs) | profile definitions: `minimal` (`extends` composes; `full` is built in) |
+| `harness.toml` (repo root) | the project (no sync writes it) | the selection: `profile`, plus `include` / `exclude` lists |
+
+```toml
+# harness.toml
+[skills]
+profile = "minimal"
+include = ["test-driven-development"]  # add an optional skill on top
+exclude = []                          # drop from the profile
+```
+
+```bash
+make skill-profile             # list profiles and what this repo carries
+make skill-profile SET=full    # select one (writes harness.toml, relinks)
+make sync-skills               # after editing harness.toml by hand
+```
+
+**A profile filters, it never deletes.** `.github/skills*/` stays complete, and
+only the native views and adapter listings follow the selection. A template sync
+therefore never fights a bootstrap, and turning a skill back on is one line. No
+`harness.toml` means `full`. `make check-sync` treats a native view whose skill
+set differs from the selection as drift.
+
+### Two levels: minimal and full
+
+| Level | Skills | Adapter listing | Use |
+|---|---|---|---|
+| `minimal` | 7: `plan_and_execute_feature`, `systematic_debugging`, `verify_changes`, `research_current_info`, `requesting-code-review`, `writing-plans`, `brainstorm_quick` | about 4 KB lighter per adapter file (CLAUDE.md ~40% smaller) | default for new projects |
+| `full` | every governed skill | complete | when a project needs the whole catalog |
+
+`minimal` is what real work used: a 2026-11-18 review of three template-derived
+repositories found those five skills invoked, and the working loop itself (the
+CLAUDE.md playbook, `/plan`, every case's harness prompt) names the rest. The
+other skills are **optional add-ons**: they stay in `.github/skills*/`, unlisted
+and unlinked, until `include` turns one on.
+
+New projects get `minimal` from `make init` ([Project init](project-init.md)).
+The lab runs either level per run: **Runs → Harness: full / minimal**, or
+`skill_profile` on `POST /api/runs` / `POST /api/runs/batch`. Shrinking
+`minimal` further needs a pruning verdict with no quality loss
+([ADR-0086](adr/0086-pruning-never-trades-quality-for-a-smaller-harness.md)); see
+[Per-step reward → From census to profile](guide-step-reward.md#from-census-to-profile).
+
+Carrying this to the template is an upstream change, not a sync: the template's
+v2 engine differs from the lab's. The ready-to-paste agent prompt is in
+[upstream/template-harness-levels-prompt.md](upstream/template-harness-levels-prompt.md).
+
 ## Safety behavior
 
 - If no external source exists, command exits successfully (`0`) without failing CI.

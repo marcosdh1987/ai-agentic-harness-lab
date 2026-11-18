@@ -1,0 +1,42 @@
+# Skill profiles (ADR-0085): named subsets of the governed catalog.
+#
+# Every skill an agent can see costs context on every run: its description is
+# listed in each adapter file whether or not it is ever opened. A profile names
+# the subset a project, or a model tier, actually carries.
+#
+# A project selects one in `harness.toml` at its root (written by
+# `make init PROFILE=...` or `make skill-profile SET=...`). No `harness.toml`
+# means `full` — every skill, which is what every repository carried before
+# profiles. `full` is built in and is not declared here.
+#
+# Profiles FILTER, never delete: `.github/skills*/` stay complete, so a template
+# sync cannot resurrect what a bootstrap removed, and turning a skill back on is
+# one line. Only the generated views follow the profile.
+#
+# Two levels, nothing in between: `minimal` (the default for a new project) and
+# the built-in `full`. Every skill outside `minimal` stays in the repo as an
+# optional add-on: not listed in the adapters, not projected into native views,
+# switched on per project with `include = [...]` in harness.toml.
+#
+# `minimal` is the skills real work used (2026-11-18 usage review of three
+# template-derived repos: plan_and_execute_feature 11 sessions,
+# systematic_debugging 5, verify_changes 3, research_current_info 2,
+# requesting-code-review 1+) plus the ones the working loop itself names: the
+# CLAUDE.md playbook and /plan point at writing-plans and brainstorm_quick, and
+# every case's harness prompt drives plan_and_execute_feature,
+# systematic_debugging and verify_changes. Lab pruning showed no skill can be
+# dropped without a quality loss (ADR-0086), so minimal is about what to carry
+# by default, not about what is safe to remove: run `make prune` before
+# shrinking it further.
+
+[profile.minimal]
+description = "The working loop real projects use: plan, debug, verify, research, review. Default for new projects."
+skills = [
+    "brainstorm_quick",
+    "plan_and_execute_feature",
+    "requesting-code-review",
+    "research_current_info",
+    "systematic_debugging",
+    "verify_changes",
+    "writing-plans",
+]

@@ -20,6 +20,7 @@ import { RunTable } from "../components/RunTable";
 import type {
   CaseRecord,
   HarnessSkill,
+  SkillProfileRecord,
   ModelOption,
   RunBatchPayload,
   RunBatchResult,
@@ -93,7 +94,6 @@ const MESSAGES = defineMessages({
     newRun: "New run",
     noCaseSelected: "No case selected",
     compareLinkLabel: "Compare",
-    presetFullSdlc: "Preset: Full SDLC + Qwen",
     leaveBatchMode: "Leave batch mode",
     batchMode: "Batch mode",
     batch: {
@@ -203,7 +203,13 @@ const MESSAGES = defineMessages({
       disableAll: "Disable all",
       experimentalTitle: "Experimental (staged, off by default)",
       askAgent: "Ask the agent to use them",
-      askAgentHint: "at the start of every step"
+      askAgentHint: "at the start of every step",
+      profile: "Harness",
+      profileCustom: "custom",
+      profileHint: (name: string, count: number) =>
+        name === "full"
+          ? "Every governed skill."
+          : `${count} skills — the rest stay in the repo, hidden for this run (.github/skill-profiles.toml).`
     },
     actions: {
       validating: "Validating...",
@@ -276,7 +282,6 @@ const MESSAGES = defineMessages({
     newRun: "Nueva corrida",
     noCaseSelected: "Ningún caso seleccionado",
     compareLinkLabel: "Comparar",
-    presetFullSdlc: "Preset: SDLC completo + Qwen",
     leaveBatchMode: "Salir del modo lote",
     batchMode: "Modo lote",
     batch: {
@@ -387,7 +392,13 @@ const MESSAGES = defineMessages({
       disableAll: "Deshabilitar todas",
       experimentalTitle: "Experimentales (staged, desactivadas por defecto)",
       askAgent: "Pedirle al agente que las use",
-      askAgentHint: "al comienzo de cada paso"
+      askAgentHint: "al comienzo de cada paso",
+      profile: "Arnés",
+      profileCustom: "personalizado",
+      profileHint: (name: string, count: number) =>
+        name === "full"
+          ? "Todas las skills gobernadas."
+          : `${count} skills — el resto queda en el repo, oculto para esta corrida (.github/skill-profiles.toml).`
     },
     actions: {
       validating: "Validando...",
@@ -443,8 +454,8 @@ export function Runs({
   const navigate = useNavigate();
   const [runId, setRunId] = useState("");
   const [label, setLabel] = useState("");
-  const [caseId, setCaseId] = useState(cases[0]?.case_id ?? "tetris-v1");
-  const [promptVariant, setPromptVariant] = useState("sdlc");
+  const [caseId, setCaseId] = useState(cases[0]?.case_id ?? "");
+  const [promptVariant, setPromptVariant] = useState("harness");
   const [harness, setHarness] = useState("opencode");
   const [plannerModel, setPlannerModel] = useState("");
   const [executorModel, setExecutorModel] = useState(FALLBACK_EXECUTOR_MODEL);
@@ -468,6 +479,7 @@ export function Runs({
   const [caseRunIds, setCaseRunIds] = useState<string[]>([]);
   const [harnessSkills, setHarnessSkills] = useState<HarnessSkill[]>([]);
   const [disabledSkills, setDisabledSkills] = useState<Set<string>>(new Set());
+  const [skillProfiles, setSkillProfiles] = useState<Record<string, SkillProfileRecord>>({});
   const [stagedSkills, setStagedSkills] = useState<StagedSkillRecord[]>([]);
   const [extraSkills, setExtraSkills] = useState<Set<string>>(new Set());
   // Off = available only; on = the agent is told to invoke them every step.
@@ -568,6 +580,16 @@ export function Runs({
         // No catalog (API offline) — the section stays hidden.
       });
     api
+      .listSkillProfiles()
+      .then((profiles) => {
+        if (active) {
+          setSkillProfiles(profiles);
+        }
+      })
+      .catch(() => {
+        // No profiles — the selector stays hidden; the checkboxes still work.
+      });
+    api
       .listStagedSkills()
       .then((skills) => {
         if (active) {
@@ -633,6 +655,15 @@ export function Runs({
     });
   };
 
+  // The harness level the checkboxes currently spell, or "" when they match
+  // no profile. A profile is a named ablation (ADR-0085), so the run still
+  // carries the exact skills_disabled list either way.
+  const disabledKey = [...disabledSkills].sort().join(",");
+  const activeProfile =
+    Object.entries(skillProfiles).find(
+      ([, profile]) => [...profile.disabled].sort().join(",") === disabledKey
+    )?.[0] ?? "";
+
   const toggleSkill = (name: string) => {
     setDisabledSkills((current) => {
       const next = new Set(current);
@@ -649,6 +680,17 @@ export function Runs({
     () => cases.find((item) => item.case_id === caseId) ?? cases[0] ?? null,
     [caseId, cases]
   );
+
+  // The form must send the case it shows. `selectedCase` falls back to the
+  // first case when `caseId` names none of them (the list loaded after the
+  // form, or a case was removed), and the dropdown then displays that one —
+  // while `caseId` kept the stale id and the run went out for a case that does
+  // not exist. Re-point it at what the screen shows.
+  useEffect(() => {
+    if (selectedCase !== null && selectedCase.case_id !== caseId) {
+      setCaseId(selectedCase.case_id);
+    }
+  }, [selectedCase, caseId]);
 
   // The case says how many steps its task takes; the form used to ignore it and
   // queue every run at 10, so a one-step case advertised a ten-step budget it
@@ -692,10 +734,7 @@ export function Runs({
     if (promptVariantNames.includes(promptVariant)) {
       return;
     }
-    const preferred =
-      caseId === "tetris-v1" && promptVariantNames.includes("sdlc")
-        ? "sdlc"
-        : promptVariantNames[0];
+    const preferred = promptVariantNames.includes("sdlc") ? "sdlc" : promptVariantNames[0];
     setPromptVariant(preferred);
   }, [caseId, promptVariant, promptVariantNames]);
 
@@ -745,15 +784,6 @@ export function Runs({
     }
     return parts.join(" \\\n  ");
   }, [caseId, dryRun, effectiveRunLabel, executorEffort, executorModel, maxSteps, plannerModel, promptVariant, resume]);
-
-  const applySdlcQwenPreset = () => {
-    setCaseId("tetris-v1");
-    setPromptVariant("sdlc");
-    setHarness("opencode");
-    setPlannerModel("");
-    setExecutorModel(FALLBACK_EXECUTOR_MODEL);
-    setMaxSteps(10);
-  };
 
   // A verdict only describes the configuration that produced it, so any edit
   // voids it rather than leaving a stale green tick above the Create button.
@@ -944,9 +974,6 @@ export function Runs({
           <span className="muted">{selectedCase ? selectedCase.name : m.noCaseSelected}</span>
         </div>
         <div className="panel-actions run-presets">
-          <button className="primary" onClick={applySdlcQwenPreset} type="button">
-            {m.presetFullSdlc}
-          </button>
           <button
             onClick={() => (batchMode ? setBatchMode(false) : enterBatchMode())}
             type="button"
@@ -1328,6 +1355,35 @@ export function Runs({
             </>
           ) : null}
         </div>
+        {harnessSkills.length > 0 && Object.keys(skillProfiles).length > 0 ? (
+          <label>
+            <span>{m.skills.profile}</span>
+            <select
+              onChange={(event) => {
+                const profile = skillProfiles[event.target.value];
+                if (profile) {
+                  setDisabledSkills(new Set(profile.disabled));
+                }
+              }}
+              value={activeProfile}
+            >
+              {Object.keys(skillProfiles).map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+              {activeProfile === "" ? <option value="">{m.skills.profileCustom}</option> : null}
+            </select>
+            {activeProfile !== "" ? (
+              <small className="muted">
+                {m.skills.profileHint(
+                  activeProfile,
+                  skillProfiles[activeProfile]?.skills.length ?? 0
+                )}
+              </small>
+            ) : null}
+          </label>
+        ) : null}
         {harnessSkills.length > 0 ? (
           <div className="skills-section">
             <button className="skills-toggle" onClick={() => setSkillsOpen((open) => !open)} type="button">

@@ -475,14 +475,20 @@ def _capability_block(
 # treatment per item, each removing exactly that item. `scripts/prune.py`
 # names the family with this prefix; the summary reads it as leave-one-out.
 PRUNING_FAMILY_PREFIX = "prune-"
+# A treatment that removes several skills at once is judged as one item.
+GROUP_ITEM_PREFIX = "skills:"
 
 
 def removed_item(control: dict[str, Any], treatment: dict[str, Any]) -> str | None:
-    """The single item a treatment removes relative to its control, or None.
+    """The item a treatment removes relative to its control, or None.
 
-    Today an item is a skill (``skills_disabled``). Anything else — two skills
-    at once, a different prompt — is not a leave-one-out arm and gets no
-    pruning verdict, rather than a verdict about the wrong thing.
+    An item is one skill (``skill:<name>``) or, for a group ablation
+    (ADR-0085), a set of skills removed together (``skills:<a>,<b>``) — the
+    cheap first cut through the never-opened set, which also catches two
+    redundant skills that leave-one-out cannot see (removing either alone
+    changes nothing; removing both does). Anything that changes more than the
+    removed skills — a re-added skill, a different prompt — gets no verdict,
+    rather than a verdict about the wrong thing.
     """
     if {k: v for k, v in control.items() if k != "skills_disabled"} != {
         k: v for k, v in treatment.items() if k != "skills_disabled"
@@ -494,9 +500,18 @@ def removed_item(control: dict[str, Any], treatment: dict[str, Any]) -> str | No
     added = set(control.get("skills_disabled") or []) - set(
         treatment.get("skills_disabled") or []
     )
-    if len(removed) != 1 or added:
+    if not removed or added:
         return None
-    return f"skill:{removed.pop()}"
+    if len(removed) == 1:
+        return f"skill:{removed.pop()}"
+    return GROUP_ITEM_PREFIX + ",".join(sorted(removed))
+
+
+def removed_skills(item: str) -> list[str]:
+    """The skill names a pruning item stands for."""
+    if item.startswith(GROUP_ITEM_PREFIX):
+        return item.removeprefix(GROUP_ITEM_PREFIX).split(",")
+    return [item.removeprefix("skill:")]
 
 
 def _pruning_block(
@@ -523,8 +538,14 @@ def _pruning_block(
             control_metrics=case_metrics.get(control_label, {}),
             treatment_metrics=case_metrics.get(condition.label, {}),
         )
-        verdicts.append({"arm": condition.label, **verdict.as_dict()})
-    order = {"keep": 0, "inconclusive": 1, "removable": 2}
+        verdicts.append(
+            {
+                "arm": condition.label,
+                **verdict.as_dict(),
+                "removed": removed_skills(item),
+            }
+        )
+    order = {"keep": 0, "inconclusive": 1, "no_signal": 2, "removable": 3}
     return sorted(verdicts, key=lambda v: (order.get(v["decision"], 9), v["item"]))
 
 
@@ -993,6 +1014,53 @@ class ExperimentService:
                 else None
             ),
         }
+
+    def pruning_overview(self) -> list[dict[str, Any]]:
+        """Every pruning experiment's verdicts, with the model and prompt it held.
+
+        The harness-improvement worklist for skills (ADR-0085): what each
+        ablation says can go, for which model and under which prompt. A verdict
+        is only ever about that model on those cases, so both travel with it.
+        Newest first; an experiment with no verdict yet is listed with none.
+        """
+        # Local: experiment_audit_service imports this module.
+        from harness_lab_app.experiment_audit_service import TERMINAL_STATES
+
+        rows: list[dict[str, Any]] = []
+        for experiment in self.list_experiments():
+            if not str(experiment.family_id or "").startswith(PRUNING_FAMILY_PREFIX):
+                continue
+            runs = self.runs(experiment.experiment_id)
+            control = next(
+                (
+                    c
+                    for c in self.conditions(experiment.experiment_id)
+                    if c.role == ConditionRole.control
+                ),
+                None,
+            )
+            config = (
+                self.session.get(RunConfig, runs[0].run_config_id) if runs else None
+            )
+            summary = self.summarize(experiment.experiment_id) if runs else {}
+            rows.append(
+                {
+                    "experiment_id": experiment.experiment_id,
+                    "created_at": experiment.created_at,
+                    "case_ids": list(experiment.case_ids),
+                    "repetitions": experiment.repetitions,
+                    "model": getattr(config, "executor_model", None),
+                    "harness": getattr(config, "harness", None),
+                    "prompt": (control.overrides or {}).get("prompt_variant")
+                    if control is not None
+                    else None,
+                    "runs": len(runs),
+                    "finished": bool(runs)
+                    and all(run.state in TERMINAL_STATES for run in runs),
+                    "verdicts": summary.get("pruning") or [],
+                }
+            )
+        return rows
 
     def try_complete(self, experiment_id: str) -> Experiment | None:
         """Mark a running experiment complete once every run has stopped.
