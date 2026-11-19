@@ -84,7 +84,7 @@ setup-hooks:
 	@if [ ! -d .venv ]; then make install; fi
 	@echo "📦 Syncing dev dependencies required for hooks..."
 	@uv sync --group dev
-	@. $(VENV_DIR)/bin/activate && pre-commit install --hook-type pre-commit --hook-type commit-msg
+	@. $(VENV_DIR)/bin/activate && pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push
 	@echo "✅ Hooks installed!"
 
 # =============================================================================
@@ -141,22 +141,25 @@ fix-force:
 # SYSTEM TESTING
 # =============================================================================
 
-# Run all tests with coverage
+# Run all tests with coverage; fail on test/collection errors without editing code.
 test:
 	@echo "🧪 Running tests with coverage..."
 	@if [ ! -d .venv ]; then make install; fi
-	@echo "🎨 Running format before tests..."
-	@make format
-	@echo "🔧 Running fix before tests..."
-	@make fix
-	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ --cov=src --cov-report=html --cov-report=term-missing || echo "⚠️  No tests found to run"
+	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ --cov=src --cov-report=html --cov-report=term-missing
 	@echo "✅ Tests completed! See report in htmlcov/index.html"
 
 # Run specific tests
 test-unit:
 	@echo "🧪 Running unit tests..."
 	@if [ ! -d .venv ]; then make install; fi
-	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ -v
+	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ -m "not integration" -v
+
+# Deterministic integration tests; live Docker/model smoke checks stay separate.
+.PHONY: test-integration
+test-integration:
+	@echo "🧪 Running integration tests..."
+	@if [ ! -d .venv ]; then make install; fi
+	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ -m integration -v
 
 # =============================================================================
 # OPENCODE RUNTIME (self-hosted / cloud, configured via .env)
@@ -1002,6 +1005,7 @@ help:
 	@echo "Testing:"
 	@echo "  make test                 Run all tests with coverage"
 	@echo "  make test-unit            Run unit tests only"
+	@echo "  make test-integration     Run marked integration tests"
 	@echo ""
 	@echo "Application Execution (Local):"
 	@echo "  make app-up              Start the local web app (api + celery worker + redis + frontend)"
