@@ -135,6 +135,27 @@ def _hashable(value: Any) -> Any:
     return value
 
 
+def _one_staged_skill_swapped(conditions: list[dict[str, Any]]) -> bool:
+    """Is this a version swap of one skill — v1 in one arm, v2 in the other?
+
+    Every arm adds exactly one staged skill and asks for that same skill, and
+    the skill differs between arms. That is one intervention (which version of
+    the skill under test), the design ADR-0092's v1-vs-v2 builds; reading it as
+    "skills_extra and skills_invoke both vary" would warn on the right design.
+    Narrow on purpose: any arm adding more than one skill, or not asking for
+    the one it adds, is not a swap and is judged by the other rules.
+    """
+    seen: set[str] = set()
+    for condition in conditions:
+        overrides = condition.get("overrides", {}) or {}
+        extra = [str(item) for item in overrides.get("skills_extra") or []]
+        invoke = [str(item) for item in overrides.get("skills_invoke") or []]
+        if len(extra) != 1 or extra != invoke:
+            return False
+        seen.add(extra[0])
+    return len(seen) == len(conditions) > 1
+
+
 def _skills_move_together(conditions: list[dict[str, Any]]) -> bool:
     """Is "stage the skill" and "ask for it" one intervention here, or two?
 
@@ -165,6 +186,44 @@ def _skills_move_together(conditions: list[dict[str, Any]]) -> bool:
         for extra_b, invoke_b in pairs[index + 1 :]:
             forward = extra_a <= extra_b and invoke_a <= invoke_b
             backward = extra_b <= extra_a and invoke_b <= invoke_a
+            if not (forward or backward):
+                return False
+    return True
+
+
+def _governed_skills_enabled_and_invoked(conditions: list[dict[str, Any]]) -> bool:
+    """Is "turn a governed skill back on" and "ask for it" one intervention here?
+
+    The governed-catalog twin of :func:`_skills_move_together`. Trialling a
+    catalog skill on top of a profile (ADR-0089) runs the profile as the
+    control and, as the treatment, the same profile with that skill removed
+    from ``skills_disabled`` *and* named in ``skills_invoke``: two fields, one
+    lever. They are one intervention when every pair of arms differs by
+    exactly that — the skills one arm re-enables are the skills it asks for,
+    and nothing else moves in either set. A treatment that re-enables X but
+    asks for Y, or re-enables X without asking, is genuinely two factors.
+    """
+    arms = []
+    for condition in conditions:
+        overrides = condition.get("overrides", {}) or {}
+        arms.append(
+            (
+                {str(item) for item in overrides.get("skills_disabled") or []},
+                {str(item) for item in overrides.get("skills_invoke") or []},
+            )
+        )
+    for index, (disabled_a, invoke_a) in enumerate(arms):
+        for disabled_b, invoke_b in arms[index + 1 :]:
+            forward = (
+                disabled_b <= disabled_a
+                and invoke_a <= invoke_b
+                and disabled_a - disabled_b == invoke_b - invoke_a
+            )
+            backward = (
+                disabled_a <= disabled_b
+                and invoke_b <= invoke_a
+                and disabled_b - disabled_a == invoke_a - invoke_b
+            )
             if not (forward or backward):
                 return False
     return True
@@ -298,11 +357,20 @@ def validate_design(
                 "These conditions are identical on every harness axis, so there is "
                 "nothing to attribute a difference to."
             )
-        if {"skills_extra", "skills_invoke"} <= harness_axes and _skills_move_together(
-            conditions
+        if {"skills_extra", "skills_invoke"} <= harness_axes and (
+            _skills_move_together(conditions) or _one_staged_skill_swapped(conditions)
         ):
             # One intervention wearing two field names (see above).
             harness_axes = (harness_axes - {"skills_extra", "skills_invoke"}) | {
+                "skills_under_test"
+            }
+        elif (
+            {"skills_disabled", "skills_invoke"} <= harness_axes
+            and "skills_extra" not in harness_axes
+            and _governed_skills_enabled_and_invoked(conditions)
+        ):
+            # The same, for a catalog skill turned back on (see above).
+            harness_axes = (harness_axes - {"skills_disabled", "skills_invoke"}) | {
                 "skills_under_test"
             }
         # A bare arm is one axis, not four (ADR-0049). It has no prompt family
