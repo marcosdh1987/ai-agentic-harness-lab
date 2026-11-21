@@ -207,6 +207,16 @@ export type ValidationRecord = {
     time_minutes?: number | null;
     // "subscription_quota": a plan's quota, no per-token price (ADR-0094).
     cost_source?: string | null;
+    // A subscription run's tokens at the provider's API list price. Beside
+    // cost_usd, never in it: the real cost of a plan's quota stays unknown.
+    estimated_cost_usd?: number | null;
+    estimate_basis?: {
+      kind: "api_list_price";
+      model: string;
+      source: string;
+      as_of: string;
+      context: "short";
+    } | null;
     billing_mode?: string | null;
     detected_model?: string | null;
   };
@@ -2023,12 +2033,25 @@ export type NativeConnectState = {
     | "starting"
     | "waiting"
     | "connected"
+    | "expired"
     | "running"
     | "ok"
     | "failed";
+  /** Why a login failed: the provider refused it, the lab ran out of time,
+   * the network failed, or anything else. */
+  reason?: "rejected" | "timeout" | "connection" | "error";
+  /** The login attempt this record belongs to (one at a time). */
+  attempt?: string;
   url?: string;
   code?: string;
+  /** Epoch seconds the code was requested (before the CLI asked for it). */
+  issued_at?: number;
+  /** Epoch seconds the provider's code expires. */
   expires_at?: number;
+  /** The server's clock when it answered: the countdown's reference. */
+  server_time?: number;
+  /** Expired, but the worker may still report an approval from the last seconds. */
+  settling?: boolean;
   error?: string;
   answer?: string;
   model?: string;
