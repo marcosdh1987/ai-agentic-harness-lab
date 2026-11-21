@@ -18,6 +18,7 @@ protocol = 1
 governance_paths = [
     ".github/skills",
     ".github/skills-external",
+    ".github/skill-profiles.toml",
     ".github/agents",
     ".github/architecture.md",
     ".github/standards.md",
@@ -92,6 +93,15 @@ adapter_file = "AGENTS.md"
 adapter_template = "agents.md.j2"
 native_agents_dir = ".codex/agents"  # Codex subagent TOML files
 agent_format = "codex"               # emits .codex/agents/<name>.toml
+
+[[tool]]
+id = "gemini"
+display_name = "Gemini CLI"
+native_skills_dir = ".gemini/skills"  # Gemini CLI workspace skills (activate_skill)
+link_strategy = "symlink"            # gemini-cli 0.70 follows symlinked skill dirs
+needs_manifest = false
+adapter_file = "GEMINI.md"           # loaded from the cwd and every ancestor
+adapter_template = "gemini-cli.md.j2"
 
 [[tool]]
 id = "copilot"

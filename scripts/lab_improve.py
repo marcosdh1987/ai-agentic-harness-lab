@@ -49,12 +49,12 @@ from create_run import DATA_DIR, _load_env
 TEMPLATE_REPO = (
     os.environ.get("HARNESS_LAB_TEMPLATE_REPOSITORY")
     or os.environ.get("IMPROVE_REPO_TEMPLATE")
-    or "marcosdh1987/ml-python-base"
+    or "xmartlabs/sdlc-ml-python-template"
 )
 HARNESS_REPO = (
     os.environ.get("HARNESS_LAB_GUIDE_REPOSITORY")
     or os.environ.get("IMPROVE_REPO_HARNESS")
-    or "marcosdh1987/harness-engineering-guide"
+    or "xmartlabs/sdlc-harness-engineering-guide"
 )
 ISSUE_LABEL = os.environ.get("IMPROVE_LABEL", "lab-improvement")
 

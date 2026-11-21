@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import harness_lab_app.validation as validation
 from harness_lab_app.validation import (
     DEFAULT_VALIDATION_DEADLINE_SECONDS,
+    VALIDATION_DEPS_DIR,
     _portable_timeout,
     build_validation_spec,
     collect_cost,
@@ -364,7 +365,7 @@ def test_billed_tokens_are_absent_when_nothing_is_known(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# A target's gate runs inside the workspace (ADR-0063)
+# A target's gate runs inside the workspace (ADR-0062)
 # --------------------------------------------------------------------------
 
 
@@ -411,7 +412,7 @@ def test_a_case_command_is_never_prefixed(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# A check the environment failed is not a verdict (ADR-0063)
+# A check the environment failed is not a verdict (ADR-0062)
 # --------------------------------------------------------------------------
 
 
@@ -521,3 +522,213 @@ def test_the_judge_reads_why_a_check_did_not_measure():
     text = describe_objective_for_judge(objective)
     assert "[INCONCLUSIVE: command not found]" in text
     assert "settled nothing (command not found)" in text
+
+
+# --- validation dependencies (ADR-0071) -----------------------------------------
+
+
+def test_a_case_that_declares_validation_requirements_gets_a_setup_step(
+    tmp_path, monkeypatch
+):
+    """eda-ml-iris (2026-10-23): ten runs failed `pytest` at collection because
+    the clean, offline validation container had no pandas. The case names its
+    graders' dependencies; the lab installs them, with network, before the
+    offline checks run."""
+    monkeypatch.setattr(
+        "harness_lab_app.validation.get_settings",
+        lambda: SimpleNamespace(data_runs_dir=tmp_path),
+    )
+    case = _case(
+        validation_commands=["pytest {workspace}/test_x.py -q"],
+        metadata_json={
+            "validation_requirements": ["pandas==2.2.3", "scikit-learn==1.5.2"]
+        },
+    )
+    spec = build_validation_spec(case, "iris-K-001")
+    setup = spec["setup"]
+    assert len(setup) == 1
+    script = setup[0][-1]
+    assert "uv pip install" in script and "--target" in script
+    assert "python -m pip install" in script  # fallback where there is no uv
+    assert "pandas==2.2.3 scikit-learn==1.5.2;" in script
+    deps = "data/runs/iris-K-001/validation-deps"
+    assert deps in script
+    # Every offline check sees the installed packages.
+    assert all(
+        f'PYTHONPATH="$PWD/{deps}' in command[-1] for command in spec["commands"]
+    )
+
+
+def test_a_case_without_validation_requirements_has_no_setup_step(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "harness_lab_app.validation.get_settings",
+        lambda: SimpleNamespace(data_runs_dir=tmp_path),
+    )
+    spec = build_validation_spec(
+        _case(validation_commands=["pytest {workspace}/t.py -q"]), "r-K-001"
+    )
+    assert spec["setup"] == []
+    assert "PYTHONPATH" not in spec["commands"][0][-1]
+
+
+def test_an_unsafe_requirement_is_refused_not_shell_injected(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "harness_lab_app.validation.get_settings",
+        lambda: SimpleNamespace(data_runs_dir=tmp_path),
+    )
+    case = _case(
+        validation_commands=["pytest {workspace}/t.py -q"],
+        metadata_json={"validation_requirements": ["pandas; rm -rf /", "numpy==2.1.3"]},
+    )
+    script = build_validation_spec(case, "r-K-001")["setup"][0][-1]
+    assert "rm -rf /" not in script and "pandas" not in script
+    assert " numpy==2.1.3;" in script
+
+
+def test_a_missing_third_party_module_is_inconclusive():
+    """No module named 'joblib' in the grader's environment says nothing about
+    the agent's code."""
+    output = (
+        "ImportError while importing test module 'test_pipeline_iris_eda.py'.\n"
+        "E   ModuleNotFoundError: No module named 'joblib'\n"
+        "!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!"
+    )
+    assert validation.classify_inconclusive(2, output) == "missing_dependency"
+
+
+def test_a_missing_module_the_agent_should_have_written_is_still_its_failure():
+    """clinic.py not written is the agent's failure — the whole point of the check."""
+    output = "E   ModuleNotFoundError: No module named 'clinic'\n"
+    assert validation.classify_inconclusive(1, output, own_modules={"clinic"}) is None
+
+
+def test_a_module_from_the_workspace_is_never_called_a_missing_dependency(tmp_path):
+    (tmp_path / "ml_pipeline.py").write_text("x = 1\n")
+    output = "E   ModuleNotFoundError: No module named 'ml_pipeline'\n"
+    own = validation.workspace_modules(tmp_path)
+    assert "ml_pipeline" in own
+    assert validation.classify_inconclusive(1, output, own_modules=own) is None
+
+
+def test_a_measured_zero_cost_is_kept_with_where_it_came_from(tmp_path):
+    """A self-hosted run costs $0 — a fact, distinguishable from a gap."""
+    from harness_lab_app.validation import collect_cost
+
+    (tmp_path / "usage.json").write_text(
+        json.dumps(
+            {
+                "input_tokens": 1000,
+                "output_tokens": 300,
+                "reasoning_tokens": 120,
+                "cost_usd": 0.0,
+                "cost_source": "self_hosted",
+                "time_minutes": 12.5,
+                "time_source": "step_clock",
+                "model_minutes": 9.0,
+                "usage_source": "opencode_db",
+            }
+        )
+    )
+
+    cost = collect_cost(tmp_path)
+
+    assert cost["cost_usd"] == 0.0
+    assert cost["cost_source"] == "self_hosted"
+    assert cost["time_source"] == "step_clock"
+    assert cost["model_minutes"] == 9.0
+    assert cost["reasoning_tokens"] == 120
+
+
+def test_a_check_with_braces_of_its_own_renders_and_does_not_crash(
+    tmp_path, monkeypatch
+):
+    """`str.format` read `{'a': 1}` in an inline check as a placeholder.
+
+    The case editor accepted the command, and validation then died on
+    `KeyError: "'a'"` for every run of the case. Only `{workspace}` and
+    `{run_id}` are the lab's; every other brace is the check's own code.
+    """
+    monkeypatch.setattr(
+        "harness_lab_app.validation.get_settings",
+        lambda: SimpleNamespace(data_runs_dir=tmp_path),
+    )
+    case = _case(
+        validation_commands=[
+            "python3 -c \"import sys; d={'a': 1}; "
+            "sys.exit(0 if d['a'] == 1 and '{run_id}' else 1)\" {workspace}",
+            "awk '{print $1}' {workspace}/out.txt",
+        ]
+    )
+    spec = build_validation_spec(case, "r1")
+    rendered = [argv[-1] for argv in spec["commands"]]
+    assert "d={'a': 1}" in rendered[0]
+    assert "'r1'" in rendered[0] and rendered[0].endswith("workspace/r1")
+    assert rendered[1] == "awk '{print $1}' workspace/r1/out.txt"
+
+
+def test_render_command_fills_only_the_labs_placeholders():
+    from harness_lab_app.validation import render_command
+
+    assert render_command("{workspace}/{run_id} {x} {}", "ws", "r") == "ws/r {x} {}"
+    # Doubled braces were the escape under `str.format`; they still mean one.
+    assert render_command("awk '{{print}}' {workspace}", "ws", "r") == (
+        "awk '{print}' ws"
+    )
+
+
+def test_the_browser_screens_requirements_with_the_setup_steps_own_rule():
+    """The forms flag uninstallable lines while typing; the server refuses them on
+    save. Two copies of one rule drift, so the browser's is held to this one."""
+    import re
+
+    from harness_lab_app.validation import _REQUIREMENT_RE
+
+    source = (
+        Path(__file__).resolve().parents[2] / "frontend" / "src" / "caseLabels.ts"
+    ).read_text()
+    found = re.search(r"const INSTALLABLE_REQUIREMENT =\s*/(.+)/;", source)
+    assert found, "caseLabels.ts must define INSTALLABLE_REQUIREMENT"
+    assert found.group(1) == _REQUIREMENT_RE.pattern
+
+
+def test_a_check_that_cds_into_the_workspace_still_imports_the_installed_deps(
+    tmp_path, monkeypatch
+):
+    """The deps path is resolved from the lab root, before the check's own `cd`.
+
+    The 3D graders run `cd {workspace} && python …/grade.py`, and the setup step
+    installs into `data/runs/<id>/validation-deps` relative to the lab root. The
+    check is executed for real here, from the lab root as the runner does, so a
+    PYTHONPATH that resolved inside the workspace would fail the import.
+    """
+    import subprocess
+    import sys
+
+    runs = tmp_path / "data" / "runs"
+    monkeypatch.setattr(
+        "harness_lab_app.validation.get_settings",
+        lambda: SimpleNamespace(data_runs_dir=runs),
+    )
+    run_id = "chess3d-v1-K-001"
+    (runs / run_id / "workspace").mkdir(parents=True)
+    deps = runs / run_id / VALIDATION_DEPS_DIR
+    deps.mkdir()
+    (deps / "lab_marker_dep.py").write_text("VALUE = 41\n")
+    case = _case(
+        validation_commands=[
+            'cd {workspace} && python -c "import lab_marker_dep; print(lab_marker_dep.VALUE)"'
+        ],
+        metadata_json={"validation_requirements": ["lab-marker-dep==1.0"]},
+    )
+    spec = build_validation_spec(case, run_id)
+    # The setup installs into the very directory the check puts on its path.
+    assert f"data/runs/{run_id}/{VALIDATION_DEPS_DIR}" in spec["setup"][0][-1]
+    argv = spec["commands"][0]
+    env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin"}
+    done = subprocess.run(
+        argv, cwd=tmp_path, env=env, capture_output=True, text=True, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "41"

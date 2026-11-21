@@ -1,27 +1,24 @@
 import { useEffect, useState } from "react";
 import type { ComponentType } from "react";
 import type { ReactNode } from "react";
-import { NavLink } from "react-router-dom";
+import { NavLink, useLocation } from "react-router-dom";
 
+import { defineMessages, useMessages } from "../i18n";
 import type { IconProps } from "./icons";
-import { LabMark } from "./LabMark";
+import { LanguageToggle } from "./LanguageToggle";
+import { XmartlabsLogo } from "./XmartlabsLogo";
 import {
-  IconBook,
   IconChevronLeft,
   IconChevronRight,
-  IconCompare,
+  IconCpu,
   IconFiles,
   IconFlask,
   IconHome,
-  IconLightbulb,
   IconList,
-  IconPlus,
-  IconPulse,
   IconPuzzle,
   IconRepo,
-  IconSearch,
   IconSettings,
-  IconTrophy
+  IconTrendUp
 } from "./icons";
 
 type ShellProps = {
@@ -29,68 +26,155 @@ type ShellProps = {
   /** False in open mode: no password is set, so the UI warns instead of offering sign-out. */
   authEnabled: boolean;
   onLogout: () => void;
+  /** Runs queued or running, from the list App already polls. */
+  activeRuns?: number;
 };
 
 const COLLAPSED_STORAGE_KEY = "ahl.sidebar.collapsed";
 
+const MESSAGES = defineMessages({
+  en: {
+    groups: {
+      tryOut: "Try",
+      lab: "Lab"
+    },
+    nav: {
+      home: "Home",
+      models: "Models and harness",
+      skills: "Skills",
+      benchmarks: "Benchmarks",
+      repo: "Your repo",
+      results: "Results",
+      metrics: "Metrics",
+      runs: "Runs",
+      system: "System"
+    },
+    runsActive: (n: number) => `Runs · ${n} active`,
+    runsNone: "Runs · none active",
+    expandSidebar: "Expand sidebar",
+    collapseSidebar: "Collapse sidebar",
+    signOut: "Sign out",
+    authOff: "Authentication is off — anyone who can reach this address can drive the lab. Run",
+    authOffTail: "on the server to protect it."
+  },
+  es: {
+    groups: {
+      tryOut: "Probar",
+      lab: "Lab"
+    },
+    nav: {
+      home: "Inicio",
+      models: "Modelos y arnés",
+      skills: "Skills",
+      benchmarks: "Benchmarks",
+      repo: "Tu repo",
+      results: "Resultados",
+      metrics: "Métricas",
+      runs: "Corridas",
+      system: "Sistema"
+    },
+    runsActive: (n: number) => `Corridas · ${n} activas`,
+    runsNone: "Corridas · ninguna activa",
+    expandSidebar: "Expandir la barra lateral",
+    collapseSidebar: "Contraer la barra lateral",
+    signOut: "Cerrar sesión",
+    authOff:
+      "La autenticación está desactivada: cualquiera que llegue a esta dirección puede usar el lab. Corré",
+    authOffTail: "en el servidor para protegerlo."
+  }
+});
+
+type NavKey = keyof (typeof MESSAGES)["en"]["nav"];
+type GroupKey = keyof (typeof MESSAGES)["en"]["groups"];
+
 type NavItem = {
   to: string;
-  label: string;
+  label: NavKey;
   icon: ComponentType<IconProps>;
   end?: boolean;
+  /** Screens that belong to this entry: it stays highlighted inside them. */
+  owns?: string[];
 };
 
-type NavGroup = { title: string; items: NavItem[] };
+type NavGroup = { title: GroupKey | null; items: NavItem[] };
 
 /**
- * Navigation grouped by what a person came to do, not by which table backs it.
+ * Navigation by capability (ADR-0090): seven entries instead of twenty.
  *
- * "Evaluate" is where you go with a question, "Evidence" is what the lab knows,
- * "Advanced" is the operational machinery underneath. Nothing was removed in
- * the regrouping — Runs, Compare and the leaderboard all still exist, they just
- * stopped competing with the workflows for the top of the page.
+ * Each entry opens a hub — a board of cards saying what the capability does,
+ * whether it is built, and where it lives. Every screen the old navigation
+ * listed still exists at the same route; it is now reached from its hub, and
+ * the hub's entry stays highlighted while you are inside it (`owns`).
+ *
+ * The routes the backend emits (attention feed) are untouched, which a contract
+ * test checks (tests/harness_lab_app/test_attention.py).
  */
 const NAV_GROUPS: NavGroup[] = [
   {
-    title: "",
-    items: [{ to: "/", label: "Home", icon: IconHome, end: true }]
+    title: null,
+    items: [{ to: "/", label: "home", icon: IconHome, end: true }]
   },
   {
-    title: "Evaluate",
+    // Each entry opens its guided flow (ADR-0093); the screens it drives keep
+    // their routes and highlight the entry while you are inside them.
+    title: "tryOut",
     items: [
-      { to: "/evaluate/new", label: "New evaluation", icon: IconPlus },
-      { to: "/evaluate/subject", label: "Validate your tool", icon: IconPuzzle },
-      { to: "/evaluate/audit", label: "Audit a repository", icon: IconSearch },
-      { to: "/evaluate/experiments", label: "Experiments", icon: IconFlask }
+      {
+        // Models and harness are one flow since 2026-11-20 (ADR-0093).
+        to: "/flows/models",
+        label: "models",
+        icon: IconCpu,
+        owns: [
+          "/models",
+          "/local/",
+          "/evaluate/compare-models",
+          "/harness",
+          "/evaluate/harness-by-model",
+          "/evaluate/new"
+        ]
+      },
+      {
+        // Trying and improving a skill are one flow too.
+        to: "/flows/skills",
+        label: "skills",
+        icon: IconPuzzle,
+        owns: ["/evidence/skills"]
+      },
+      {
+        to: "/benchmarks",
+        label: "benchmarks",
+        icon: IconFiles,
+        owns: ["/evidence/cases"]
+      },
+      {
+        to: "/your-repo",
+        label: "repo",
+        icon: IconRepo,
+        owns: ["/evaluate/audit", "/evaluate/subject", "/evidence/repositories"]
+      }
     ]
   },
   {
-    title: "Evidence",
+    title: "lab",
     items: [
-      { to: "/evidence/findings", label: "Findings", icon: IconSearch },
-      { to: "/evidence/cases", label: "Cases", icon: IconFiles },
-      { to: "/evidence/repositories", label: "Repositories", icon: IconRepo },
-      { to: "/evidence/skills", label: "Skills", icon: IconPuzzle }
-    ]
-  },
-  {
-    title: "Advanced",
-    items: [
-      { to: "/advanced/runs", label: "Runs", icon: IconList },
-      { to: "/advanced/compare", label: "Compare", icon: IconCompare },
-      { to: "/advanced/benchmarks", label: "Benchmarks", icon: IconTrophy },
-      { to: "/advanced/improvements", label: "Improvements", icon: IconLightbulb }
-    ]
-  },
-  {
-    title: "System",
-    items: [
-      { to: "/system/health", label: "Health", icon: IconPulse },
-      { to: "/system/guide", label: "Guide", icon: IconBook },
-      { to: "/system/settings", label: "Settings", icon: IconSettings }
+      { to: "/flows/metrics", label: "metrics", icon: IconTrendUp, owns: ["/advanced/compare", "/advanced/improvements", "/evidence/findings"] },
+      { to: "/advanced/runs", label: "runs", icon: IconList, owns: ["/advanced/runs"] },
+      {
+        to: "/results",
+        label: "results",
+        icon: IconFlask,
+        owns: ["/evaluate/experiments", "/advanced/benchmarks"]
+      },
+      { to: "/system", label: "system", icon: IconSettings, owns: ["/system/"] }
     ]
   }
 ];
+
+function ownsPath(item: NavItem, pathname: string): boolean {
+  return (item.owns ?? []).some((prefix) =>
+    prefix.endsWith("/") ? pathname.startsWith(prefix) : pathname === prefix || pathname.startsWith(`${prefix}/`)
+  );
+}
 
 function getStoredCollapsed(): boolean {
   if (typeof window === "undefined") {
@@ -99,8 +183,10 @@ function getStoredCollapsed(): boolean {
   return window.localStorage.getItem(COLLAPSED_STORAGE_KEY) === "true";
 }
 
-export function Shell({ children, authEnabled, onLogout }: ShellProps) {
+export function Shell({ children, authEnabled, onLogout, activeRuns = 0 }: ShellProps) {
   const [collapsed, setCollapsed] = useState(getStoredCollapsed);
+  const { pathname } = useLocation();
+  const m = useMessages(MESSAGES);
 
   useEffect(() => {
     window.localStorage.setItem(COLLAPSED_STORAGE_KEY, collapsed ? "true" : "false");
@@ -118,24 +204,24 @@ export function Shell({ children, authEnabled, onLogout }: ShellProps) {
             {collapsed ? null : (
               <div className="brand-heading">
                 <div className="brand-logo-container">
-                  <LabMark height={30} variant="icon-only" width={30} />
+                  <XmartlabsLogo width={120} />
                 </div>
                 <div className="brand-meta">
-                  <span className="brand-kicker">Local web app</span>
-                  <strong className="brand-title">Agentic Harness Lab</strong>
+                  <span className="brand-kicker">AI Lab Platform</span>
+                  <strong className="brand-title">Harness Lab</strong>
                 </div>
               </div>
             )}
             <button
               aria-expanded={!collapsed}
-              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-label={collapsed ? m.expandSidebar : m.collapseSidebar}
               className="sidebar-toggle"
               onClick={() => setCollapsed((current) => !current)}
               type="button"
             >
               {collapsed ? (
                 <div className="collapsed-brand-toggle">
-                  <LabMark height={20} variant="icon-only" width={20} />
+                  <XmartlabsLogo height={20} variant="icon-only" width={20} />
                   <span className="collapsed-arrow">
                     <IconChevronRight size={14} />
                   </span>
@@ -145,30 +231,34 @@ export function Shell({ children, authEnabled, onLogout }: ShellProps) {
               )}
             </button>
           </div>
+          {/* The language switch sits with the brand, where it is seen first. */}
+          <div className="brand-lang">
+            <LanguageToggle compact={collapsed} />
+          </div>
         </div>
         <nav className="nav">
           {NAV_GROUPS.map((group) => (
-            <div className="nav-group" key={group.title || "root"}>
+            <div className="nav-group" key={group.title ?? "root"}>
               {group.title && !collapsed ? (
-                <p className="nav-group-title">{group.title}</p>
+                <p className="nav-group-title">{m.groups[group.title]}</p>
               ) : null}
               {group.items.map((item) => {
                 const Icon = item.icon;
                 return (
                   <NavLink
                     className={({ isActive }) =>
-                      isActive ? "nav-item active" : "nav-item"
+                      isActive || ownsPath(item, pathname) ? "nav-item active" : "nav-item"
                     }
                     end={item.end}
                     key={item.to}
-                    title={item.label}
+                    title={m.nav[item.label]}
                     to={item.to}
                   >
                     <span className="nav-item-icon">
                       <Icon size={16} />
                     </span>
                     {collapsed ? null : (
-                      <span className="nav-item-label">{item.label}</span>
+                      <span className="nav-item-label">{m.nav[item.label]}</span>
                     )}
                   </NavLink>
                 );
@@ -179,12 +269,12 @@ export function Shell({ children, authEnabled, onLogout }: ShellProps) {
         {collapsed ? null : (
           <div className="sidebar-foot">
             <div className="sidebar-foot-brand">
-              <span className="sidebar-foot-badge">LOCAL</span>
+              <span className="sidebar-foot-badge">XMARTLABS</span>
               <span className="sidebar-foot-edition">Agentic Harness Lab</span>
             </div>
             {authEnabled ? (
               <button className="button-link" onClick={onLogout} type="button">
-                Sign out
+                {m.signOut}
               </button>
             ) : null}
           </div>
@@ -193,10 +283,19 @@ export function Shell({ children, authEnabled, onLogout }: ShellProps) {
       <main className="workbench">
         {authEnabled ? null : (
           <div className="auth-banner" role="status">
-            Authentication is off — anyone who can reach this address can drive the
-            lab. Run <code>make set-password</code> on the server to protect it.
+            {m.authOff} <code>make set-password</code> {m.authOffTail}
           </div>
         )}
+        {/* Runs are one click away from every flow (ADR-0093). */}
+        <div className="workbench-topbar">
+          <NavLink
+            className={activeRuns > 0 ? "runs-pill runs-pill--live" : "runs-pill"}
+            to="/advanced/runs"
+          >
+            <span aria-hidden="true" className="runs-pill-dot" />
+            {activeRuns > 0 ? m.runsActive(activeRuns) : m.runsNone}
+          </NavLink>
+        </div>
         {children}
       </main>
     </div>

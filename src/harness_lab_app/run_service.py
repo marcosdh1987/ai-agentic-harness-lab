@@ -8,8 +8,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
-from sqlalchemy import desc
-from sqlmodel import Session, select
+from sqlalchemy import (
+    desc,
+    update as sa_update,
+)
+from sqlmodel import Session, col, select
 
 from harness_lab_app.config import get_settings, read_env_file_value
 from harness_lab_app.constants import EXAMPLE_LMSTUDIO_URL, EXAMPLE_OLLAMA_URL
@@ -42,6 +45,8 @@ from harness_lab_app.target_service import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
+    from sqlalchemy import CursorResult
+
 
 # Tokens that mean "no real gateway credential configured yet".
 _PLACEHOLDER_TOKENS = {"", "sk-local-change-me"}
@@ -65,6 +70,18 @@ class RunBatchTooLargeError(ValueError):
 
 class RunContinueError(ValueError):
     """Raised when a run cannot be continued (not terminal, or no workspace)."""
+
+
+class RunRetryError(ValueError):
+    """Raised when a retry cannot run as asked (wrong state, nothing to keep)."""
+
+
+# How a stopped run is run again (ADR-0083). `resume` is the original retry:
+# from step 1 over whatever workspace the attempt left. `scratch` wipes the
+# attempt and runs it as new. `continue` restores the last completed step and
+# runs only the steps after it.
+RETRY_MODES = ("resume", "scratch", "continue")
+RETRYABLE_STATES = frozenset({RunState.failed, RunState.cancelled})
 
 
 # States a run can be continued from: it has stopped, and whatever it built is
@@ -148,6 +165,7 @@ def _batch_size(data: RunBatchCreate, variants: Mapping[str, Sequence[str]]) -> 
         sum(len(names) for names in variants.values())
         * len(data.harnesses)
         * len(data.executor_models)
+        * len(data.executor_efforts)
         * len(data.planner_models)
         * len(data.target_repo_ids)
         * len(data.harness_sources)
@@ -174,6 +192,7 @@ def _expand_batch(
             prompt_variant=prompt_variant,
             harness=harness,
             executor_model=executor_model,
+            executor_effort=executor_effort,
             planner_model=planner_model,
             score_mode=data.score_mode,
             max_steps=data.max_steps,
@@ -190,6 +209,7 @@ def _expand_batch(
         for prompt_variant in variants[case_id]
         for harness in data.harnesses
         for executor_model in data.executor_models
+        for executor_effort in data.executor_efforts
         for planner_model in data.planner_models
         for target_repo_id in data.target_repo_ids
         for harness_source in data.harness_sources
@@ -200,20 +220,22 @@ def _expand_batch(
 def _preflight_key(config: RunConfigCreate) -> tuple:
     """The fields ``RunService.preflight`` actually reads.
 
-    Deduplication key for batch validation. Two configs with the same key
-    cannot get different preflight answers, so the second check is pure cost —
-    and preflight's cost is network round-trips.
+    Deduplication key for batch and experiment-launch validation. Two configs
+    with the same key cannot get different preflight answers, so the second
+    check is pure cost — and preflight's cost is network round-trips.
 
     Kept next to ``preflight`` on purpose: **if preflight starts reading another
-    field, it must be added here**, or a batch will skip a check it should have
-    made. ``planner_model`` and ``case_id`` are absent because preflight does
-    not consult them; including them would only fragment the cache.
+    field, it must be added here**, or a batch or an experiment arm will skip a
+    check it should have made. ``planner_model`` and ``case_id`` are absent
+    because preflight does not consult them; including them would only
+    fragment the cache.
     """
     return (
         config.dry_run,
         config.harness,
         config.score_mode,
         config.executor_model,
+        config.executor_effort,
         tuple(sorted(set(config.skills_disabled))),
         tuple(sorted(set(config.skills_extra))),
         tuple(sorted(set(config.skills_invoke))),
@@ -235,12 +257,14 @@ def _resume_config(config: RunConfig) -> RunConfigCreate:
         harness=config.harness,
         planner_model=config.planner_model,
         executor_model=config.executor_model,
+        executor_effort=config.executor_effort,
         target_repo_id=config.target_repo_id,
         target_ref=config.target_ref,
         harness_source=config.harness_source,
         score_mode=config.score_mode,
         max_steps=config.max_steps,
         resume=True,
+        resume_from_step=config.resume_from_step,
         dry_run=config.dry_run,
         continuation_prompt=config.continuation_prompt,
         skills_disabled=list(config.skills_disabled),
@@ -312,7 +336,7 @@ class RunService:
     def preview_command(self, run_id: str, config: RunConfigCreate) -> list[str]:
         return self.adapter.build_command(run_id, config)
 
-    def _check_runner_image(self) -> None:
+    def _check_runner_image(self, config: RunConfigCreate | None = None) -> None:
         """Refuse a docker-backed run when the runner image is not built yet.
 
         Without this the run is persisted, queued, and dies in the executor
@@ -322,6 +346,12 @@ class RunService:
         answer is cached, so this costs nothing in the common case. Silence
         when no worker replies: that is the worker check's story to tell, and
         guessing here would block runs whenever the broadcast is slow.
+
+        With ``config``, a case that brings its own image (ADR-0078, the 3D
+        cases) is checked too: `make app-up` builds only the shared image, so a
+        stack reset can leave the Godot one missing while everything else is
+        fine (chess3d-v1-K-015, 2026-11-20). A worker that does not report its
+        case images (``case_images_present`` absent) is not second-guessed.
         """
         from harness_lab_app.health_service import worker_facts
 
@@ -334,6 +364,33 @@ class RunService:
                 "the run would fail immediately. Open Health and use "
                 "'Build runner image' — it builds on the worker and takes a "
                 "few minutes."
+            )
+        present = facts.get("case_images_present")
+        if (
+            config is None
+            or not facts.get("docker_ok")
+            or not isinstance(present, list)
+        ):
+            return
+        from harness_lab_app.case_profile import CaseProfileError, runner_image_for
+        from harness_lab_app.models import Case
+
+        case = self.session.exec(
+            select(Case).where(Case.case_id == config.case_id)
+        ).first()
+        if case is None:
+            return
+        try:
+            image = runner_image_for(case)
+        except CaseProfileError:
+            return  # the executor reports a malformed image with the case's name
+        if image and image not in present:
+            raise RunPreflightError(
+                f"Case '{config.case_id}' runs in its own image, {image!r}, which "
+                "is not built on this machine, so the run would fail in its first "
+                "second. Build it once with `make images-3d` (a few minutes; "
+                "`make app-up` builds only the shared runner image), then launch "
+                "again."
             )
 
     def preflight(self, config: RunConfigCreate) -> None:
@@ -348,6 +405,7 @@ class RunService:
         answer is the one ``create_run`` would give.
         """
         self._check_target(config)
+        self._check_effort(config)
         if config.dry_run:
             return
         # A bare arm is bare only because the runner masks the lab's governance
@@ -364,32 +422,32 @@ class RunService:
                 "governance is masked inside the runner container, and a host "
                 "run would see it through the workspace's parent directory."
             )
-        self._check_runner_image()
-        if config.harness in ("codex", "claude"):
-            # These harnesses drive their own CLI with native auth (no gateway
+        self._check_runner_image(config)
+        if config.harness in ("codex", "gemini"):
+            # Subscription-backed CLIs (ADR-0094): the provider's own login,
+            # kept per provider outside the repository, on either lane.
+            self._check_native_session(config)
+            return
+        if config.harness == "claude":
+            # claude drives its own CLI with native auth (no gateway
             # model/token). Host/subprocess mode uses your host login directly.
             # See docs/harness-adapters.md.
             if get_settings().execution_backend == "subprocess":
                 return
-            # Docker mode: the CLI must be baked into the runner image with
-            # credentials supplied via .env. claude is wired for Docker; codex is
-            # host-only for now.
-            if config.harness == "claude":
-                token = read_env_file_value(
-                    "CLAUDE_CODE_OAUTH_TOKEN"
-                ) or read_env_file_value("ANTHROPIC_API_KEY")
-                if token:
-                    return
-                raise RunPreflightError(
-                    "The 'claude' harness in Docker needs credentials in .env: "
-                    "CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`, uses your "
-                    "subscription) or ANTHROPIC_API_KEY. Or run host mode "
-                    "(make app-host)."
-                )
+            # Docker mode: the CLI is baked into the runner image and the
+            # credential comes from .env.
+            token = read_env_file_value(
+                "CLAUDE_CODE_OAUTH_TOKEN"
+            ) or read_env_file_value("ANTHROPIC_API_KEY")
+            if token:
+                self._check_claude_cli_version(config.executor_model)
+                self._check_claude_model_served(config.executor_model)
+                return
             raise RunPreflightError(
-                "The 'codex' harness runs the host CLI — start host mode "
-                "(make app-host) or set HARNESS_LAB_EXECUTION_BACKEND=subprocess. "
-                "(codex-in-Docker is not wired yet.)"
+                "The 'claude' harness in Docker needs credentials in .env: "
+                "CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`, uses your "
+                "subscription) or ANTHROPIC_API_KEY. Or run host mode "
+                "(make app-host)."
             )
         if config.score_mode != "none" and not (config.executor_model or "").strip():
             raise RunPreflightError(
@@ -686,6 +744,203 @@ class RunService:
                 "Ollama, and retry."
             )
 
+    def _check_effort(self, config: RunConfigCreate) -> None:
+        """Refuse an effort level the run cannot honour (ADR-0081).
+
+        Checked before every early return, dry runs included: an effort the CLI
+        never receives would still be recorded and hashed as part of the arm,
+        so the run would claim a condition it did not run under.
+        """
+        from harness_lab_app.native_models import effort_levels
+
+        effort = config.executor_effort
+        if not effort:
+            return
+        if config.harness != "claude":
+            raise RunPreflightError(
+                f"Reasoning effort is a Claude Code setting (--effort); the "
+                f"'{config.harness}' harness has no way to pass it. Clear the "
+                "effort or switch the harness to claude."
+            )
+        model = (config.executor_model or "").strip()
+        if not model or model.startswith(("gateway/", "lmstudio/", "ollama/")):
+            raise RunPreflightError(
+                "Reasoning effort needs a native Claude model: without one the "
+                "CLI runs its own default model, and the effort would describe a "
+                "model nobody chose. Pick a Claude model or clear the effort."
+            )
+        levels = effort_levels("claude", model)
+        if levels is not None and effort not in levels:
+            raise RunPreflightError(
+                f"'{model}' does not accept effort '{effort}'"
+                + (
+                    f" (it accepts: {', '.join(levels)})."
+                    if levels
+                    else " — it has no effort control. Clear the effort."
+                )
+            )
+
+    def _check_native_session(self, config: RunConfigCreate) -> None:
+        """Refuse a codex/gemini run that cannot reach its subscription (ADR-0094).
+
+        Checks, in order, what would otherwise fail inside the run: a model id
+        meant for the gateway (the CLI would silently fall back to its own
+        default — a run filed under a model nobody chose), the CLI missing or
+        older than the version this integration was verified against, and no
+        login in the provider's session directory. Expiry is not judged here:
+        only the CLI knows whether its refresh token still works, and it says
+        so in the run's first step.
+        """
+        import shutil
+
+        from harness_lab_app.health_service import worker_facts
+        from harness_lab_app.native_auth import (
+            credential_file,
+            session_dir,
+            session_status,
+        )
+        from harness_lab_app.native_models import native_cli_too_old
+
+        harness = config.harness
+        model = (config.executor_model or "").strip()
+        if model.startswith(("gateway/", "lmstudio/", "ollama/")):
+            raise RunPreflightError(
+                f"'{model}' is a gateway/self-hosted model id; the '{harness}' "
+                "harness runs its own CLI on your subscription and would ignore "
+                "it. Pick one of its native models, or leave the model empty "
+                "for the CLI default."
+            )
+        login = "make auth-codex" if harness == "codex" else "make auth-gemini"
+        if get_settings().execution_backend == "subprocess":
+            if shutil.which(harness) is None:
+                raise RunPreflightError(
+                    f"The '{harness}' CLI is not on the worker's PATH. Install it "
+                    "(see docs/runbook-claude-codex.md) and restart host mode."
+                )
+        else:
+            facts = worker_facts()
+            from harness_lab_app.native_models import CLI_VERSION_LABELS
+
+            version = ""
+            if facts:
+                version = str((facts.get("cli_versions") or {}).get(harness) or "")
+            if facts and facts.get("runner_image_present") and not version:
+                raise RunPreflightError(
+                    f"The runner image has no {harness} CLI (no "
+                    f"'{CLI_VERSION_LABELS[harness]}' label). Rebuild it: Health → "
+                    "Build runner image, or `docker compose build runner`."
+                )
+            required = native_cli_too_old(harness, version)
+            if required:
+                raise RunPreflightError(
+                    f"The runner image has {harness} {version}; the lab's "
+                    f"integration was verified on {required} or newer. Rebuild "
+                    "the runner image with the version Dockerfile.runner pins."
+                )
+        status = session_status(harness)
+        state = status["state"]
+        if state == "api_key":
+            raise RunPreflightError(
+                f"The {harness} session in {session_dir(harness)} holds an API "
+                "key, not a ChatGPT sign-in: runs would bill per token. Run "
+                f"`{login}` to sign in with your plan instead."
+            )
+        if state != "connected":
+            raise RunPreflightError(
+                f"No {harness} subscription login in "
+                f"{credential_file(harness)} ({state}). Run `{login}` once; "
+                "the session is kept outside the repository and reused by every "
+                "run."
+            )
+
+    def _check_claude_cli_version(self, executor_model: str | None) -> None:
+        """Refuse a model the runner image's Claude Code is too old to address.
+
+        The version is read from the image's ``claude-code.version`` label, which
+        the worker reports with its other facts — no container is started. Runs
+        K-006/007 of 2026-10-23 died in a second on the API's
+        ``claude_code_version_too_old``: the image's unpinned install had stayed
+        on a cached 2.1.197.
+        """
+        from harness_lab_app.health_service import worker_facts
+        from harness_lab_app.native_models import claude_cli_too_old
+
+        model = (executor_model or "").strip()
+        if not model:
+            return
+        facts = worker_facts()
+        cli_version = str(facts.get("claude_cli_version") or "") if facts else ""
+        required = claude_cli_too_old(model, cli_version)
+        if required:
+            raise RunPreflightError(
+                f"The runner image has Claude Code {cli_version}, and '{model}' "
+                f"needs {required} or newer — every run would be refused by the "
+                "API on its first request. Rebuild the runner image "
+                "(Health → Build runner image, or `docker compose build runner`) "
+                "with CLAUDE_CODE_VERSION in Dockerfile.runner at or above it."
+            )
+
+    def _gateway_routing(self) -> dict[str, Any] | None:
+        """The gateway's model cards, or ``None`` when it cannot be asked.
+
+        ``None`` covers no gateway configured, the probe disabled, and a gateway
+        that did not answer — unknown, never "serves nothing". Extracted for
+        tests.
+        """
+        if os.environ.get("HARNESS_LAB_DISABLE_GATEWAY_PROBE"):
+            return None
+        from harness_lab_app.executors import rewrite_localhost
+        from harness_lab_app.gateway_models import fetch_gateway_routing_cached
+
+        base = read_env_file_value("GATEWAY_BASE_URL") or ""
+        token = read_env_file_value("GATEWAY_TOKEN") or ""
+        if not base or not token or token in _PLACEHOLDER_TOKENS:
+            return None
+        if Path("/.dockerenv").exists():
+            base = rewrite_localhost(base, get_settings().docker_host_alias)
+        return fetch_gateway_routing_cached(base, token) or None
+
+    def _claude_routes_through_gateway(self) -> bool:
+        """Whether the claude CLI in a run reaches Anthropic through a gateway.
+
+        It does only when the lab's Claude settings set ``ANTHROPIC_BASE_URL``
+        (``.claude/settings.local.json`` is per developer and untracked). A
+        gateway configured for opencode says nothing about claude: without the
+        variable the CLI talks to Anthropic, which serves every Claude model.
+        """
+        from harness_lab_app.executors import claude_settings_env
+
+        return bool(
+            claude_settings_env(get_settings().repo_root).get("ANTHROPIC_BASE_URL")
+        )
+
+    def _check_claude_model_served(self, executor_model: str | None) -> None:
+        """Refuse a Claude model the gateway has no card for.
+
+        Applies when the claude CLI reaches Anthropic through the gateway
+        (``ANTHROPIC_BASE_URL``, see ``executors.claude_settings_env``): a model
+        without a card then dies on its first request with "Invalid model name"
+        — eight runs of claude-haiku-5-5 did exactly that on 2026-10-23. An
+        empty model is the CLI's own default and is left alone.
+        """
+        model = (executor_model or "").strip()
+        if not model or not self._claude_routes_through_gateway():
+            return
+        routing = self._gateway_routing()
+        if routing is None:
+            return
+        from harness_lab_app.native_models import gateway_coverage, served_claude_models
+
+        coverage = gateway_coverage("claude", routing)
+        if model in coverage and coverage[model] is False:
+            served = served_claude_models(routing)
+            raise RunPreflightError(
+                f"The gateway has no card for '{model}', so every run would die "
+                "on its first request with 'Invalid model name'. Add the model to "
+                "the gateway, or pick one it serves"
+                + (f": {', '.join(served)}." if served else ".")
+            )
+
     def _check_routable(self, executor: str) -> None:
         """Reject a ``gateway/`` model opencode has no provider entry for.
 
@@ -979,6 +1234,7 @@ class RunService:
             harness=config.harness,
             planner_model=config.planner_model,
             executor_model=config.executor_model,
+            executor_effort=config.executor_effort,
             score_mode=config.score_mode,
             max_steps=config.max_steps,
             resume=False,
@@ -1061,6 +1317,7 @@ class RunService:
             harness=config.harness,
             planner_model=config.planner_model,
             executor_model=config.executor_model,
+            executor_effort=config.executor_effort,
             score_mode=config.score_mode,
             max_steps=max_steps or config.max_steps,
             resume=True,
@@ -1095,13 +1352,39 @@ class RunService:
         self._publish(run_id)
         return run
 
-    def mark_running(self, run_id: str) -> Run:
+    def mark_running(self, run_id: str, lane: str | None = None) -> Run:
         run = self.get_run(run_id)
         run.state = RunState.running
         run.started_at = utc_now()
+        # The queue of the worker driving it (ADR-0082), for reconciliation.
+        run.lane = lane
         self.session.add(run)
         self.session.add(RunEvent(run_id=run_id, message="Run started"))
         self.session.commit()
+        self.session.refresh(run)
+        return run
+
+    def claim_pending(self, run_id: str, lane: str | None = None) -> Run | None:
+        """``mark_running``, but only for a run that is still ``pending``.
+
+        One conditional UPDATE, so a cancellation committed after the worker
+        last read the row cannot be overwritten: the worker learns it lost the
+        race (``None``) instead of resurrecting a cancelled run.
+        """
+        claimed = cast(
+            "CursorResult[Any]",
+            self.session.execute(
+                sa_update(Run)
+                .where(col(Run.run_id) == run_id, col(Run.state) == RunState.pending)
+                .values(state=RunState.running, started_at=utc_now(), lane=lane)
+            ),
+        )
+        if claimed.rowcount != 1:
+            self.session.rollback()
+            return None
+        self.session.add(RunEvent(run_id=run_id, message="Run started"))
+        self.session.commit()
+        run = self.get_run(run_id)
         self.session.refresh(run)
         return run
 
@@ -1168,6 +1451,29 @@ class RunService:
         self.session.refresh(run)
         return run
 
+    def keep_waiting(self, run_id: str, seconds: int) -> Run:
+        """Give a running run's slow phase more time ("Keep waiting").
+
+        Adds to ``extra_wait_seconds``, which the phase watchdog reads on every
+        tick: the flag lifts until the new deadline. A run that is not running
+        is returned unchanged — there is no phase left to wait for.
+        """
+        run = self.get_run(run_id)
+        if run.state != RunState.running:
+            return run
+        run.extra_wait_seconds = int(run.extra_wait_seconds or 0) + max(0, int(seconds))
+        self.session.add(run)
+        self.session.add(
+            RunEvent(
+                run_id=run_id,
+                level="info",
+                message=f"Keep waiting: {round(seconds / 60)} more minutes for this phase",
+            )
+        )
+        self.session.commit()
+        self.session.refresh(run)
+        return run
+
     def cancel_run(self, run_id: str) -> Run:
         run = self.get_run(run_id)
         if run.state in {RunState.completed, RunState.failed, RunState.cancelled}:
@@ -1179,9 +1485,22 @@ class RunService:
                 RunEvent(run_id=run_id, level="info", message="Cancellation requested")
             )
         else:
-            run.state = RunState.cancelled
-            run.ended_at = utc_now()
-            self.session.add(run)
+            # Conditional on the state just read: the worker may claim the run
+            # (`claim_pending`) in between, and an unconditional write would
+            # mark a started run cancelled with nothing asking it to stop.
+            observed = run.state
+            moved = cast(
+                "CursorResult[Any]",
+                self.session.execute(
+                    sa_update(Run)
+                    .where(col(Run.run_id) == run_id, col(Run.state) == observed)
+                    .values(state=RunState.cancelled, ended_at=utc_now())
+                ),
+            )
+            if moved.rowcount != 1:
+                self.session.rollback()
+                self.session.expire_all()
+                return self.cancel_run(run_id)
             self.session.add(
                 RunEvent(run_id=run_id, level="info", message="Run cancelled")
             )
@@ -1189,16 +1508,83 @@ class RunService:
         self.session.refresh(run)
         return run
 
-    def retry_run(self, run_id: str) -> Run:
+    def retry_options(self, run_id: str) -> dict[str, Any]:
+        """Which retries a run offers, and from which step it would continue."""
+        from harness_lab_app.run_resume import resume_point
+
         run = self.get_run(run_id)
         config = self.get_run_config(run.run_config_id)
-        # Persist resume on the config: the Celery task rebuilds the command
-        # from RunConfig at execution time, so the flag must survive there.
-        config.resume = True
+        point = resume_point(
+            get_settings().data_runs_dir / run_id, int(config.max_steps or 1)
+        )
+        retryable = run.state in RETRYABLE_STATES
+        return {
+            "retryable": retryable,
+            "max_steps": config.max_steps,
+            "continue_from_step": (
+                point.last_step + 1 if point.last_step is not None else None
+            ),
+            "last_completed_step": point.last_step,
+            "continue_reason": point.reason,
+        }
+
+    def retry_run(self, run_id: str, mode: str = "resume") -> Run:
+        """Run a stopped run again under the same id (ADR-0083).
+
+        ``resume`` reruns every step over the workspace the attempt left — the
+        retry this lab always had. ``scratch`` wipes that attempt (workspace,
+        steps, validation, scores) and runs it as new. ``continue`` restores the
+        workspace as the last completed step left it and runs only the steps
+        after it, keeping the finished ones as they ran.
+        """
+        if mode not in RETRY_MODES:
+            raise RunRetryError(
+                f"Unknown retry mode '{mode}': {', '.join(RETRY_MODES)}"
+            )
+        run = self.get_run(run_id)
+        if mode != "resume" and run.state not in RETRYABLE_STATES:
+            raise RunRetryError(
+                f"Run '{run_id}' is {run.state.value}; only a failed or cancelled "
+                "run is retried."
+            )
+        config = self.get_run_config(run.run_config_id)
+        settings = get_settings()
+        run_dir = settings.data_runs_dir / run_id
+        workspace = settings.workspace_dir / run_id
+        message = "Run retried"
+        if mode == "continue":
+            from harness_lab_app.run_resume import restore_step, resume_point
+
+            point = resume_point(run_dir, int(config.max_steps or 1))
+            if not point.available or point.last_step is None:
+                raise RunRetryError(point.reason)
+            self._guard_run_paths(run_dir, workspace)
+            restore_step(run_dir, workspace, point.last_step)
+            config.resume = True
+            config.resume_from_step = point.last_step + 1
+            message = (
+                f"Run continued from step {point.last_step + 1}: steps 1-"
+                f"{point.last_step} are kept as they ran, the workspace restored "
+                f"from step {point.last_step}'s snapshot"
+            )
+        elif mode == "scratch":
+            from harness_lab_app.run_resume import wipe_for_scratch
+
+            self._guard_run_paths(run_dir, workspace)
+            wipe_for_scratch(run_dir, workspace)
+            self._clear_results(run_id)
+            config.resume = False
+            config.resume_from_step = 0
+            message = "Run retried from scratch: the previous attempt was discarded"
+        else:
+            # Persist resume on the config: the Celery task rebuilds the command
+            # from RunConfig at execution time, so the flag must survive there.
+            config.resume = True
+            config.resume_from_step = 0
         self.session.add(config)
         run.command = self.adapter.build_command(
             run_id,
-            _resume_config(config),
+            _resume_config(config) if config.resume else self._config_create(config),
         )
         run.state = RunState.pending
         run.exit_code = None
@@ -1206,12 +1592,35 @@ class RunService:
         run.started_at = None
         run.ended_at = None
         run.cancel_requested = False
+        run.score = None
+        run.lane = None
         self.session.add(run)
-        self.session.add(RunEvent(run_id=run_id, level="info", message="Run retried"))
+        self.session.add(RunEvent(run_id=run_id, level="info", message=message))
         self.session.commit()
         self.session.refresh(run)
         self._publish(run_id)
         return run
+
+    @staticmethod
+    def _config_create(config: RunConfig) -> RunConfigCreate:
+        payload = _resume_config(config).model_dump()
+        payload.update({"resume": False, "resume_from_step": 0})
+        return RunConfigCreate(**payload)
+
+    @staticmethod
+    def _guard_run_paths(*paths: Path) -> None:
+        """Refuse any path a retry would rewrite that is outside the repo root."""
+        repo_root = get_settings().repo_root.resolve()
+        for path in paths:
+            target = path.resolve()
+            if repo_root == target or repo_root not in target.parents:
+                raise RunRetryError(f"Refusing to touch {path}: outside the lab.")
+
+    def _clear_results(self, run_id: str) -> None:
+        """Drop what a previous attempt measured, keeping the run's own events."""
+        for model in (Validation, Attribution, Audit, Artifact, Score):
+            for row in self.session.exec(select(model).where(model.run_id == run_id)):
+                self.session.delete(row)
 
     @staticmethod
     def _remove_run_dirs(run_id: str) -> None:

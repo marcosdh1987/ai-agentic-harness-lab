@@ -49,11 +49,16 @@ services:
       # A shared root is a working set, not a search space.
       HARNESS_LAB_LOCAL_SOURCES_ROOT: /host-sources
       HARNESS_LAB_HOST_LOCAL_SOURCES_ROOT: ${HARNESS_LAB_LOCAL_SOURCES_DIR:-${PWD}/..}
+      # The codex/gemini session store (ADR-0094), read-only: the API only reads
+      # whether a login exists (its shape, never a token) for Health and the
+      # run preflight.
+      HARNESS_LAB_AUTH_DIR: /harness-auth
     volumes:
       - .:/app
       # Read-only on purpose: the lab copies repositories out of here and must
       # never be able to write into somebody's working copy.
       - ${HARNESS_LAB_LOCAL_SOURCES_DIR:-..}:/host-sources:ro
+      - ${HARNESS_LAB_AUTH_DIR:-${HOME}/.harness-lab/auth}:/harness-auth:ro
     ports:
       # Loopback by default. Authentication is only enforced once an admin
       # password exists (see session_middleware.auth_enabled), so publishing on
@@ -85,13 +90,18 @@ services:
       timeout: 5s
       retries: 3
 
-  worker:
+  worker: &worker
     <<: [*restart, *logging]
     build:
       context: .
       dockerfile: Dockerfile.api
-    # Concurrency is deliberately 1: bench_run.py mutates repo-root shared
-    # state (BENCH_CONTEXT.md, benchmarks/*/runs.yaml), same as the CLI flow.
+    # One image for the three workers below: named, so the two that inherit
+    # this definition reuse it instead of each building a copy of their own.
+    image: harness-lab-worker:latest
+    # Concurrency is deliberately 1 per lane: a run may rewrite the lab's own
+    # tree (a skill ablation regenerates `.claude/skills`, ADR-0011). Each run
+    # writes its own BENCH_CONTEXT.md (ADR-0082), so a second lane is safe for
+    # runs that rewrite nothing shared — see `worker-parallel`.
     command:
       [
         "celery",
@@ -102,6 +112,8 @@ services:
         "runs",
         "--loglevel=info",
         "--concurrency=1",
+        "-n",
+        "runs@%h",
       ]
     environment:
       HARNESS_LAB_REPO_ROOT: /app
@@ -113,15 +125,61 @@ services:
       # Host path of the repo: runner containers are siblings created through
       # the host daemon, so their bind mounts must use host paths.
       HARNESS_LAB_HOST_REPO_ROOT: ${PWD}
+      # Subscription sessions of the codex/gemini CLIs (ADR-0094), one
+      # directory per provider, outside the repository. A run never mounts the
+      # store: the worker copies the run's own credential into
+      # data/runs/<run>/session/ and writes a refreshed one back when the run
+      # ends, so the store is read-write here (and read-only for the API).
+      HARNESS_LAB_AUTH_DIR: /harness-auth
     volumes:
       - .:/app
       # Docker-out-of-docker: the worker launches one runner container per
       # run through the host daemon. Root-equivalent host access — keep this
       # mount on the worker service only.
       - /var/run/docker.sock:/var/run/docker.sock
+      - ${HARNESS_LAB_AUTH_DIR:-${HOME}/.harness-lab/auth}:/harness-auth
     depends_on:
       redis:
         condition: service_healthy
+
+  # The second run lane (ADR-0082): a model comparison launched "two at a time"
+  # alternates its runs between `runs` and this queue. The launch refuses any
+  # run that rewrites the shared tree, so nothing that needs the one lane ever
+  # lands here.
+  worker-parallel:
+    <<: *worker
+    command:
+      [
+        "celery",
+        "-A",
+        "harness_lab_app.celery_app",
+        "worker",
+        "-Q",
+        "runs-parallel",
+        "--loglevel=info",
+        "--concurrency=1",
+        "-n",
+        "parallel@%h",
+      ]
+
+  # Sandboxes (terminal, desktop, Play) take seconds and a person is waiting.
+  # On the run lane they queued behind runs of several hours, so a finished
+  # game could not be played while another run was still going.
+  worker-interactive:
+    <<: *worker
+    command:
+      [
+        "celery",
+        "-A",
+        "harness_lab_app.celery_app",
+        "worker",
+        "-Q",
+        "interactive",
+        "--loglevel=info",
+        "--concurrency=2",
+        "-n",
+        "interactive@%h",
+      ]
 
   # Build-only entry so `docker compose build runner` produces the image the
   # worker launches per run; it is never started as a service.
@@ -140,6 +198,26 @@ services:
       context: .
       dockerfile: Dockerfile.sandbox
     image: harness-lab-sandbox:latest
+    profiles:
+      - build-only
+
+  # Build-only images for 3D game cases (ADR-0078): the runner and the sandbox
+  # above plus the Godot engine. Built on demand with `make images-3d`, never by
+  # `make app-up`, so no other case pays for the engine. Build the two bases
+  # first: each FROMs its sibling above.
+  runner-godot:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner-godot
+    image: harness-lab-runner-godot:latest
+    profiles:
+      - build-only
+
+  sandbox-godot:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox-godot
+    image: harness-lab-sandbox-godot:latest
     profiles:
       - build-only
 

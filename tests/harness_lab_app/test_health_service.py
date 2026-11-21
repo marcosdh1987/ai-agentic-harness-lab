@@ -75,6 +75,8 @@ def test_every_check_reports_even_with_nothing_running(isolated):
         "redis",
         "worker",
         "docker",
+        "codex_cli",
+        "gemini_cli",
         "skills_drift",
         "git_tree",
         "staging",
@@ -467,3 +469,37 @@ def test_heal_endpoint_maps_a_failed_repair_to_502(isolated, monkeypatch):
         endpoint(HealRequest(action="skills_sync"), session)
     assert exc.value.status_code == 502
     assert "git is missing" in exc.value.detail
+
+
+def _image_with_cli(version):
+    return {
+        "backend": "docker",
+        "docker_ok": True,
+        "runner_image_present": True,
+        "runner_image": "harness-lab-runner:latest",
+        "docker_version": "29.0",
+        "claude_cli_version": version,
+    }
+
+
+def test_a_runner_cli_too_old_for_current_claude_models_is_a_warning():
+    """K-006/007: the image was 'present', so Health read green while every
+    claude-opus-5-5 run was refused for an old CLI."""
+    status, detail, _ = module._check_docker(_image_with_cli("2.1.197"))
+    assert status == module.WARN
+    assert "2.1.197" in detail and "2.1.321" in detail
+    assert "Build runner image" in detail
+
+
+def test_a_runner_cli_that_predates_fable_5_2_is_a_warning():
+    """2.1.309 runs the 5.5 family but answers `unrecognized_model` for Fable 5.2,
+    so the warning names the highest floor among current models, not the first."""
+    status, detail, _ = module._check_docker(_image_with_cli("2.1.309"))
+    assert status == module.WARN
+    assert "2.1.321" in detail
+
+
+def test_the_runner_cli_version_is_reported_when_it_is_current():
+    status, detail, _ = module._check_docker(_image_with_cli("2.1.325"))
+    assert status == module.OK
+    assert "Claude Code 2.1.325" in detail

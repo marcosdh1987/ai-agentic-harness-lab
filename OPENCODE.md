@@ -39,6 +39,7 @@ The governed skills below are projected into `.opencode/skills/`. Internal skill
 - `refactor_to_clean_architecture` — Use when refactoring modules to align dependency direction, responsibilities, and boundaries with clean architecture.
 - `research_current_info` — Use when the user asks for up-to-date or current information, to confirm something is still accurate, or when a task depends on facts that may have changed since training (library versions, APIs, pricing, releases, news, current best practices). Runs a governed web search with a curated domain allow/deny policy and cited, recency-checked results.
 - `retrospective` — Use at the end of a unit of work to capture durable, non-obvious knowledge into project memory (memory/) and flag decisions worth an ADR. Turns one-off discoveries into compounding, persistent context.
+- `sensible_testing` — Design, review, and audit automated tests and benchmark graders for meaningful bug detection. Use when assessing test quality, adding regression coverage, finding missing failure cases, or evaluating whether existing tests justify their cost.
 - `systematic_debugging` — Use when diagnosing a bug, failing test, or unexpected behavior — drive a methodical reproduce → isolate → hypothesize → fix → verify loop instead of guessing. Prevents thrashing and repeated edits to the same file.
 - `validate_module_structure` — Use when validating module placement, dependency direction, and structure against repository governance.
 - `verify_changes` — Use before considering work done — run the read-only quality gate and tests, interpret failures, and confirm the change is correct. The verification step of the working loop.
@@ -55,6 +56,7 @@ The governed skills below are projected into `.opencode/skills/`. Internal skill
 - `using-git-worktrees` — Use when starting feature work that needs isolation from current workspace or before executing implementation plans - ensures an isolated workspace exists via native tools or git worktree fallback
 - `writing-clearly-and-concisely` — Apply Strunk's timeless writing rules to ANY prose humans will read—documentation, commit messages, error messages, explanations, reports, or UI text. Makes your writing clearer, stronger, and more professional.
 - `writing-plans` — Use when you have a spec or requirements for a multi-step task, before touching code
+- `xmartlabs-branding` — Xmartlabs brand guidelines for creating artifacts, presentations, one-pagers, pitch decks, and any market-facing materials. Use this skill whenever creating a visual artifact, document, or HTML/React output for Xmartlabs or any of its offerings (e.g. AI Intake offering, client case studies, proposals).
 
 Refresh this layout with `make sync-skills` (or `make check-sync` to verify it is current).
 <!-- END GENERATED SKILLS -->
@@ -105,3 +107,4 @@ verify endpoints with `make opencode-doctor`. Full guide: `.github/portability.m
 - Prefer `make` targets and `uv` workflows.
 - When implementing or testing changes, create or update documentation in `docs/`.
 - Use absolute imports only.
+- The developer is the sole author of every commit and PR: never commit, push or branch unless asked, never set a git identity, never add AI co-author or "Generated with" lines (see `.github/standards.md` → Authorship).

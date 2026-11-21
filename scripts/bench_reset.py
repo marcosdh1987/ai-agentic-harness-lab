@@ -257,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("  clean:      no artifact directories found")
 
     print()
-    print("  Done. Open the Runs page in the web app to confirm.")
+    print("  Done. Run `make bench-results` to confirm.")
     print("=" * 66)
     return 0
 

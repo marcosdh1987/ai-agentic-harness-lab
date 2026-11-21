@@ -3,9 +3,9 @@
 # A GitHub *user* handle is used rather than an org team, because a CODEOWNERS
 # entry naming a team that does not exist — or that lacks write access to the
 # repository — is silently ignored, and the failure looks exactly like nobody
-# being assigned. If an org team ever owns this repo, replace @marcosdh1987
-# below with that team and confirm on a test PR that the review request
-# actually appears.
+# being assigned. Once an `xmartlabs` team owns this repo, replace @marcosdh1987
+# below with `@xmartlabs/<team>` and confirm on a test PR that the review
+# request actually appears.
 
 # Default owner for everything not matched more specifically below.
 *                       @marcosdh1987

@@ -9,12 +9,16 @@ the reason it might mean nothing.
 
 Deliberately not here: p-values and significance tests. Good repetitions and
 visible distributions first; a t-test over four runs would dress three runs of
-noise in the vocabulary of proof.
+noise in the vocabulary of proof. What *is* here is the width of what was
+measured (ADR-0064): every success rate carries its 95% interval and every
+success delta a case-clustered one. They are descriptive — a range the runs are
+compatible with — and nothing in this module turns one into a pass/fail test.
 """
 
 from __future__ import annotations
 
 import math
+import random
 import statistics
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -77,6 +81,15 @@ class ConditionSummary:
             return None
         return self.successes / self.scored_runs
 
+    @property
+    def success_rate_ci(self) -> tuple[float, float] | None:
+        """The 95% Wilson interval around :attr:`success_rate` (ADR-0064).
+
+        Same denominator as the rate it brackets, so an arm with nothing scored
+        has no interval rather than a made-up one.
+        """
+        return wilson_interval(self.successes, self.scored_runs)
+
 
 @dataclass
 class Delta:
@@ -92,6 +105,14 @@ class Delta:
     # own. Not a significance test — a guard against reading a delta that sits
     # entirely inside the spread.
     exceeds_spread: bool | None = None
+    # False when either arm is missing this metric for any of its runs. A mean
+    # over the runs that happened to record a figure is not the arm's mean —
+    # 3 of 5 runs with tokens against 0 of 5 was rendered as a cost difference.
+    # The difference is then withheld, not computed on the survivors.
+    comparable: bool = True
+    # Runs without a value, per arm: what the reader needs to fix it.
+    control_missing: int = 0
+    treatment_missing: int = 0
 
     @property
     def improved(self) -> bool | None:
@@ -195,7 +216,13 @@ def compare(
             control=control_mean,
             treatment=treatment_mean,
             direction=directions.get(name, "neutral"),
+            control_missing=_missing_runs(left, control),
+            treatment_missing=_missing_runs(right, treatment),
         )
+        delta.comparable = not (delta.control_missing or delta.treatment_missing)
+        if not delta.comparable:
+            deltas.append(delta)
+            continue
         if control_mean is not None and treatment_mean is not None:
             delta.absolute = treatment_mean - control_mean
             if control_mean != 0:
@@ -221,18 +248,88 @@ def compare(
     return deltas
 
 
+def _missing_runs(aggregate: Aggregate | None, arm: ConditionSummary) -> int:
+    """Runs of ``arm`` that recorded no value for this metric."""
+    if aggregate is None:
+        return arm.runs
+    return aggregate.missing
+
+
+def incomplete_metrics(
+    control: ConditionSummary,
+    treatment: ConditionSummary,
+    names: Sequence[str],
+) -> dict[str, dict[str, int]]:
+    """``{metric: {arm: runs without it}}`` for metrics one side lacks.
+
+    Only metrics at least one arm measured somewhere: a metric neither arm ever
+    produced (a judge that was never configured) is absent, not asymmetric.
+    """
+    gaps: dict[str, dict[str, int]] = {}
+    for name in names:
+        left = control.metrics.get(name)
+        right = treatment.metrics.get(name)
+        if not (left and left.n) and not (right and right.n):
+            continue
+        missing = {
+            control.label: _missing_runs(left, control),
+            treatment.label: _missing_runs(right, treatment),
+        }
+        if any(missing.values()):
+            gaps[name] = missing
+    return gaps
+
+
 def success_delta(
-    control: ConditionSummary, treatment: ConditionSummary
+    control: ConditionSummary,
+    treatment: ConditionSummary,
+    *,
+    control_cases: Mapping[str, Sequence[bool]] | None = None,
+    treatment_cases: Mapping[str, Sequence[bool]] | None = None,
 ) -> dict[str, Any]:
-    """Difference in success rate, in percentage points."""
+    """Difference in success rate, in percentage points, with its 95% interval.
+
+    ``control_cases`` / ``treatment_cases`` are every scored outcome per case
+    (``{case_id: [passed, ...]}``). With them the interval is the envelope of a
+    paired, case-clustered bootstrap and Newcombe's interval; without them it is
+    Newcombe's alone. Either way it is never narrower than Newcombe's, which is
+    what keeps a unanimous 0/5 against 5/5 from resampling to "+100, certainly"
+    (ADR-0064).
+    """
     left = control.success_rate
     right = treatment.success_rate
+    paired = _paired_case_count(control_cases or {}, treatment_cases or {})
     if left is None or right is None:
-        return {"control": left, "treatment": right, "points": None}
+        return {
+            "control": left,
+            "treatment": right,
+            "points": None,
+            "delta_ci_low": None,
+            "delta_ci_high": None,
+            "interval_crosses_zero": None,
+            "paired_cases": paired,
+        }
+    low, high = _newcombe_interval(
+        control.successes,
+        control.scored_runs,
+        treatment.successes,
+        treatment.scored_runs,
+    )
+    bootstrap = paired_bootstrap_interval(control_cases or {}, treatment_cases or {})
+    if bootstrap is not None:
+        low = min(low, bootstrap[0])
+        high = max(high, bootstrap[1])
+    low_points, high_points = low * 100.0, high * 100.0
     return {
         "control": left,
         "treatment": right,
         "points": (right - left) * 100.0,
+        "delta_ci_low": low_points,
+        "delta_ci_high": high_points,
+        # "Includes zero", in the plain words the page uses. Descriptive: it
+        # says the runs are compatible with no effect, not that there is none.
+        "interval_crosses_zero": low_points <= 0.0 <= high_points,
+        "paired_cases": paired,
     }
 
 
@@ -285,6 +382,267 @@ def confidence_interval(
 
 
 # --------------------------------------------------------------------------
+# Uncertainty — the width of what was measured (ADR-0064)
+# --------------------------------------------------------------------------
+
+# Two-sided 95% and 80% power: the conventions a reader already knows, used for
+# every interval and the one planning figure. Descriptive, never a test.
+_Z95 = statistics.NormalDist().inv_cdf(0.975)
+_Z_POWER = statistics.NormalDist().inv_cdf(0.80)
+
+# Fixed so the same runs always draw the same interval: a page that redraws a
+# different range on every refresh would itself be noise. Two thousand
+# resamples put the 2.5% tails on fifty draws each, which is steady to about a
+# point at the sizes this lab runs.
+BOOTSTRAP_SEED = 64
+BOOTSTRAP_RESAMPLES = 2_000
+
+# The planning figure answers one fixed question, so readers can compare it
+# across experiments: how many repetitions to see a 20-point move.
+PLAN_DIFFERENCE_POINTS = 20
+# Below this many scored runs in every arm an observed rate is too loose to
+# plan from (its own interval is wider than the difference being planned for),
+# and the plan assumes the worst case, a coin flip.
+PLAN_MIN_SCORED_RUNS = 10
+
+
+def wilson_interval(
+    successes: int, trials: int, z: float = _Z95
+) -> tuple[float, float] | None:
+    """The Wilson score interval for a pass rate, or None with nothing scored.
+
+    Chosen over the normal approximation because the lab lives at small N and
+    at the edges: 0 of 5 reads as ``[0, 0]`` under the normal approximation —
+    certainty from five runs — and as ``[0, 43%]`` here.
+    """
+    if trials <= 0:
+        return None
+    rate = successes / trials
+    spread = z * z / trials
+    denominator = 1 + spread
+    centre = (rate + spread / 2) / denominator
+    half = (
+        z * math.sqrt(rate * (1 - rate) / trials + spread / (4 * trials)) / denominator
+    )
+    # Exact at the edges, so a unanimous arm reads 0% or 100% rather than a
+    # rounding artefact a hair beyond the scale.
+    low = 0.0 if successes <= 0 else max(0.0, centre - half)
+    high = 1.0 if successes >= trials else min(1.0, centre + half)
+    return (low, high)
+
+
+def _newcombe_interval(
+    control_successes: int,
+    control_trials: int,
+    treatment_successes: int,
+    treatment_trials: int,
+) -> tuple[float, float]:
+    """Newcombe's hybrid score interval for ``treatment - control`` rates.
+
+    Built from each arm's Wilson interval, so it inherits the property that
+    matters here: it does not collapse when an arm is unanimous.
+    """
+    p1 = control_successes / control_trials
+    p2 = treatment_successes / treatment_trials
+    low1, high1 = wilson_interval(control_successes, control_trials) or (p1, p1)
+    low2, high2 = wilson_interval(treatment_successes, treatment_trials) or (p2, p2)
+    delta = p2 - p1
+    low = delta - math.sqrt((p2 - low2) ** 2 + (high1 - p1) ** 2)
+    high = delta + math.sqrt((high2 - p2) ** 2 + (p1 - low1) ** 2)
+    return (max(-1.0, low), min(1.0, high))
+
+
+def _paired_case_count(
+    control_cases: Mapping[str, Sequence[bool]],
+    treatment_cases: Mapping[str, Sequence[bool]],
+) -> int:
+    return sum(
+        1
+        for case in set(control_cases) & set(treatment_cases)
+        if control_cases[case] and treatment_cases[case]
+    )
+
+
+def _quantile(ordered: Sequence[float], q: float) -> float:
+    """Linear-interpolated quantile of an already sorted sequence."""
+    position = (len(ordered) - 1) * q
+    below = math.floor(position)
+    above = min(below + 1, len(ordered) - 1)
+    return ordered[below] + (ordered[above] - ordered[below]) * (position - below)
+
+
+def _resampled_passes(rng: random.Random, passes: int, runs: int) -> int:
+    """How many of ``runs`` draws with replacement from one case's runs pass."""
+    if passes <= 0 or passes >= runs:
+        # A unanimous case resamples to itself; skipping the draws keeps the
+        # common case cheap without changing a single number.
+        return passes
+    rate = passes / runs
+    return sum(1 for _ in range(runs) if rng.random() < rate)
+
+
+def paired_bootstrap_interval(
+    control_cases: Mapping[str, Sequence[bool]],
+    treatment_cases: Mapping[str, Sequence[bool]],
+    *,
+    resamples: int = BOOTSTRAP_RESAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+) -> tuple[float, float] | None:
+    """95% interval for ``treatment - control`` success, resampled by case.
+
+    Two stages, because the runs are not independent: repetitions of one case
+    share its difficulty. Each resample draws the *cases* with replacement —
+    the same draw for both arms, which is what keeps the comparison paired —
+    then each arm's repetitions within every drawn case. Resampling runs as one
+    pool would treat forty runs over four cases as forty independent facts and
+    report an interval far narrower than the design supports.
+
+    Only cases both arms scored take part. Returned as rates in ``[-1, 1]``;
+    ``None`` when no case is paired. Deterministic for a given ``seed``.
+    """
+    cases = sorted(
+        case
+        for case in set(control_cases) & set(treatment_cases)
+        if control_cases[case] and treatment_cases[case]
+    )
+    if not cases:
+        return None
+    counts = [
+        (
+            sum(bool(v) for v in control_cases[case]),
+            len(control_cases[case]),
+            sum(bool(v) for v in treatment_cases[case]),
+            len(treatment_cases[case]),
+        )
+        for case in cases
+    ]
+    rng = random.Random(seed)
+    deltas: list[float] = []
+    for _ in range(resamples):
+        control_passes = control_runs = treatment_passes = treatment_runs = 0
+        for index in rng.choices(range(len(counts)), k=len(counts)):
+            c_pass, c_runs, t_pass, t_runs = counts[index]
+            control_passes += _resampled_passes(rng, c_pass, c_runs)
+            control_runs += c_runs
+            treatment_passes += _resampled_passes(rng, t_pass, t_runs)
+            treatment_runs += t_runs
+        deltas.append(treatment_passes / treatment_runs - control_passes / control_runs)
+    deltas.sort()
+    return (_quantile(deltas, 0.025), _quantile(deltas, 0.975))
+
+
+def pass_at_k(
+    cases: Mapping[str, Sequence[bool]], k: int | None = None
+) -> dict[str, Any] | None:
+    """pass@k and pass^k over one arm's cases, averaged with equal case weight.
+
+    ``pass@k`` — at least one of k tries passes — is what a developer who
+    retries feels. ``pass^k`` — all k pass — is what a user who cannot retry
+    feels, and it is the reliability number. ``k`` defaults to the fewest
+    scored repetitions any case has. A case with more runs than ``k`` uses the
+    unbiased estimator over every k-subset of its runs rather than its first k.
+    """
+    scored = {case: list(outcomes) for case, outcomes in cases.items() if outcomes}
+    if not scored:
+        return None
+    if k is None:
+        k = min(len(outcomes) for outcomes in scored.values())
+    eligible = [outcomes for outcomes in scored.values() if len(outcomes) >= k]
+    if k < 1 or not eligible:
+        return None
+    at_k: list[float] = []
+    hat_k: list[float] = []
+    for outcomes in eligible:
+        runs = len(outcomes)
+        passes = sum(bool(v) for v in outcomes)
+        subsets = math.comb(runs, k)
+        at_k.append(1 - math.comb(runs - passes, k) / subsets)
+        hat_k.append(math.comb(passes, k) / subsets)
+    return {
+        "k": k,
+        "cases": len(eligible),
+        "pass_at_k": statistics.fmean(at_k),
+        "pass_hat_k": statistics.fmean(hat_k),
+    }
+
+
+def pass_k_by_arm(
+    arms: Mapping[str, Mapping[str, Sequence[bool]]],
+) -> dict[str, dict[str, Any] | None]:
+    """:func:`pass_at_k` for every arm at one shared ``k``.
+
+    pass^3 beside pass^2 would be two different questions side by side, so the
+    shared ``k`` is the fewest scored repetitions of any case in any arm.
+    """
+    lengths = [
+        len(outcomes)
+        for cases in arms.values()
+        for outcomes in cases.values()
+        if outcomes
+    ]
+    if not lengths:
+        return dict.fromkeys(arms)
+    k = min(lengths)
+    return {label: pass_at_k(cases, k) for label, cases in arms.items()}
+
+
+def _runs_to_detect(rate: float, difference: float) -> int:
+    """Runs per arm for a two-sided 5% / 80%-power two-proportion comparison."""
+    other = rate - difference if rate > 0.5 else rate + difference
+    pooled = (rate + other) / 2
+    numerator = _Z95 * math.sqrt(2 * pooled * (1 - pooled)) + _Z_POWER * math.sqrt(
+        rate * (1 - rate) + other * (1 - other)
+    )
+    return math.ceil((numerator / difference) ** 2)
+
+
+def plan_repetitions(
+    arms: Sequence[ConditionSummary], *, cases: int
+) -> dict[str, Any] | None:
+    """How many repetitions would let a 20-point move stand out. Advice only.
+
+    Plans from the noisiest observed arm — the rate closest to 50% — once every
+    arm has :data:`PLAN_MIN_SCORED_RUNS` scored runs, and from a coin flip
+    before that, with the textbook two-proportion formula.
+
+    **It under-plans; read it as a floor.** The formula assumes the interval
+    the lab reports is a two-proportion test's, and it is not: the reported
+    interval is the wider of the case bootstrap and Newcombe's (see
+    :func:`success_delta`), so it excludes zero less often than the formula
+    expects. A Monte Carlo check of this function's own advice (Trinidad,
+    2026-11-06: 96 runs per arm, rates drawn per case from 10-90%) found the
+    promised 80% to be 66-72% when every case moved by 20 points, and 32-66%
+    when half the cases moved by 50 and half not at all. In the uneven case
+    the split matters as much as the total — 4 cases x 24 repetitions saw the
+    move a third of the time, 32 x 3 two thirds — and this figure cannot tell
+    them apart, because it counts runs and not cases. Prefer more cases over
+    more repetitions at a fixed budget. It says what a next design would need
+    at the least; it is never a verdict on this one.
+    """
+    if cases <= 0:
+        return None
+    observed = bool(arms) and all(
+        arm.scored_runs >= PLAN_MIN_SCORED_RUNS for arm in arms
+    )
+    rate = 0.5
+    if observed:
+        rate = min(
+            (arm.success_rate for arm in arms if arm.success_rate is not None),
+            key=lambda value: abs(value - 0.5),
+        )
+    runs = _runs_to_detect(rate, PLAN_DIFFERENCE_POINTS / 100.0)
+    return {
+        "difference_points": PLAN_DIFFERENCE_POINTS,
+        "alpha": 0.05,
+        "power": 0.8,
+        "basis": "observed" if observed else "assumed",
+        "base_rate": rate,
+        "runs_per_arm": runs,
+        "repetitions_per_case": math.ceil(runs / cases),
+    }
+
+
+# --------------------------------------------------------------------------
 # The ten-second answer
 # --------------------------------------------------------------------------
 
@@ -293,10 +651,14 @@ def confidence_interval(
 # Graded outcome first, then what it cost. `billed_tokens` rather than
 # `total_tokens`: the latter excludes the prompt cache and once showed a
 # full-harness arm using fewer tokens than a bare one while costing 71% more.
+# `output_tokens` beside it because on a self-hosted model the bill is $0 and
+# what a harness costs is time — and decode, the generated tokens, is the slow
+# half of it.
 HEADLINE_METRICS = (
     "test_pass_rate",
     "cost_usd",
     "billed_tokens",
+    "output_tokens",
     "agent_steps",
     "wall_time_minutes",
 )
@@ -322,6 +684,11 @@ def _highlight(
     left = control.metrics.get(name)
     right = treatment.metrics.get(name)
     if not left or not right or left.mean is None or right.mean is None:
+        return None
+    # A headline figure must be a whole-arm figure on both sides: a mean over
+    # the three runs that happened to log tokens, set against another arm's
+    # five, is two different populations behind one arrow.
+    if left.missing or right.missing:
         return None
     # The reader needs to know which way is good: "10,712 → 7,223 tokens"
     # reads as an improvement, and for a cost it is — but the page used to
@@ -394,6 +761,41 @@ def _direction_of(name: str) -> str:
         return "neutral"
 
 
+def _signed_points(value: float) -> str:
+    """`+12`, `-8`, and `0` rather than `-0` when a bound rounds to nothing."""
+    rounded = round(value)
+    return "0" if rounded == 0 else f"{rounded:+d}"
+
+
+def _interval_phrase(success: Mapping[str, Any] | None) -> str:
+    """` (95% interval -12 to +52)` for a claim, or nothing without one."""
+    low = (success or {}).get("delta_ci_low")
+    high = (success or {}).get("delta_ci_high")
+    if low is None or high is None:
+        return ""
+    return f" (95% interval {_signed_points(low)} to {_signed_points(high)})"
+
+
+def _interval_caveat(success: Mapping[str, Any] | None) -> str | None:
+    """Say so when the delta's interval includes zero (ADR-0064).
+
+    Descriptive by construction: the headline is not changed by it, because an
+    interval used as a gate on the wording is a significance test under another
+    name. It tells the reader how much the runs left open, in points.
+    """
+    if not success or success.get("interval_crosses_zero") is not True:
+        return None
+    low, high = success["delta_ci_low"], success["delta_ci_high"]
+    lead = (
+        f"The 95% interval for the success delta runs from {_signed_points(low)} "
+        f"to {_signed_points(high)} points and includes zero"
+    )
+    points = success.get("points")
+    if points is not None and abs(points) < 1e-9:
+        return f"{lead}: a tie this wide does not show the arms are equivalent."
+    return f"{lead}: these runs are also compatible with no effect."
+
+
 def _movements(case_matrix: list[dict[str, Any]]) -> dict[str, int]:
     counts = {"fixed": 0, "broken": 0, "unchanged": 0, "incomplete": 0}
     for row in case_matrix:
@@ -455,7 +857,23 @@ _ISSUE_ORDER = (
     "floor_effect",
     "mixed_treatment",
     "design_objection",
+    "incomplete_cost_metrics",
+    # Last: it does not break the comparison, it bounds what it generalises to.
+    "few_cases",
 )
+
+#: The cost-of-the-outcome figures a harness comparison is read on. An arm
+#: missing one of these cannot be compared on what it cost, whatever its pass
+#: rate says.
+COST_METRICS = ("cost_usd", "billed_tokens", "wall_time_minutes")
+
+#: Below this many paired cases the delta's interval describes the cases that
+#: ran, not the kind of task they stand for. The same threshold `tribunal
+#: compare` warns at for its clusters, and the one where a Monte Carlo check of
+#: this module's interval (Trinidad, 2026-11-06) saw its coverage of the
+#: population effect fall to ~83% at 4 cases x 24 repetitions with an effect
+#: that hit some cases and not others — against the 95% it is read as.
+MIN_PAIRED_CASES = 5
 
 
 @dataclass
@@ -624,6 +1042,84 @@ def _ceiling_issue(
         remedy=(
             "Pick a case the control does not already solve, or score on a "
             "metric with room to move."
+        ),
+    )
+
+
+def _incomplete_cost_issue(
+    control: ConditionSummary | None, treatment: ConditionSummary | None
+) -> ValidityIssue | None:
+    """Say so when the arms cannot be compared on what they cost.
+
+    The outcome comparison stands — this is ``degraded``, not ``invalid`` — but
+    the cost half of the answer is withheld until every run of both arms has
+    the figure. It used to be computed anyway: a bare arm with no token data
+    and a full-harness arm with three of five became "tokens: — → 755k".
+    """
+    if control is None or treatment is None:
+        return None
+    gaps = incomplete_metrics(control, treatment, COST_METRICS)
+    if not gaps:
+        return None
+    parts = [
+        f"{name} ("
+        + ", ".join(
+            f"{label} {missing}/{arm.runs}"
+            for (label, missing), arm in zip(
+                arms.items(), (control, treatment), strict=True
+            )
+            if missing
+        )
+        + " missing)"
+        for name, arms in gaps.items()
+    ]
+    return ValidityIssue(
+        code="incomplete_cost_metrics",
+        severity=DEGRADED,
+        arm=None,
+        detail=(
+            "The arms cannot be compared on cost: "
+            + "; ".join(parts)
+            + ". Those deltas are withheld rather than computed on the runs "
+            "that happened to record a figure."
+        ),
+        remedy=(
+            "Re-run the affected repetitions with a lab version that records "
+            "usage for every harness and arm, then read the cost comparison."
+        ),
+    )
+
+
+def _few_cases_issue(success: Mapping[str, Any] | None) -> ValidityIssue | None:
+    """Say so when too few cases were paired for the interval to generalise.
+
+    The bootstrap resamples cases, so with a handful of them it can barely see
+    how much the effect varies from case to case; Newcombe's floor counts every
+    run as independent. Both stay narrow exactly where many repetitions sit on
+    few cases, and the interval then describes *these* cases — accurate for
+    "how did it do here?", overconfident for "does it help on tasks like
+    these?", which is how a delta is usually read.
+
+    Zero paired cases means the comparison carried no per-case outcomes at
+    all — a different gap, not this one — so it stays quiet then.
+    """
+    paired = (success or {}).get("paired_cases")
+    if not isinstance(paired, int) or not 0 < paired < MIN_PAIRED_CASES:
+        return None
+    return ValidityIssue(
+        code="few_cases",
+        severity=DEGRADED,
+        arm=None,
+        detail=(
+            f"Only {paired} paired case(s): the interval describes these "
+            "cases, not tasks of this kind in general. With few cases and many "
+            "repetitions it is narrower than the case-to-case variation it "
+            "cannot see."
+        ),
+        remedy=(
+            f"Read it as a result on these cases, or add cases (at least "
+            f"{MIN_PAIRED_CASES}) — at a fixed budget, more cases with fewer "
+            "repetitions each tells more than the reverse."
         ),
     )
 
@@ -814,6 +1310,12 @@ def assess_validity(
     floor = _floor_issue(every_arm, check_signatures)
     if floor:
         issues.append(floor)
+    incomplete = _incomplete_cost_issue(control, treatment)
+    if incomplete:
+        issues.append(incomplete)
+    few_cases = _few_cases_issue(success)
+    if few_cases:
+        issues.append(few_cases)
     for note in design_notes or []:
         issues.append(
             ValidityIssue(
@@ -922,6 +1424,25 @@ def _compose_verdict(
             "caveats": [
                 "Use these runs to derive cases and findings, not to conclude "
                 "that anything improved."
+            ],
+        }
+
+    if mode == "harness_by_model":
+        # A grid, not a pair (ADR-0066): there is no single comparison to lead
+        # with, and saying "not enough evidence" over a fully scored grid would
+        # contradict the panel that reads it.
+        return {
+            **base,
+            "headline": "Read the harness x model panel",
+            "claim": (
+                "This experiment runs every harness level on every model. Its "
+                "result is the harness effect per model and how that effect "
+                "changes from the first model to the last, read in the Harness x "
+                "model panel with its intervals."
+            ),
+            "caveats": [
+                "Cells are not compared pairwise here: any two cells would mix "
+                "the model with the harness."
             ],
         }
 
@@ -1048,6 +1569,11 @@ def _compose_verdict(
     )
     if confound:
         caveats.append(confound)
+    # Said before the repetition count, because it is the same warning made
+    # concrete: not "five runs is few" but "five runs left this much open".
+    width = _interval_caveat(success)
+    if width:
+        caveats.append(width)
     if repetitions < USEFUL_COMPARISON:
         caveats.append(
             f"{repetitions} repetition{'s' if repetitions != 1 else ''} per arm — "
@@ -1128,18 +1654,19 @@ def _compose_verdict(
     else:
         word = "improvement" if points > 0 else "regression"
         material = abs(points) >= _MATERIAL_POINTS
+        span = _interval_phrase(success)
         if repetitions >= USEFUL_COMPARISON and material:
             headline = f"Likely {word}"
             claim = (
-                f"{treatment.label} moved success by {points:+.0f} points against "
-                f"{control.label} over {evidence} — a {strength}."
+                f"{treatment.label} moved success by {points:+.0f} points{span} "
+                f"against {control.label} over {evidence} — a {strength}."
             )
         else:
             headline = f"{word.capitalize()} observed"
             claim = (
-                f"{treatment.label} moved success by {points:+.0f} points against "
-                f"{control.label}, but over {evidence} that sits within the "
-                "variance this design can distinguish."
+                f"{treatment.label} moved success by {points:+.0f} points{span} "
+                f"against {control.label}, but over {evidence} that sits within "
+                "the variance this design can distinguish."
             )
             caveats.insert(
                 0, "Within observed variance — treat as a signal, not a result."

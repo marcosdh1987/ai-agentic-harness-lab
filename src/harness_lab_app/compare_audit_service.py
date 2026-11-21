@@ -11,7 +11,7 @@ the same selection always resolves to the same stored reading no matter what
 order the columns were added in, and regenerating overwrites it in place.
 
 Written in English, unlike the experiment and repository auditors: this reading
-renders inside the UI, and the lab's UI copy is English (see ADR-0061).
+renders inside the UI, and the lab's UI copy is English (see ADR-0060).
 """
 
 from __future__ import annotations
@@ -220,7 +220,7 @@ def build_evidence(session: Session, run_ids: Sequence[str]) -> dict[str, Any]:
         objective = (validation.objective if validation else None) or {}
         subjective = (validation.subjective if validation else None) or {}
         effort = (validation.effort if validation else None) or {}
-        # A check that did not measure is not a check that failed (ADR-0063):
+        # A check that did not measure is not a check that failed (ADR-0062):
         # served under `failed_checks` it reads to the auditor as the run's
         # fault rather than the sandbox's.
         failed_checks = [

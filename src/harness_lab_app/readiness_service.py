@@ -88,6 +88,14 @@ def classify(paths: list[str]) -> dict[str, Any]:
             found["rules_files"].append(path)
         if path in _TEST_MARKERS:
             found["test_markers"].append(path)
+        # A plugin's skills and agents sit under a per-plugin root no fixed
+        # prefix can name, so they are matched by shape before the buckets.
+        if gp.is_plugin_skill_path(path):
+            found["skills"].append(gp.skill_name(path))
+            continue
+        if gp.is_plugin_agent_path(path):
+            found["agents"].append(gp.agent_name(path))
+            continue
         for prefix, suffix, bucket in _BUCKETS:
             if path.startswith(prefix) and path.endswith(suffix):
                 found[bucket].append(_name(path, prefix, suffix))
@@ -269,7 +277,7 @@ def offline_validation(
     the lab fails open. But this one is worth saying out loud at registration,
     because the failure it predicts is silent and total — the command dies in
     its own installer, every run, and the lab used to record that as the agent
-    failing the check (ADR-0063).
+    failing the check (ADR-0062).
 
     A task-runner target is resolved against the Makefile the caller already
     read, so ``make test`` whose recipe calls ``make install`` is named for what
@@ -568,7 +576,7 @@ def infer_commands(paths: list[str], contents: dict[str, str]) -> dict[str, list
             setup.append("uv sync")
             if has_pytest:
                 # `--offline`: setup installs with a network, validation runs
-                # without one (ADR-0063). Plain `uv run` re-checks the lock and
+                # without one (ADR-0062). Plain `uv run` re-checks the lock and
                 # dies on DNS in that lane, having tested nothing. The venv the
                 # setup phase built is already there, so nothing is lost.
                 validation.append("uv run --offline pytest -x -q")
@@ -593,7 +601,7 @@ def infer_commands(paths: list[str], contents: dict[str, str]) -> dict[str, list
     if shell_tests:
         # `{workspace}`-anchored, like every other command the lab stores.
         # Both lanes now run from inside the checkout — the gate check always
-        # did, and objective validation gained the `cd` in ADR-0063 — but the
+        # did, and objective validation gained the `cd` in ADR-0062 — but the
         # placeholder costs nothing and keeps the string readable either way.
         # `|| exit 1` inside the body, because a `for` loop otherwise returns
         # only its last command's status.

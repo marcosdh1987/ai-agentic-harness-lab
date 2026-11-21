@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { Navigate, Route, Routes, useParams } from "react-router-dom";
 import { api, SESSION_EXPIRED_EVENT } from "./api";
 import { CaseEditor } from "./components/CaseEditor";
+import { CaseSkillTrial } from "./components/CaseSkillTrial";
 import { Layout } from "./components/Layout";
 import { RunDetailRoute } from "./components/RunDetailRoute";
+import { defineMessages, useMessages } from "./i18n";
 import { Audit } from "./pages/Audit";
 import { Cases } from "./pages/Cases";
 import { Compare } from "./pages/Compare";
@@ -13,10 +15,22 @@ import { Repositories } from "./pages/Repositories";
 import { RepositoryDetail } from "./pages/RepositoryDetail";
 import { Dashboard } from "./pages/Dashboard";
 import { Guide } from "./pages/Guide";
+import { AgentClis } from "./pages/AgentClis";
 import { Health } from "./pages/Health";
+import { HarnessByModel } from "./pages/HarnessByModel";
+import { CompareModels } from "./pages/CompareModels";
 import { Home } from "./pages/Home";
+import { BenchmarksHub } from "./pages/hubs/BenchmarksHub";
+import { HarnessHub } from "./pages/hubs/HarnessHub";
+import { ModelsHub } from "./pages/hubs/ModelsHub";
+import { RepoHub } from "./pages/hubs/RepoHub";
+import { ResultsHub } from "./pages/hubs/ResultsHub";
+import { SystemHub } from "./pages/hubs/SystemHub";
+import { FlowPage } from "./pages/flows/FlowPage";
 import { Improvements } from "./pages/Improvements";
 import { Login } from "./pages/Login";
+import { LocalModels } from "./pages/LocalModels";
+import { LocalResults } from "./pages/LocalResults";
 import { NewEvaluation } from "./pages/NewEvaluation";
 import { Runs } from "./pages/Runs";
 import { Settings } from "./pages/Settings";
@@ -26,12 +40,25 @@ import { applyTheme, getStoredTheme } from "./theme";
 import type { ThemeMode } from "./theme";
 import type {
   CaseCreatePayload,
+  RetryMode,
   CaseRecord,
   RunBatchPayload,
   RunCreatePayload,
   RunRecord,
   SessionState
 } from "./types";
+
+const MESSAGES = defineMessages({
+  en: { previewMode: "Preview mode" },
+  es: { previewMode: "Modo de vista previa" }
+});
+
+/** Sentinel for `apiStatus`: the health check never reached the API. Mapped to
+ * text at render time (not stored translated) so a language switch updates it
+ * without a refetch. */
+const PREVIEW_MODE = "__preview_mode__";
+// How often the run list is re-read while the tab is visible.
+const RUNS_REFRESH_MS = 15_000;
 
 const previewCase: CaseRecord = {
   case_id: "tetris-v1",
@@ -80,11 +107,12 @@ export default function App() {
   const [cases, setCases] = useState<CaseRecord[]>(fallbackCases);
   const [runs, setRuns] = useState<RunRecord[]>(fallbackRuns);
   const [selectedCaseId, setSelectedCaseId] = useState<string | null>(previewCase.case_id);
-  const [apiStatus, setApiStatus] = useState("Preview mode");
+  const [apiStatus, setApiStatus] = useState(PREVIEW_MODE);
   const [theme, setTheme] = useState<ThemeMode>(() => getStoredTheme());
   // `null` while the session probe is in flight, so the app never flashes the
   // login form at an already-authenticated operator.
   const [session, setSession] = useState<SessionState | null>(null);
+  const m = useMessages(MESSAGES);
 
   useEffect(() => {
     applyTheme(theme);
@@ -150,13 +178,37 @@ export default function App() {
           casesResult.status === "rejected" &&
           runsResult.status === "rejected"
         ) {
-          setApiStatus("Preview mode");
+          setApiStatus(PREVIEW_MODE);
         }
       }
     );
 
     return () => {
       active = false;
+    };
+  }, [session]);
+
+  // Runs are also created outside this page — `make prune`, `make ladder`,
+  // another tab — and the list above is read once. Re-read it while the tab is
+  // visible, or a whole CLI-launched experiment stays invisible until a reload.
+  useEffect(() => {
+    if (session === null || !session.authenticated) {
+      return undefined;
+    }
+    const refresh = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      api
+        .listRuns()
+        .then((latest) => setRuns(latest))
+        .catch(() => undefined);
+    };
+    const timer = window.setInterval(refresh, RUNS_REFRESH_MS);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refresh);
     };
   }, [session]);
 
@@ -241,8 +293,8 @@ export default function App() {
     return updated;
   };
 
-  const retryRun = async (runId: string) => {
-    const updated = await api.retryRun(runId);
+  const retryRun = async (runId: string, mode?: RetryMode) => {
+    const updated = await api.retryRun(runId, mode);
     updateRun(updated);
     return updated;
   };
@@ -297,14 +349,27 @@ export default function App() {
         }
       >
         <Route element={<Home />} path="/" />
+        {/* Capability hubs (ADR-0090): each links to screens that keep their routes. */}
+        <Route element={<ModelsHub />} path="/models" />
+        <Route element={<HarnessHub />} path="/harness" />
+        <Route element={<BenchmarksHub />} path="/benchmarks" />
+        <Route element={<RepoHub />} path="/your-repo" />
+        <Route element={<ResultsHub />} path="/results" />
+        <Route element={<SystemHub />} path="/system" />
+        {/* Guided flows (ADR-0093): one question per step, a live diagram beside it. */}
+        <Route element={<FlowPage />} path="/flows/:flow" />
         <Route element={<NewEvaluation />} path="/evaluate/new" />
         <Route element={<Audit />} path="/evaluate/audit" />
         <Route element={<SubjectValidation />} path="/evaluate/subject" />
+        <Route element={<HarnessByModel />} path="/evaluate/harness-by-model" />
+        <Route element={<CompareModels />} path="/evaluate/compare-models" />
         <Route element={<Experiments />} path="/evaluate/experiments" />
         <Route element={<Findings />} path="/evidence/findings" />
         <Route element={<Repositories />} path="/evidence/repositories" />
         <Route element={<RepositoryDetail />} path="/evidence/repositories/:targetId" />
         <Route element={<Skills />} path="/evidence/skills" />
+        <Route element={<LocalModels />} path="/local/tune" />
+        <Route element={<LocalResults />} path="/local/results" />
         <Route
           element={
             <>
@@ -318,13 +383,17 @@ export default function App() {
                 selectedCaseId={selectedCaseId}
               />
               {selectedCase !== null ? (
-                <CaseEditor
-                  caseRecord={selectedCase}
-                  key={selectedCase.case_id}
-                  onCloned={upsertCase}
-                  onDeleted={removeCase}
-                  onSaved={upsertCase}
-                />
+                <>
+                  <CaseEditor
+                    caseRecord={selectedCase}
+                    key={selectedCase.case_id}
+                    onCloned={upsertCase}
+                    onDeleted={removeCase}
+                    onSaved={upsertCase}
+                  />
+                  {/* Try the case's skill, improve it, or bring yours (ADR-0091). */}
+                  <CaseSkillTrial caseRecord={selectedCase} key={`trial-${selectedCase.case_id}`} />
+                </>
               ) : null}
             </>
           }
@@ -358,11 +427,18 @@ export default function App() {
         />
         <Route element={<Compare runs={runs} />} path="/advanced/compare" />
         <Route
-          element={<Dashboard apiStatus={apiStatus} cases={cases} runs={runs} />}
+          element={
+            <Dashboard
+              apiStatus={apiStatus === PREVIEW_MODE ? m.previewMode : apiStatus}
+              cases={cases}
+              runs={runs}
+            />
+          }
           path="/advanced/benchmarks"
         />
         <Route element={<Improvements />} path="/advanced/improvements" />
         <Route element={<Health />} path="/system/health" />
+        <Route element={<AgentClis />} path="/system/agent-clis" />
         <Route element={<Guide />} path="/system/guide" />
         <Route
           element={<Settings onThemeChange={setTheme} theme={theme} />}

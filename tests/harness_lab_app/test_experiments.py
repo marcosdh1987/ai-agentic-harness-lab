@@ -376,10 +376,11 @@ def lab(session, monkeypatch):
         )
     )
     runs = RunService(session)
-    monkeypatch.setattr(runs, "_check_runner_image", lambda: None)
+    monkeypatch.setattr(runs, "_check_runner_image", lambda _config=None: None)
     monkeypatch.setattr(runs, "_publish", lambda _run_id: None)
     monkeypatch.setattr(
-        "harness_lab_app.run_service.RunService._check_runner_image", lambda _self: None
+        "harness_lab_app.run_service.RunService._check_runner_image",
+        lambda _self, _config=None: None,
     )
     monkeypatch.setattr(
         "harness_lab_app.run_service.RunService._publish", lambda _self, _run_id: None
@@ -1121,6 +1122,104 @@ def test_relaunching_with_a_different_model_is_refused(session):
     assert len(service.runs("lockcheck")) == 4
 
 
+def test_relaunching_at_a_different_effort_is_refused(session):
+    """Effort is part of what was measured (ADR-0081), so the lock holds it."""
+    claude = {"harness": "claude", "executor_model": "claude-opus-5-5"}
+    service = ExperimentService(session)
+    _skills_design(service, "effortlock")
+    service.launch("effortlock", _base_config(**claude, executor_effort="high"))
+
+    with pytest.raises(ExperimentError, match="executor_effort"):
+        service.launch("effortlock", _base_config(**claude, executor_effort="low"))
+
+    again = service.launch("effortlock", _base_config(**claude, executor_effort="high"))
+    assert len(again) == 2
+    assert service.launch_config("effortlock")["executor_effort"] == "high"
+
+
+def _effort_design(service, experiment_id, mode):
+    return service.create_experiment(
+        ExperimentCreate(
+            experiment_id=experiment_id,
+            name="Effort",
+            question="Does max effort beat the default on this case?",
+            mode=mode,
+            case_ids=["tetris-v1"],
+            repetitions=1,
+            conditions=[
+                ExperimentConditionCreate(
+                    label="default", role=ConditionRole.control, overrides={}
+                ),
+                ExperimentConditionCreate(
+                    label="max",
+                    role=ConditionRole.treatment,
+                    overrides={"executor_effort": "max"},
+                ),
+            ],
+        )
+    )
+
+
+def test_a_harness_evaluation_refuses_to_vary_effort(session):
+    """Effort is a setting of the model: varying it confounds the harness."""
+    service = ExperimentService(session)
+    with pytest.raises(ExperimentDesignError, match="executor_effort"):
+        _effort_design(service, "effortconfound", ExperimentMode.harness_evaluation)
+
+
+def test_an_experiment_can_vary_effort_between_arms(session):
+    """Same model, two effort levels: two arms, each carrying its own level."""
+    service = ExperimentService(session)
+    CaseService(session).create_case(
+        CaseCreate(
+            case_id="tetris-v1",
+            name="Tetris",
+            type=CaseType.single_prompt,
+            prompt_variants={"sdlc": "Build Tetris."},
+        )
+    )
+    _effort_design(service, "effortaxis", ExperimentMode.discovery)
+    runs = service.launch(
+        "effortaxis",
+        _base_config(harness="claude", executor_model="claude-opus-5-5"),
+    )
+    runs_service = RunService(session)
+    by_arm = {
+        run.condition_label: runs_service.get_run_config(
+            run.run_config_id
+        ).executor_effort
+        for run in runs
+    }
+    assert by_arm == {"default": "", "max": "max"}
+
+
+def test_an_effort_arm_is_preflighted_even_after_its_default_arm(session):
+    """The default arm passes first; the max arm must still be checked.
+
+    If effort were missing from the launch's preflight de-duplication key, the
+    max arm would reuse the default arm's answer, be persisted, and fail later
+    inside the runner, which reads as an effect of the treatment.
+    """
+    from harness_lab_app.run_service import RunPreflightError
+
+    service = ExperimentService(session)
+    CaseService(session).create_case(
+        CaseCreate(
+            case_id="tetris-v1",
+            name="Tetris",
+            type=CaseType.single_prompt,
+            prompt_variants={"sdlc": "Build Tetris."},
+        )
+    )
+    _effort_design(service, "effortpreflight", ExperimentMode.discovery)
+    with pytest.raises(RunPreflightError, match="no effort control"):
+        service.launch(
+            "effortpreflight",
+            _base_config(harness="claude", executor_model="claude-haiku-4-5-20251001"),
+        )
+    assert service.runs("effortpreflight") == []
+
+
 def test_a_dry_run_rehearsal_neither_locks_nor_is_blocked(session):
     """Dry runs build commands; they measure nothing, so they lock nothing."""
     service = ExperimentService(session)
@@ -1401,10 +1500,12 @@ def test_a_treatment_that_never_invoked_its_skill_invalidates_the_summary(sessio
     summary = service.summarize("activation")
 
     assert summary["validity"]["status"] == "invalid"
-    # Invalid leads, degraded follows.
+    # Invalid leads, degraded follows — and a one-case design says its interval
+    # is about that case, last, because it bounds the reading, not the design.
     assert [issue["code"] for issue in summary["validity"]["issues"]] == [
         "treatment_not_activated",
         "design_objection",
+        "few_cases",
     ]
     assert summary["verdict"]["headline"] == "Comparison not valid"
     assert summary["verdict"]["tone"] == "invalid"
@@ -1726,6 +1827,141 @@ def test_the_case_matrix_reads_every_repetition_not_the_last(session):
     assert summary["verdict"]["movements"]["fixed"] == 0
 
 
+def _reps_design(service, experiment_id, repetitions=3):
+    """One case, a control and a treatment: the smallest design with a delta."""
+    from sqlmodel import select
+
+    from harness_lab_app.models import Case, CaseType
+
+    session = service.session
+    if not session.exec(select(Case).where(Case.case_id == "tetris-v1")).first():
+        session.add(
+            Case(
+                case_id="tetris-v1",
+                name="Tetris",
+                type=CaseType.single_prompt,
+                prompt_variants={"sdlc": "Build Tetris."},
+            )
+        )
+        session.commit()
+    service.create_experiment(
+        ExperimentCreate(
+            experiment_id=experiment_id,
+            name="Uncertainty",
+            question="Does the skill help?",
+            mode=ExperimentMode.harness_evaluation,
+            case_ids=["tetris-v1"],
+            repetitions=repetitions,
+            conditions=[
+                ExperimentConditionCreate(
+                    label="control",
+                    role=ConditionRole.control,
+                    overrides={"skills_disabled": ["bootstrap_project"]},
+                ),
+                ExperimentConditionCreate(
+                    label="treatment",
+                    role=ConditionRole.treatment,
+                    overrides={"skills_disabled": []},
+                ),
+            ],
+        )
+    )
+
+
+def test_every_arm_reports_the_interval_around_its_success_rate(session):
+    """A pass rate over three runs is a range, and the summary says which range.
+
+    ADR-0064: the interval existed in `statistics.py` for months and reached
+    neither the API nor the page, so "validation" was printed over numbers
+    whose 95% interval spanned most of the scale.
+    """
+    from harness_lab_app.statistics import wilson_interval
+
+    service = ExperimentService(session)
+    _reps_design(service, "uncertainty")
+    runs = service.launch("uncertainty", _base_config())
+    treatment_runs = [run for run in runs if run.condition_label == "treatment"]
+    for run in runs:
+        if run.condition_label == "control":
+            _score(session, run, passed=False)
+    for run, passed in zip(treatment_runs, (True, True, False), strict=True):
+        _score(session, run, passed=passed)
+
+    summary = service.summarize("uncertainty")
+
+    arms = {condition["label"]: condition for condition in summary["conditions"]}
+    low, high = wilson_interval(2, 3)
+    assert arms["treatment"]["success_rate_ci_low"] == pytest.approx(low)
+    assert arms["treatment"]["success_rate_ci_high"] == pytest.approx(high)
+    # 0 of 3 is not "certainly zero": the upper bound stays above half.
+    assert arms["control"]["success_rate_ci_low"] == 0.0
+    assert arms["control"]["success_rate_ci_high"] > 0.5
+    # pass^k asks whether every try passes; two of three is not that.
+    assert arms["treatment"]["pass_k"]["k"] == 3
+    assert arms["treatment"]["pass_k"]["pass_at_k"] == pytest.approx(1.0)
+    assert arms["treatment"]["pass_k"]["pass_hat_k"] == pytest.approx(0.0)
+
+
+def test_the_success_delta_arrives_with_a_case_clustered_interval(session):
+    service = ExperimentService(session)
+    _reps_design(service, "delta-interval")
+    runs = service.launch("delta-interval", _base_config())
+    for run in runs:
+        _score(session, run, passed=run.condition_label == "treatment")
+
+    summary = service.summarize("delta-interval")
+
+    success = summary["comparisons"][0]["success"]
+    assert success["points"] == pytest.approx(100.0)
+    assert success["paired_cases"] == 1
+    assert success["delta_ci_low"] < success["points"]
+    assert success["delta_ci_high"] == pytest.approx(100.0)
+    assert success["interval_crosses_zero"] is (success["delta_ci_low"] <= 0.0)
+    # Computed twice, rendered twice, the same both times.
+    assert service.summarize("delta-interval")["comparisons"][0]["success"] == success
+
+
+def test_the_summary_says_how_many_repetitions_a_20_point_difference_needs(session):
+    """Advice for the next design, offered before anything has even run."""
+    service = ExperimentService(session)
+    _reps_design(service, "planning", repetitions=2)
+
+    summary = service.summarize("planning")
+
+    plan = summary["repetition_plan"]
+    assert plan["basis"] == "assumed"
+    assert plan["difference_points"] == 20
+    assert plan["repetitions_per_case"] == plan["runs_per_arm"] == 93
+    assert summary["repetitions_needed_for_20pp"] == 93
+    # Nothing scored yet: no interval, no pass^k — and no invented ones.
+    for condition in summary["conditions"]:
+        assert condition["success_rate_ci_low"] is None
+        assert condition["success_rate_ci_high"] is None
+        assert condition["pass_k"] is None
+
+
+def test_a_mode_with_no_comparison_gets_no_repetition_plan(lab):
+    lab.create_experiment(
+        _payload(
+            experiment_id="nothing-to-compare",
+            mode=ExperimentMode.discovery,
+            repetitions=1,
+            conditions=[
+                ExperimentConditionCreate(
+                    label="as-is",
+                    role=ConditionRole.control,
+                    overrides={"target_repo_id": "payments"},
+                ),
+            ],
+        )
+    )
+
+    summary = lab.summarize("nothing-to-compare")
+
+    assert summary["repetition_plan"] is None
+    assert summary["repetitions_needed_for_20pp"] is None
+
+
 def test_a_ladder_rung_is_not_objected_to_for_being_single_factor():
     """A rung of a family is single-factor by design (ADR-0051)."""
     warnings = validate_design(
@@ -1878,7 +2114,7 @@ def test_two_arms_failing_the_same_check_identically_is_a_floor(session):
     """Nothing resolved on either side, so the 0-point delta ranks nothing.
 
     This is `audit-ml-python-base`: every run failed the lab's own `make test`
-    and the summary led with "No difference observed" (ADR-0063).
+    and the summary led with "No difference observed" (ADR-0062).
     """
     service = ExperimentService(session)
     # Two repetitions: below that the floor stays quiet for the same reason the
@@ -1928,3 +2164,732 @@ def test_a_manual_only_case_is_not_an_unmeasured_experiment(session):
     assert "objective_unmeasured" not in [
         issue["code"] for issue in summary["validity"]["issues"]
     ]
+
+
+# --------------------------------------------------------------------------
+# Harness x model — the interaction is the question (ADR-0066)
+# --------------------------------------------------------------------------
+
+
+def _grid(**over):
+    """A 2x2: bare vs the lab harness, on two models."""
+    conditions = []
+    for model in ("small", "large"):
+        for source in (HarnessSource.bare, HarnessSource.lab_root):
+            conditions.append(
+                ExperimentConditionCreate(
+                    label=f"{source.value}-{model}",
+                    role=ConditionRole.control
+                    if (source == HarnessSource.bare and model == "small")
+                    else ConditionRole.treatment,
+                    overrides={"harness_source": source, "executor_model": model},
+                )
+            )
+    base = {
+        "experiment_id": "less-harness",
+        "question": "Do stronger models need less harness?",
+        "mode": ExperimentMode.harness_by_model,
+        "case_ids": ["add-endpoint"],
+        "prompt_variants": ["default"],
+        "repetitions": 3,
+        "conditions": conditions,
+    }
+    base.update(over)
+    return ExperimentCreate(**base)
+
+
+def test_harness_by_model_accepts_a_full_grid_where_harness_evaluation_refuses_it(lab):
+    experiment, _ = lab.create_experiment(_grid())
+    assert experiment.mode == ExperimentMode.harness_by_model
+    with pytest.raises(ExperimentDesignError, match="confounded"):
+        lab.create_experiment(
+            _grid(experiment_id="refused", mode=ExperimentMode.harness_evaluation)
+        )
+
+
+def test_harness_by_model_refuses_an_incomplete_grid(lab):
+    payload = _grid()
+    payload.conditions = payload.conditions[:3]
+    with pytest.raises(ExperimentDesignError, match="incomplete"):
+        lab.create_experiment(payload)
+
+
+def test_harness_by_model_refuses_a_second_varying_harness_factor(lab):
+    payload = _grid()
+    for condition in payload.conditions:
+        if condition.overrides["harness_source"] == HarnessSource.lab_root:
+            condition.overrides["skills_invoke"] = ["verify_changes"]
+    with pytest.raises(ExperimentDesignError, match="one harness"):
+        lab.create_experiment(payload)
+
+
+def test_harness_by_model_keeps_the_declared_model_order(lab):
+    """Labels sort alphabetically on read ('bare-large' before 'bare-small'), but
+    the interaction runs from the first model declared to the last — reading it
+    the other way round flips its sign."""
+    lab.create_experiment(_grid())
+    block = lab.summarize("less-harness")["factorial"]
+    assert block["models"] == ["small", "large"]
+    assert block["interaction"]["from_model"] == "small"
+    assert block["interaction"]["to_model"] == "large"
+
+
+def test_harness_by_model_order_does_not_depend_on_which_arm_is_the_control(lab):
+    """Declared small→large, control on the *large* model: the reading must still
+    run small→large. The control role sorts first on read and used to drag its
+    model to the front."""
+    payload = _grid()
+    for condition in payload.conditions:
+        condition.role = (
+            ConditionRole.control
+            if condition.label == "bare-large"
+            else ConditionRole.treatment
+        )
+    lab.create_experiment(payload)
+    block = lab.summarize("less-harness")["factorial"]
+    assert block["models"] == ["small", "large"]
+    assert block["harness_levels"] == ["no harness", "lab harness"]
+
+
+def _cost(session, run, usd):
+    from harness_lab_app.models import Score
+
+    session.add(Score(run_id=run.run_id, name="cost_usd", version=1, value_num=usd))
+    session.commit()
+
+
+def test_harness_by_model_cost_per_resolved_counts_only_scored_runs_with_cost(lab):
+    """Cost per resolved task divides the cost of the runs it counts by their
+    passes. A run with no cost figure is not $0: the cell reports no figure."""
+    lab.create_experiment(_grid(repetitions=2))
+    runs = lab.launch(
+        "less-harness",
+        RunConfigCreate(case_id="add-endpoint", prompt_variant="default"),
+    )
+    for run in runs:
+        _score(lab.session, run, passed=True)
+        if run.condition_label != "lab_root-large":
+            _cost(lab.session, run, 1.0)
+    # lab_root-large: one run has a cost, the other does not.
+    _cost(
+        lab.session, next(r for r in runs if r.condition_label == "lab_root-large"), 1.0
+    )
+
+    cells = {
+        (c["level"], c["model"]): c
+        for c in lab.summarize("less-harness")["factorial"]["cells"]
+    }
+    assert cells[("no harness", "small")]["cost_per_resolved_usd"] == pytest.approx(1.0)
+    assert cells[("lab harness", "large")]["cost_usd"] is None
+    assert cells[("lab harness", "large")]["cost_per_resolved_usd"] is None
+
+
+def test_harness_by_model_summary_reads_the_interaction(lab):
+    lab.create_experiment(_grid())
+    runs = lab.launch(
+        "less-harness",
+        RunConfigCreate(case_id="add-endpoint", prompt_variant="default"),
+    )
+    assert len(runs) == 12  # 4 cells x 3 repetitions
+    # small: bare 0/3 → harness 3/3 ; large: bare 3/3 → harness 3/3
+    passes = {
+        "bare-small": False,
+        "lab_root-small": True,
+        "bare-large": True,
+        "lab_root-large": True,
+    }
+    for run in runs:
+        _score(lab.session, run, passed=passes[run.condition_label])
+
+    block = lab.summarize("less-harness")["factorial"]
+
+    assert block["axis"] == "harness_source"
+    assert block["models"] == ["small", "large"]
+    assert block["harness_levels"] == ["no harness", "lab harness"]
+    effects = {row["model"]: row["points"] for row in block["harness_effect"]}
+    assert effects == {"small": pytest.approx(100.0), "large": pytest.approx(0.0)}
+    assert block["interaction"]["points"] == pytest.approx(-100.0)
+    # One case cannot establish anything, however large the observed change.
+    assert block["interaction"]["established"] is False
+
+
+def test_harness_by_model_verdict_points_to_the_panel_not_to_missing_evidence(lab):
+    lab.create_experiment(_grid())
+    runs = lab.launch(
+        "less-harness",
+        RunConfigCreate(case_id="add-endpoint", prompt_variant="default"),
+    )
+    for run in runs:
+        _score(lab.session, run, passed=True)
+    verdict = lab.summarize("less-harness")["verdict"]
+    assert verdict["headline"] != "Not enough evidence yet"
+    assert "harness x model" in verdict["headline"].lower()
+    assert verdict["causal"] is False
+
+
+def test_tier_tags_give_each_arm_a_capability_frontier(lab):
+    """Cases tagged tier:1 / tier:2 turn any experiment into a capability ladder
+    per arm (ADR-0069): the highest tier the arm does reliably."""
+    for case_id, tier in [
+        ("t1a", "1"),
+        ("t1b", "1"),
+        ("t1c", "1"),
+        ("t1d", "1"),
+        ("t2a", "2"),
+        ("t2b", "2"),
+        ("t2c", "2"),
+        ("t2d", "2"),
+    ]:
+        CaseService(lab.session).create_case(
+            CaseCreate(
+                case_id=case_id,
+                name=case_id,
+                type=CaseType.repo_task,
+                prompt_variants={"default": "do it"},
+                tags=[f"tier:{tier}"],
+            )
+        )
+    lab.create_experiment(
+        _grid(
+            experiment_id="ladder",
+            case_ids=["t1a", "t1b", "t1c", "t1d", "t2a", "t2b", "t2c", "t2d"],
+            repetitions=5,
+        )
+    )
+    runs = lab.launch(
+        "ladder", RunConfigCreate(case_id="t1a", prompt_variant="default")
+    )
+    run_service = RunService(lab.session)
+    for run in runs:
+        case_id = run_service.get_run_config(run.run_config_id).case_id
+        # Every arm solves tier 1; only the large model with the harness solves tier 2.
+        passed = case_id.startswith("t1") or run.condition_label == "lab_root-large"
+        _score(lab.session, run, passed=passed)
+
+    block = lab.summarize("ladder")["capability"]
+    frontier = {arm["label"]: arm["frontier"] for arm in block["arms"]}
+    assert block["tiers"] == ["1", "2"]
+    assert frontier["lab_root-large"] == "2"
+    assert frontier["bare-small"] == "1"
+
+
+def test_untagged_cases_produce_no_capability_block(lab):
+    lab.create_experiment(_grid(experiment_id="plain"))
+    assert lab.summarize("plain")["capability"] is None
+
+
+def test_a_partial_vs_full_harness_ladder_runs_as_harness_by_model(lab):
+    """none → governance only → full, on two models: the effect of each rung is
+    read per model against 'none'."""
+    conditions = []
+    for model in ("small", "large"):
+        for label, overrides in [
+            ("none", {"harness_source": HarnessSource.bare}),
+            (
+                "gov",
+                {
+                    "harness_source": HarnessSource.lab_root,
+                    "skills_disabled": ["verify_changes"],
+                },
+            ),
+            ("full", {"harness_source": HarnessSource.lab_root}),
+        ]:
+            conditions.append(
+                ExperimentConditionCreate(
+                    label=f"{label}-{model}",
+                    role=ConditionRole.control
+                    if (label, model) == ("none", "small")
+                    else ConditionRole.treatment,
+                    overrides={**overrides, "executor_model": model},
+                )
+            )
+    lab.create_experiment(_grid(experiment_id="ladder3", conditions=conditions))
+    block = lab.summarize("ladder3")["factorial"]
+    assert block["axis"] == "harness_level"
+    assert len(block["harness_levels"]) == 3
+    rungs = {(row["model"], row["level"]) for row in block["harness_effect"]}
+    assert len(rungs) == 4  # two rungs above 'none', on two models
+
+
+# --------------------------------------------------------------------------
+# Leave-one-out pruning (ADR-0076)
+# --------------------------------------------------------------------------
+
+
+def test_removed_item_names_the_one_skill_a_treatment_drops():
+    from harness_lab_app.experiment_service import removed_item
+
+    control = {"prompt_variant": "harness", "skills_disabled": []}
+    assert (
+        removed_item(control, {**control, "skills_disabled": ["verify_changes"]})
+        == "skill:verify_changes"
+    )
+    # Two at once is one group item (ADR-0085), named in a stable order.
+    assert (
+        removed_item(control, {**control, "skills_disabled": ["b", "a"]})
+        == "skills:a,b"
+    )
+    # A treatment that re-adds a skill the control removed is not an ablation.
+    assert (
+        removed_item(
+            {**control, "skills_disabled": ["a"]},
+            {**control, "skills_disabled": ["b"]},
+        )
+        is None
+    )
+    # Neither is a different prompt.
+    assert (
+        removed_item(
+            control,
+            {"prompt_variant": "default", "skills_disabled": ["verify_changes"]},
+        )
+        is None
+    )
+
+
+def _case_of(session, run) -> str:
+    from harness_lab_app.models import RunConfig
+
+    return session.get(RunConfig, run.run_config_id).case_id
+
+
+def test_a_pruning_family_reports_a_removal_verdict_per_skill(session):
+    """Removing one skill changed nothing on three cases: removable.
+
+    Removing the other doubled the cost to resolve while both arms passed
+    everything — the success rate cannot see that, the per-step reward can.
+    """
+    from harness_lab_app.models import Case, CaseType, Score
+    from harness_lab_app.skills_catalog import known_skill_names
+
+    governed = sorted(known_skill_names())[:2]
+    if len(governed) < 2:
+        pytest.skip("not enough governed skills in this checkout")
+    cheap, costly = governed
+    service = ExperimentService(session)
+    cases = ["prune-a", "prune-b", "prune-c"]
+    for case_id in cases:
+        session.add(
+            Case(
+                case_id=case_id,
+                name=case_id,
+                type=CaseType.single_prompt,
+                prompt_variants={"harness": "Do it.", "default": "Do it."},
+            )
+        )
+    session.commit()
+    control = {"prompt_variant": "harness", "skills_disabled": []}
+    service.create_experiment(
+        ExperimentCreate(
+            experiment_id="prune-claude-haiku-2x",
+            name="Pruning",
+            question="Which skills can go?",
+            mode=ExperimentMode.harness_evaluation,
+            case_ids=cases,
+            repetitions=3,
+            family_id="prune-claude-haiku",
+            conditions=[
+                ExperimentConditionCreate(
+                    label="full-harness", role=ConditionRole.control, overrides=control
+                ),
+                ExperimentConditionCreate(
+                    label=f"without-{cheap}",
+                    overrides={**control, "skills_disabled": [cheap]},
+                ),
+                ExperimentConditionCreate(
+                    label=f"without-{costly}",
+                    overrides={**control, "skills_disabled": [costly]},
+                ),
+            ],
+        )
+    )
+    runs = service.launch(
+        "prune-claude-haiku-2x",
+        _base_config(case_id=cases[0], prompt_variant="harness"),
+    )
+    for run in runs:
+        # One case fails in every arm: the set can show a difference, so a
+        # verdict is possible (an all-pass ceiling is no_signal, ADR-0086).
+        _score(session, run, passed=_case_of(session, run) != "prune-c")
+        cost = 0.60 if run.condition_label == f"without-{costly}" else 0.30
+        for name, value in (("cost_to_resolve_usd", cost), ("progress_auc", 1.0)):
+            session.add(Score(run_id=run.run_id, name=name, version=1, value_num=value))
+    session.commit()
+
+    pruning = service.summarize("prune-claude-haiku-2x")["pruning"]
+
+    by_item = {row["item"]: row for row in pruning}
+    assert by_item[f"skill:{cheap}"]["decision"] == "removable"
+    assert by_item[f"skill:{costly}"]["decision"] == "keep"
+    assert "cost_to_resolve_usd" in by_item[f"skill:{costly}"]["reason"]
+    # Keep first: the reader meets what must stay before what may go.
+    assert pruning[0]["decision"] == "keep"
+
+
+def test_a_pruning_family_without_step_scores_removes_nothing(session):
+    """Success alone is not evidence of a removal (PR #45 review).
+
+    Runs from before per-step snapshots carry `task_validation_pass` but no
+    `cost_to_resolve_usd`/`progress_auc`. A clean success record on three cases
+    must read *inconclusive*, never *removable*.
+    """
+    from harness_lab_app.models import Case, CaseType
+    from harness_lab_app.skills_catalog import known_skill_names
+
+    governed = sorted(known_skill_names())[:1]
+    if not governed:
+        pytest.skip("no governed skills in this checkout")
+    service = ExperimentService(session)
+    cases = ["prune-a", "prune-b", "prune-c"]
+    for case_id in cases:
+        session.add(
+            Case(
+                case_id=case_id,
+                name=case_id,
+                type=CaseType.single_prompt,
+                prompt_variants={"harness": "Do it.", "default": "Do it."},
+            )
+        )
+    session.commit()
+    control = {"prompt_variant": "harness", "skills_disabled": []}
+    service.create_experiment(
+        ExperimentCreate(
+            experiment_id="prune-claude-haiku-1x",
+            name="Pruning",
+            question="Which skills can go?",
+            mode=ExperimentMode.harness_evaluation,
+            case_ids=cases,
+            repetitions=3,
+            family_id="prune-claude-haiku",
+            conditions=[
+                ExperimentConditionCreate(
+                    label="full-harness", role=ConditionRole.control, overrides=control
+                ),
+                ExperimentConditionCreate(
+                    label=f"without-{governed[0]}",
+                    overrides={**control, "skills_disabled": governed},
+                ),
+            ],
+        )
+    )
+    runs = service.launch(
+        "prune-claude-haiku-1x",
+        _base_config(case_id=cases[0], prompt_variant="harness"),
+    )
+    for run in runs:
+        _score(session, run, passed=_case_of(session, run) != "prune-c")
+    session.commit()
+
+    (row,) = service.summarize("prune-claude-haiku-1x")["pruning"]
+
+    assert row["decision"] == "inconclusive"
+    assert row["missing_metrics"] == ["cost_to_resolve_usd", "progress_auc"]
+
+
+def test_a_non_pruning_experiment_has_no_pruning_block(lab):
+    lab.create_experiment(_payload())
+    assert lab.summarize("migration-safety")["pruning"] is None
+
+
+# --------------------------------------------------------------------------
+# Two at a time (ADR-0082): a model comparison may run on two lanes
+# --------------------------------------------------------------------------
+
+
+def _models_design(service, experiment_id="two-lanes", repetitions=1):
+    from sqlmodel import select
+
+    from harness_lab_app.models import Case, CaseType
+
+    session = service.session
+    case = session.exec(select(Case).where(Case.case_id == "tetris-v1")).first()
+    if case is None:
+        case = Case(
+            case_id="tetris-v1",
+            name="Tetris",
+            type=CaseType.single_prompt,
+            prompt_variants={"sdlc": "Build Tetris."},
+        )
+    # A model comparison is a subject validation, which grades by command.
+    case.validation_commands = ["test -s {workspace}/main.py"]
+    session.add(case)
+    session.commit()
+    service.create_experiment(
+        ExperimentCreate(
+            experiment_id=experiment_id,
+            name="Two lanes",
+            question="Which model builds tetris best?",
+            mode=ExperimentMode.subject_validation,
+            subject="model comparison on tetris-v1",
+            case_ids=["tetris-v1"],
+            prompt_variants=["sdlc"],
+            repetitions=repetitions,
+            family_id="models-tetris-v1",
+            conditions=[
+                ExperimentConditionCreate(
+                    label="opus",
+                    role=ConditionRole.treatment,
+                    overrides={
+                        "harness": "claude",
+                        "executor_model": "claude-opus-5-5",
+                    },
+                ),
+                ExperimentConditionCreate(
+                    label="local",
+                    role=ConditionRole.treatment,
+                    overrides={"harness": "opencode", "executor_model": "lmstudio/x"},
+                ),
+            ],
+        )
+    )
+
+
+def test_two_at_a_time_puts_one_model_on_each_lane(session):
+    """Claude on one lane, the slower local model on the other."""
+    main: list[str] = []
+    second: list[str] = []
+    service = ExperimentService(
+        session, enqueue=main.append, enqueue_parallel=second.append
+    )
+    _models_design(service)
+
+    runs = service.launch("two-lanes", _base_config(dry_run=True), parallel=2)
+
+    label = {run.run_id: run.condition_label for run in runs}
+    assert len(main) == 1 and len(second) == 1
+    # One model on each lane, so neither waits for the other.
+    assert {label[main[0]], label[second[0]]} == {"opus", "local"}
+
+
+def test_repetitions_alternate_so_each_lane_gets_every_model(session):
+    """Two models x two repetitions: a lane never runs one model twice in a row."""
+    main: list[str] = []
+    second: list[str] = []
+    service = ExperimentService(
+        session, enqueue=main.append, enqueue_parallel=second.append
+    )
+    _models_design(service, "two-lanes-reps", repetitions=2)
+
+    runs = service.launch("two-lanes-reps", _base_config(dry_run=True), parallel=2)
+
+    label = {run.run_id: run.condition_label for run in runs}
+    assert len(main) == 2 and len(second) == 2
+    assert sorted(label[r] for r in main) == ["local", "opus"]
+    assert sorted(label[r] for r in second) == ["local", "opus"]
+
+
+def test_one_at_a_time_is_the_default_and_uses_one_lane(session):
+    main: list[str] = []
+    second: list[str] = []
+    service = ExperimentService(
+        session, enqueue=main.append, enqueue_parallel=second.append
+    )
+    _models_design(service, "one-lane")
+
+    runs = service.launch("one-lane", _base_config(dry_run=True))
+
+    assert sorted(main) == sorted(run.run_id for run in runs)
+    assert second == []
+
+
+def test_a_models_family_name_does_not_make_an_ablation_parallel(session):
+    """The `models-` prefix is a name anyone can type; the design is what counts.
+
+    An ablation regenerates `.claude/skills` in the shared tree (ADR-0011), so
+    filing a harness evaluation under a `models-` family must not open the
+    second lane to it.
+    """
+    service = ExperimentService(
+        session, enqueue=lambda _r: None, enqueue_parallel=lambda _r: None
+    )
+    _skills_design(service, "ablation-two-lanes")
+    experiment = service.get_experiment("ablation-two-lanes")
+    experiment.family_id = "models-tetris-v1"
+    session.add(experiment)
+    session.commit()
+
+    with pytest.raises(ExperimentError, match="not subject_validation") as refused:
+        service.launch("ablation-two-lanes", _base_config(dry_run=True), parallel=2)
+    assert "also sets skills_disabled" in str(refused.value)
+    assert "is a control" in str(refused.value)
+
+
+def test_only_a_model_comparison_runs_two_at_a_time(session):
+    """Any other design keeps the one lane ADR-0002 guarantees."""
+    service = ExperimentService(
+        session, enqueue=lambda _r: None, enqueue_parallel=lambda _r: None
+    )
+    _skills_design(service, "harness-two-lanes")
+
+    with pytest.raises(ExperimentError, match="Only a model comparison"):
+        service.launch("harness-two-lanes", _base_config(dry_run=True), parallel=2)
+
+
+def test_a_model_arm_that_also_changes_something_else_runs_one_at_a_time(session):
+    """Same mode, peers, harness and model — plus a staged skill: not a model arm."""
+    from sqlmodel import select
+
+    from harness_lab_app.models import ExperimentCondition
+
+    service = ExperimentService(
+        session, enqueue=lambda _r: None, enqueue_parallel=lambda _r: None
+    )
+    _models_design(service, "models-plus-skill")
+    arm = session.exec(
+        select(ExperimentCondition).where(
+            ExperimentCondition.experiment_id == "models-plus-skill",
+            ExperimentCondition.label == "opus",
+        )
+    ).one()
+    arm.overrides = {**arm.overrides, "skills_extra": ["new-skill"]}
+    session.add(arm)
+    session.commit()
+
+    with pytest.raises(ExperimentError, match="arm 'opus' also sets skills_extra"):
+        service.launch("models-plus-skill", _base_config(dry_run=True), parallel=2)
+
+
+def test_the_model_comparison_shape():
+    from harness_lab_app.model_comparison import model_comparison_shape_errors
+
+    peers = [
+        (
+            "opus",
+            "treatment",
+            {"harness": "claude", "executor_model": "claude-opus-5-5"},
+        ),
+        (
+            "fable",
+            "treatment",
+            {
+                "harness": "claude",
+                "executor_model": "claude-fable-5-2",
+                "executor_effort": "high",
+            },
+        ),
+    ]
+    assert model_comparison_shape_errors("subject_validation", peers) == []
+    assert model_comparison_shape_errors("subject_validation", peers[:1]) == [
+        "it has fewer than two arms"
+    ]
+    no_model = [*peers, ("bare", "treatment", {"harness": "claude"})]
+    assert model_comparison_shape_errors("subject_validation", no_model) == [
+        "arm 'bare' does not fix a harness and a model"
+    ]
+
+
+def test_two_at_a_time_without_the_second_lane_fails_instead_of_running_one(session):
+    """Silently sequential would answer a request nobody made."""
+    published: list[str] = []
+    service = ExperimentService(session, enqueue=published.append)
+    _models_design(service, "no-second-lane")
+
+    with pytest.raises(ExperimentError, match="second run lane"):
+        service.launch("no-second-lane", _base_config(dry_run=True), parallel=2)
+    assert published == []
+
+
+def test_only_one_or_two_lanes_exist(session):
+    service = ExperimentService(session, enqueue=lambda _r: None)
+    _models_design(service, "three-lanes")
+    with pytest.raises(ExperimentError, match="1 or 2"):
+        service.launch("three-lanes", _base_config(dry_run=True), parallel=3)
+
+
+def test_the_lanes_route_is_not_read_as_a_run_id():
+    """`/api/runs/lanes` must be matched before `/api/runs/{run_id}`."""
+    from fastapi.routing import APIRoute
+
+    from harness_lab_app.api import create_app
+
+    paths = [route.path for route in create_app().routes if isinstance(route, APIRoute)]
+    assert paths.index("/api/runs/lanes") < paths.index("/api/runs/{run_id}")
+
+
+def test_a_parallel_launch_with_no_second_worker_is_refused(monkeypatch):
+    """Half the runs would sit pending forever on a queue nobody serves."""
+    from fastapi import HTTPException
+    from fastapi.routing import APIRoute
+
+    from harness_lab_app import health_service
+    from harness_lab_app.api import create_app
+    from harness_lab_app.schemas import ExperimentLaunch
+
+    monkeypatch.setattr(health_service, "queues_served", lambda: {"runs"})
+    launch = next(
+        route.endpoint
+        for route in create_app().routes
+        if isinstance(route, APIRoute)
+        and route.path == "/api/experiments/{experiment_id}/launch"
+    )
+    with pytest.raises(HTTPException) as refused:
+        launch("x", ExperimentLaunch(config=_base_config(), parallel=2), session=None)
+    assert refused.value.status_code == 422
+    assert "second run lane" in refused.value.detail
+
+
+def test_a_parallel_launch_is_refused_when_the_lane_cannot_be_confirmed(monkeypatch):
+    """Unknown is not a yes: the runs sent there could wait forever."""
+    from fastapi import HTTPException
+    from fastapi.routing import APIRoute
+
+    from harness_lab_app import health_service
+    from harness_lab_app.api import create_app
+    from harness_lab_app.schemas import ExperimentLaunch
+
+    monkeypatch.setattr(health_service, "queues_served", lambda: None)
+    launch = next(
+        route.endpoint
+        for route in create_app().routes
+        if isinstance(route, APIRoute)
+        and route.path == "/api/experiments/{experiment_id}/launch"
+    )
+    with pytest.raises(HTTPException) as refused:
+        launch("x", ExperimentLaunch(config=_base_config(), parallel=2), session=None)
+    assert "Could not ask the workers" in refused.value.detail
+
+
+def test_pruning_overview_lists_only_pruning_families_with_model_and_prompt(lab):
+    lab.create_experiment(_payload())  # an ordinary experiment: not listed
+    control = {"prompt_variant": "default", "skills_disabled": []}
+    lab.create_experiment(
+        _payload(
+            experiment_id="prune-claude-stub-2group",
+            family_id="prune-claude-stub",
+            repetitions=1,
+            conditions=[
+                ExperimentConditionCreate(
+                    label="full-harness", role=ConditionRole.control, overrides=control
+                ),
+                ExperimentConditionCreate(
+                    label="without-group-of-2",
+                    overrides={
+                        **control,
+                        "skills_disabled": ["verify_changes", "writing-plans"],
+                    },
+                ),
+            ],
+        )
+    )
+    lab.launch(
+        "prune-claude-stub-2group",
+        RunConfigCreate(
+            case_id="add-endpoint",
+            prompt_variant="default",
+            executor_model="stub-model",
+        ),
+    )
+
+    rows = lab.pruning_overview()
+
+    assert [row["experiment_id"] for row in rows] == ["prune-claude-stub-2group"]
+    row = rows[0]
+    assert row["model"] == "stub-model"
+    assert row["prompt"] == "default"
+    assert row["runs"] == 2
+    assert row["finished"] is False
+    # No scored run yet: the arm is still judged, and judged inconclusive.
+    assert [v["removed"] for v in row["verdicts"]] == [
+        ["verify_changes", "writing-plans"]
+    ]
+    assert row["verdicts"][0]["decision"] == "inconclusive"

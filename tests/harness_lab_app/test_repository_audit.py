@@ -175,6 +175,38 @@ def test_a_root_level_harness_is_seen_the_same_as_a_dotted_one():
     assert evidence["harness_present"] is True
 
 
+def test_a_plugin_marketplace_shows_its_plugins_skills_and_agents():
+    """A harness shipped as plugins lives one root per plugin.
+
+    Audits of `xmartlabs/agent-skills` were shown 2 of its skills and none of
+    its agents: the collector never looked under `plugins/<p>/skills/` or
+    `plugins/<p>/agents/`, so five repeated audits said nothing about them.
+    """
+    files = {
+        "pyproject.toml": "[project]\n",
+        "CLAUDE.md": "# Rules\n",
+        "plugins/tribunal/.claude-plugin/plugin.json": "{}\n",
+        "plugins/tribunal/skills/review-pr/SKILL.md": "# Review a PR\n",
+        "plugins/tribunal/agents/tribunal-refuter.md": "# Refuter\n",
+        "plugins/homosapiens/skills/humanize/SKILL.md": "# Humanize\n",
+        # A README beside the skills is documentation, not a skill.
+        "plugins/tribunal/skills/README.md": "# Skills\n",
+    }
+    evidence = _evidence(files)
+
+    assert sorted(evidence["skills"]) == [
+        "plugins/homosapiens/skills/humanize/SKILL.md",
+        "plugins/tribunal/skills/review-pr/SKILL.md",
+    ]
+    assert list(evidence["agents"]) == ["plugins/tribunal/agents/tribunal-refuter.md"]
+    assert evidence["governance"]["skills"] == [
+        "homosapiens:humanize",
+        "tribunal:review-pr",
+    ]
+    assert evidence["governance"]["agents"] == ["tribunal:tribunal-refuter"]
+    assert evidence["harness_present"] is True
+
+
 def test_a_source_directory_named_skills_is_not_a_harness():
     """`skills/` counts only when it carries the marker that says what it is."""
     files = {
@@ -386,6 +418,52 @@ def test_the_lab_verdict_comes_from_the_evidence_not_the_model():
     assert "El laboratorio no puede ejecutarlo" in markdown
 
 
+SWALLOWING = {
+    **GOVERNED_PYTHON,
+    "Makefile": "test:\n\tpytest || echo 'no tests'\n",
+}
+
+
+def test_the_evidence_carries_the_deterministic_checks():
+    evidence = _evidence(SWALLOWING)
+    by_id = {row["id"]: row for row in evidence["harness_checks"]}
+    assert by_id["verify_target_exit_code"]["status"] == "fail"
+
+
+def test_the_report_prints_the_checks_after_the_summary_and_before_the_model_reading():
+    evidence = _evidence(SWALLOWING)
+    findings = svc.parse_findings(json.dumps(GOOD_ANSWER))
+    markdown = svc.render_markdown(findings, evidence, model="m")
+
+    assert (
+        markdown.index("## Resumen")
+        < markdown.index("## Chequeos determinísticos")
+        < markdown.index("## Harness detectado")
+    )
+    assert "❌ falla" in markdown
+    assert "Qué hacer, en orden" in markdown
+
+
+def test_the_checks_survive_a_model_that_answered_garbage():
+    """The checks are the lab's: a parse error must not hide them."""
+    evidence = _evidence(SWALLOWING)
+    findings = svc.parse_findings("not json")
+    markdown = svc.render_markdown(findings, evidence, model="m", raw="not json")
+    assert "## Chequeos determinísticos" in markdown
+    assert "Verification can fail" in markdown
+
+
+def test_the_case_pass_is_shown_what_the_checks_flagged():
+    evidence = _evidence(SWALLOWING)
+    findings = svc.parse_findings(json.dumps(GOOD_ANSWER))
+    prompt = svc.render_case_prompt(evidence, findings)
+    flagged = json.loads(prompt.split("```json\n", 1)[1].rsplit("\n```", 1)[0])[
+        "harness_checks_flagged"
+    ]
+    assert any(row["id"] == "verify_target_exit_code" for row in flagged)
+    assert all(row["status"] in {"fail", "warn"} for row in flagged)
+
+
 def test_a_parse_error_report_shows_what_the_model_said():
     evidence = _evidence(GOVERNED_PYTHON)
     findings = svc.parse_findings("not json")
@@ -434,6 +512,101 @@ def test_the_task_stores_findings_markdown_and_evidence(session, monkeypatch):
     # Two passes: the map first, the cases from the annotated map second.
     assert systems == [svc.COMPONENT_MAP_PROMPT, svc.CASE_PROPOSALS_PROMPT]
     assert "CLAUDE.md" in seen["user"]
+
+
+def test_an_audit_is_filed_under_the_model_that_answered(session, monkeypatch):
+    """The CLI answers a gateway name with its own default model.
+
+    The audit used to be filed under the requested `gpt-5.4-mini` at 0.2 even
+    when Sonnet read it at whatever temperature the CLI uses. The record now
+    names what answered, keeps the request beside it, and lists every pass.
+    """
+    from harness_lab_app import llm_transport
+
+    _seed(session)
+    monkeypatch.setattr(
+        svc, "gather_evidence", lambda t, **_kw: _evidence(GOVERNED_PYTHON, t)
+    )
+
+    def chat_reply(model, system, user, **_kw):
+        return llm_transport.ChatReply(
+            text=json.dumps(GOOD_ANSWER),
+            transport="claude_cli",
+            requested_model=model,
+            model="claude-sonnet-5-5",
+            requested_temperature=0.2,
+            temperature=None,
+        )
+
+    monkeypatch.setattr(llm_transport, "chat_reply", chat_reply)
+
+    _audit_repository_body(session, "payments", "gpt-5.4-mini")
+
+    audit = svc.RepositoryAuditService(session).get("payments")
+    assert audit.status == "done"
+    assert audit.auditor_model == "claude-sonnet-5-5 (requested gpt-5.4-mini)"
+    passes = audit.evidence_json["llm"]
+    assert len(passes) == 2
+    assert {p["effective_model"] for p in passes} == {"claude-sonnet-5-5"}
+    assert {p["temperature"] for p in passes} == {None}
+    assert {p["requested_temperature"] for p in passes} == {0.2}
+
+
+def test_an_audit_served_as_requested_keeps_the_plain_model_name(session, monkeypatch):
+    from harness_lab_app import llm_transport
+
+    _seed(session)
+    monkeypatch.setattr(
+        svc, "gather_evidence", lambda t, **_kw: _evidence(GOVERNED_PYTHON, t)
+    )
+    monkeypatch.setattr(
+        llm_transport,
+        "chat_reply",
+        lambda model, *_a, **_kw: llm_transport.ChatReply(
+            text=json.dumps(GOOD_ANSWER),
+            transport="gateway",
+            requested_model=model,
+            model=model,
+            requested_temperature=0.2,
+            temperature=0.2,
+        ),
+    )
+
+    _audit_repository_body(session, "payments", "gpt-5.4-mini")
+
+    audit = svc.RepositoryAuditService(session).get("payments")
+    assert audit.auditor_model == "gpt-5.4-mini"
+
+
+def test_an_audit_served_by_an_unreported_model_says_unknown(session, monkeypatch):
+    """A CLI too old to report usage, sent a name it cannot serve.
+
+    Filing that under the requested `gpt-5.4-mini` names the one model the
+    CLI certainly did not use.
+    """
+    from harness_lab_app import llm_transport
+
+    _seed(session)
+    monkeypatch.setattr(
+        svc, "gather_evidence", lambda t, **_kw: _evidence(GOVERNED_PYTHON, t)
+    )
+    monkeypatch.setattr(
+        llm_transport,
+        "chat_reply",
+        lambda model, *_a, **_kw: llm_transport.ChatReply(
+            text=json.dumps(GOOD_ANSWER),
+            transport="claude_cli",
+            requested_model=model,
+            model="",
+            requested_temperature=0.2,
+            temperature=None,
+        ),
+    )
+
+    _audit_repository_body(session, "payments", "gpt-5.4-mini")
+
+    audit = svc.RepositoryAuditService(session).get("payments")
+    assert audit.auditor_model == "unknown (requested gpt-5.4-mini)"
 
 
 def test_a_failing_auditor_leaves_a_failed_row_not_a_running_one(session, monkeypatch):

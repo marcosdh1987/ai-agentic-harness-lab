@@ -4,7 +4,7 @@
 
 ### 1) Functional score (0-10)
 
-Use the same functional ladder as `benchmarks/_archive/tetris-v1/scoring.md` for comparability.
+Use the same functional ladder as `benchmarks/tetris/scoring.md` for comparability.
 
 ### 2) Engineering score (0-5)
 

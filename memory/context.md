@@ -204,6 +204,33 @@ versions + rolled `harness_hash`), `model_condition` (temp/context/alias),
 
 ## Open threads / next steps
 
+- **3D game lane (ADR-0078, ADR-0079, 2026-11-13).** A case may name its own
+  `runner_image` / `sandbox_image` / `play_command` / `agent_hidden`
+  (`case_profile.py`); `make images-3d` builds the Godot images; the run page has a
+  **Play** tab. `chess3d-v1` is paced in five `phases` (one step each, the run cannot
+  end itself before the last) and its grading material is masked out of the agent's
+  container. First frontier run (K-001, before phases): 41/41 in one step, 59 min,
+  US$10.4, no skills used (variant `default`). Next: `default` vs `harness` on a
+  frontier and a small model; then the racing and open-city cases. Guide:
+  `docs/guide-3d-game-cases.md`.
+
+- **Per-step reward (ADR-0076, 2026-11-12, uncommitted).** RL-inspired: the runner
+  snapshots the workspace after every step, the worker regrades each snapshot with the
+  case's checks, five `step_reward` scores, per-step credit, and `make prune`
+  (leave-one-out skill ablation with a non-inferiority margin). Guide:
+  `docs/guide-step-reward.md`. Next: run a first real `make prune` on 3+ cases per
+  model tier; regrade target-repo diffs per step; per-step cost for opencode;
+  consider `governance_read_coverage@v3` counting shell reads; decide separately
+  whether `steps_to_resolve` should ever stop the loop (kept out on purpose).
+
+- **After `fix/measurement-honesty` merges (ADR-0073), continue with items 6–10** of
+  `docs/plans/2026-11-measurement-honesty-follow-ups.md`: judge vs checks agreement
+  and per-arm exclusions (6), Wilson relabelled "on these cases" plus a case-clustered
+  arm interval (7), repetition planning by simulation, cases vs repetitions (8, the
+  most valuable), repeated repository audits with merged cases (9), and
+  `skill_adherence` crossed with the catalog (10). Source: Federico Trinidad's
+  "Harness Lab bajo prueba" (2026-11-06), reproduced with the lab's own code.
+
 - `make check` on `feat/end-to-end-testing-updates` fails 2 pre-existing tests in
   `test_prompt_variants.py`: `benchmarks/cli-textstats/prompt_harness.md` and
   `benchmarks/tetris-v2/prompt_harness.md` drifted from preamble + default (a

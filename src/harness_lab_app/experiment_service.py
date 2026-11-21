@@ -33,7 +33,7 @@ from harness_lab_app.models import (
     RunState,
     Validation,
 )
-from harness_lab_app.run_service import RunService
+from harness_lab_app.run_service import RunService, _preflight_key
 from harness_lab_app.schemas import RunConfigCreate
 
 if TYPE_CHECKING:
@@ -51,6 +51,9 @@ CONDITION_FIELDS = frozenset(
     {
         "harness",
         "executor_model",
+        # Reasoning effort (ADR-0081): the same model at two effort levels is
+        # two arms, so an experiment may vary it like any other axis.
+        "executor_effort",
         "planner_model",
         "target_repo_id",
         "target_ref",
@@ -132,6 +135,27 @@ def _hashable(value: Any) -> Any:
     return value
 
 
+def _one_staged_skill_swapped(conditions: list[dict[str, Any]]) -> bool:
+    """Is this a version swap of one skill — v1 in one arm, v2 in the other?
+
+    Every arm adds exactly one staged skill and asks for that same skill, and
+    the skill differs between arms. That is one intervention (which version of
+    the skill under test), the design ADR-0092's v1-vs-v2 builds; reading it as
+    "skills_extra and skills_invoke both vary" would warn on the right design.
+    Narrow on purpose: any arm adding more than one skill, or not asking for
+    the one it adds, is not a swap and is judged by the other rules.
+    """
+    seen: set[str] = set()
+    for condition in conditions:
+        overrides = condition.get("overrides", {}) or {}
+        extra = [str(item) for item in overrides.get("skills_extra") or []]
+        invoke = [str(item) for item in overrides.get("skills_invoke") or []]
+        if len(extra) != 1 or extra != invoke:
+            return False
+        seen.add(extra[0])
+    return len(seen) == len(conditions) > 1
+
+
 def _skills_move_together(conditions: list[dict[str, Any]]) -> bool:
     """Is "stage the skill" and "ask for it" one intervention here, or two?
 
@@ -162,6 +186,44 @@ def _skills_move_together(conditions: list[dict[str, Any]]) -> bool:
         for extra_b, invoke_b in pairs[index + 1 :]:
             forward = extra_a <= extra_b and invoke_a <= invoke_b
             backward = extra_b <= extra_a and invoke_b <= invoke_a
+            if not (forward or backward):
+                return False
+    return True
+
+
+def _governed_skills_enabled_and_invoked(conditions: list[dict[str, Any]]) -> bool:
+    """Is "turn a governed skill back on" and "ask for it" one intervention here?
+
+    The governed-catalog twin of :func:`_skills_move_together`. Trialling a
+    catalog skill on top of a profile (ADR-0089) runs the profile as the
+    control and, as the treatment, the same profile with that skill removed
+    from ``skills_disabled`` *and* named in ``skills_invoke``: two fields, one
+    lever. They are one intervention when every pair of arms differs by
+    exactly that — the skills one arm re-enables are the skills it asks for,
+    and nothing else moves in either set. A treatment that re-enables X but
+    asks for Y, or re-enables X without asking, is genuinely two factors.
+    """
+    arms = []
+    for condition in conditions:
+        overrides = condition.get("overrides", {}) or {}
+        arms.append(
+            (
+                {str(item) for item in overrides.get("skills_disabled") or []},
+                {str(item) for item in overrides.get("skills_invoke") or []},
+            )
+        )
+    for index, (disabled_a, invoke_a) in enumerate(arms):
+        for disabled_b, invoke_b in arms[index + 1 :]:
+            forward = (
+                disabled_b <= disabled_a
+                and invoke_a <= invoke_b
+                and disabled_a - disabled_b == invoke_b - invoke_a
+            )
+            backward = (
+                disabled_a <= disabled_b
+                and invoke_b <= invoke_a
+                and disabled_b - disabled_a == invoke_a - invoke_b
+            )
             if not (forward or backward):
                 return False
     return True
@@ -218,12 +280,30 @@ def validate_design(
                 "Conditions that vary 'skills_disabled' are a harness evaluation "
                 "wearing this mode's label — use mode 'harness_evaluation'."
             )
-        subject_axes = varying & {"harness", "executor_model"}
+        subject_axes = varying & {"harness", "executor_model", "executor_effort"}
         if len(subject_axes) > 1:
             warnings.append(
-                "Both the harness and the executor model vary. That cross product "
+                "More than one of harness, executor model and reasoning effort "
+                "vary. That cross product "
                 "is the point of this mode, but each cell is its own population: "
                 "read one <harness>/<model> arm at a time, never averaged."
+            )
+        return warnings
+
+    if mode == ExperimentMode.harness_by_model:
+        # The model varies by design here — the refusal `harness_evaluation`
+        # raises for it is exactly what this mode exists to lift (ADR-0066). It
+        # is only sound as a full grid with one harness factor: an incomplete
+        # grid or two harness factors cannot separate the interaction from a
+        # confound. The control role is not used; effects are read per model
+        # against the first harness level.
+        from harness_lab_app.factorial import grid_problems
+
+        problems = grid_problems(conditions)
+        if problems:
+            raise ExperimentDesignError(
+                "Mode 'harness_by_model' needs a full grid of harness levels x "
+                "models with exactly one harness factor. " + " ".join(problems)
             )
         return warnings
 
@@ -247,6 +327,16 @@ def validate_design(
                 "vary the executor model, so harness and model effects are "
                 "confounded."
             )
+        if "executor_effort" in varying:
+            # Effort is a setting of the model, not of the harness (ADR-0081):
+            # the same confound as varying the model itself.
+            raise ExperimentDesignError(
+                "Mode 'harness_evaluation' holds the model fixed, and reasoning "
+                "effort is part of the model's setting. These conditions vary "
+                "executor_effort, so harness and effort effects are confounded. "
+                "Hold the effort fixed across arms, or compare effort levels in "
+                "mode 'subject_validation' or 'discovery'."
+            )
         harness_axes = varying & {
             "harness_source",
             "skills_disabled",
@@ -267,11 +357,20 @@ def validate_design(
                 "These conditions are identical on every harness axis, so there is "
                 "nothing to attribute a difference to."
             )
-        if {"skills_extra", "skills_invoke"} <= harness_axes and _skills_move_together(
-            conditions
+        if {"skills_extra", "skills_invoke"} <= harness_axes and (
+            _skills_move_together(conditions) or _one_staged_skill_swapped(conditions)
         ):
             # One intervention wearing two field names (see above).
             harness_axes = (harness_axes - {"skills_extra", "skills_invoke"}) | {
+                "skills_under_test"
+            }
+        elif (
+            {"skills_disabled", "skills_invoke"} <= harness_axes
+            and "skills_extra" not in harness_axes
+            and _governed_skills_enabled_and_invoked(conditions)
+        ):
+            # The same, for a catalog skill turned back on (see above).
+            harness_axes = (harness_axes - {"skills_disabled", "skills_invoke"}) | {
                 "skills_under_test"
             }
         # A bare arm is one axis, not four (ADR-0049). It has no prompt family
@@ -361,6 +460,163 @@ def validate_design(
     return warnings
 
 
+def _factorial_block(
+    conditions: list[ExperimentCondition],
+    outcomes: dict[str, dict[str, list[bool]]],
+    scored_costs: dict[str, dict[str, list[float | None]]],
+) -> dict[str, Any] | None:
+    """The harness x model analysis of a summarized grid (ADR-0066).
+
+    Harness levels are ordered as the conditions were declared, so the first
+    level an author lists is the baseline every effect is read against; models
+    likewise, so the interaction runs from the first model listed to the last.
+    """
+    from harness_lab_app.factorial import analyze, harness_axis, level_of
+
+    raw = [{"label": c.label, "overrides": dict(c.overrides or {})} for c in conditions]
+    axis = harness_axis(raw)
+    if axis is None:
+        return None
+    levels: list[str] = []
+    models: list[str] = []
+    grid: dict[tuple[str, str], dict[str, list[bool]]] = {}
+    costs: dict[tuple[str, str], dict[str, list[float | None]]] = {}
+    # Declaration order, not read order: `conditions()` sorts the control first
+    # and the rest by label, which would make whichever model carries the
+    # control the reference of the interaction and can flip its sign.
+    declared = sorted(conditions, key=lambda row: row.id or 0)
+    for condition in declared:
+        overrides = condition.overrides or {}
+        level = level_of({"label": condition.label, "overrides": dict(overrides)}, raw)
+        model = str(overrides.get("executor_model"))
+        if level not in levels:
+            levels.append(level)
+        if model not in models:
+            models.append(model)
+        grid[(level, model)] = outcomes.get(condition.label, {})
+        costs[(level, model)] = scored_costs.get(condition.label, {})
+    return {
+        "axis": axis,
+        **analyze(grid, harness_levels=levels, models=models, costs=costs),
+    }
+
+
+TIER_TAG_PREFIX = "tier:"
+
+
+def _capability_block(
+    session: Session,
+    case_ids: list[str],
+    conditions: list[ExperimentCondition],
+    outcomes: dict[str, dict[str, list[bool]]],
+) -> dict[str, Any] | None:
+    """Each arm's capability frontier over cases tagged `tier:<name>` (ADR-0069).
+
+    Tiers are ordered by name (`tier:1` < `tier:2`, `tier:T1` < `tier:T2`), so a
+    corpus states its difficulty ladder in its own tags. Untagged cases are left
+    out; with fewer than two tiers there is no ladder and no block.
+    """
+    from harness_lab_app.capability import capability_frontier
+
+    tier_of: dict[str, str] = {}
+    for case_id in case_ids:
+        case = session.exec(select(Case).where(Case.case_id == case_id)).first()
+        for tag in (case.tags if case else []) or []:
+            if str(tag).startswith(TIER_TAG_PREFIX):
+                tier_of[case_id] = str(tag)[len(TIER_TAG_PREFIX) :]
+                break
+    order = sorted(set(tier_of.values()))
+    if len(order) < 2:
+        return None
+    arms = []
+    for condition in sorted(conditions, key=lambda row: row.id or 0):
+        by_tier: dict[str, dict[str, list[bool]]] = {tier: {} for tier in order}
+        for case_id, runs in outcomes.get(condition.label, {}).items():
+            if case_id in tier_of:
+                by_tier[tier_of[case_id]][case_id] = runs
+        reading = capability_frontier(by_tier, order=order)
+        arms.append({"label": condition.label, **reading})
+    return {"tiers": order, "arms": arms}
+
+
+# A pruning family (ADR-0076): one control with the full harness and one
+# treatment per item, each removing exactly that item. `scripts/prune.py`
+# names the family with this prefix; the summary reads it as leave-one-out.
+PRUNING_FAMILY_PREFIX = "prune-"
+# A treatment that removes several skills at once is judged as one item.
+GROUP_ITEM_PREFIX = "skills:"
+
+
+def removed_item(control: dict[str, Any], treatment: dict[str, Any]) -> str | None:
+    """The item a treatment removes relative to its control, or None.
+
+    An item is one skill (``skill:<name>``) or, for a group ablation
+    (ADR-0085), a set of skills removed together (``skills:<a>,<b>``) — the
+    cheap first cut through the never-opened set, which also catches two
+    redundant skills that leave-one-out cannot see (removing either alone
+    changes nothing; removing both does). Anything that changes more than the
+    removed skills — a re-added skill, a different prompt — gets no verdict,
+    rather than a verdict about the wrong thing.
+    """
+    if {k: v for k, v in control.items() if k != "skills_disabled"} != {
+        k: v for k, v in treatment.items() if k != "skills_disabled"
+    }:
+        return None
+    removed = set(treatment.get("skills_disabled") or []) - set(
+        control.get("skills_disabled") or []
+    )
+    added = set(control.get("skills_disabled") or []) - set(
+        treatment.get("skills_disabled") or []
+    )
+    if not removed or added:
+        return None
+    if len(removed) == 1:
+        return f"skill:{removed.pop()}"
+    return GROUP_ITEM_PREFIX + ",".join(sorted(removed))
+
+
+def removed_skills(item: str) -> list[str]:
+    """The skill names a pruning item stands for."""
+    if item.startswith(GROUP_ITEM_PREFIX):
+        return item.removeprefix(GROUP_ITEM_PREFIX).split(",")
+    return [item.removeprefix("skill:")]
+
+
+def _pruning_block(
+    conditions: list[ExperimentCondition],
+    control_label: str,
+    outcomes: dict[str, dict[str, list[bool]]],
+    case_metrics: dict[str, dict[str, dict[str, list[float]]]],
+) -> list[dict[str, Any]]:
+    """One removal verdict per leave-one-out treatment arm, keep-first."""
+    from harness_lab_app.pruning import assess_removal
+
+    control = next(c for c in conditions if c.label == control_label)
+    verdicts: list[dict[str, Any]] = []
+    for condition in conditions:
+        if condition.label == control_label:
+            continue
+        item = removed_item(control.overrides or {}, condition.overrides or {})
+        if item is None:
+            continue
+        verdict = assess_removal(
+            item=item,
+            control_success=outcomes.get(control_label, {}),
+            treatment_success=outcomes.get(condition.label, {}),
+            control_metrics=case_metrics.get(control_label, {}),
+            treatment_metrics=case_metrics.get(condition.label, {}),
+        )
+        verdicts.append(
+            {
+                "arm": condition.label,
+                **verdict.as_dict(),
+                "removed": removed_skills(item),
+            }
+        )
+    order = {"keep": 0, "inconclusive": 1, "no_signal": 2, "removable": 3}
+    return sorted(verdicts, key=lambda v: (order.get(v["decision"], 9), v["item"]))
+
+
 def repetition_warning(repetitions: int) -> str | None:
     """State plainly what a given N does and does not support."""
     if repetitions < 2:
@@ -377,9 +633,42 @@ def repetition_warning(repetitions: int) -> str | None:
     return None
 
 
+def _interleave_by_arm(runs: list[Run]) -> list[Run]:
+    """Runs reordered round-robin by arm: a1, b1, a2, b2, …
+
+    With two lanes alternating, a design of two arms x two repetitions would
+    otherwise send a1 and a2 to one lane and b1 and b2 to the other. Rotating
+    the starting arm each round also gives every lane every arm.
+    """
+    by_arm: dict[str, list[Run]] = {}
+    for run in runs:
+        by_arm.setdefault(run.condition_label or "", []).append(run)
+    labels = list(by_arm)
+    ordered: list[Run] = []
+    round_index = 0
+    while any(by_arm.values()):
+        rotation = (
+            labels[round_index % len(labels) :] + labels[: round_index % len(labels)]
+        )
+        for label in rotation:
+            if by_arm[label]:
+                ordered.append(by_arm[label].pop(0))
+        round_index += 1
+    return ordered
+
+
 class ExperimentService:
-    def __init__(self, session: Session, enqueue=None, enqueue_cleanup=None):
+    def __init__(
+        self,
+        session: Session,
+        enqueue=None,
+        enqueue_cleanup=None,
+        enqueue_parallel=None,
+    ):
         self.session = session
+        # The second run lane (ADR-0082), used only by a launch that asks for
+        # two runs at a time. None outside the API: every run takes `enqueue`.
+        self.enqueue_parallel = enqueue_parallel
         # Queue publisher, injected by the API layer exactly as RunService gets
         # it. Without this, `launch` persisted its runs and then silently never
         # enqueued them — RunService._publish() no-ops when the callback is
@@ -434,6 +723,8 @@ class ExperimentService:
             compare,
             objective_signature,
             paired_by_case,
+            pass_k_by_arm,
+            plan_repetitions,
             success_delta,
             summarize_condition,
             verdict,
@@ -457,6 +748,12 @@ class ExperimentService:
         }
         # Per arm, per case: how many runs were scored and how many passed.
         case_counts: dict[str, dict[str, dict[str, int]]] = {
+            condition.label: {} for condition in conditions
+        }
+        # Per arm, per case: the cost of every *scored* run, None where a scored
+        # run reported no cost. Read by the harness x model block (ADR-0066),
+        # which must price exactly the runs it counts, never a subtotal.
+        scored_costs: dict[str, dict[str, list[float | None]]] = {
             condition.label: {} for condition in conditions
         }
         # Why the arms stopped, per arm. Two arms that terminate under
@@ -486,7 +783,7 @@ class ExperimentService:
         }
         # What each run's checks did, comparably across runs: two arms failing
         # the same command in every repetition is the environment deciding, and
-        # the floor issue needs to be able to say so (ADR-0063).
+        # the floor issue needs to be able to say so (ADR-0062).
         check_signatures: dict[str, list[Any]] = {
             condition.label: [] for condition in conditions
         }
@@ -505,6 +802,14 @@ class ExperimentService:
         # the control's `skills_disabled`. Reading the arm's own overrides alone
         # left that arm with an empty skill list, so the observation that none
         # of its twenty-five skills was ever opened had nowhere to land.
+        # Per arm, per metric, per case: the values the pruning verdict reads
+        # (ADR-0076). Only metrics whose direction is fixed in PRUNING_METRICS.
+        from harness_lab_app.pruning import PRUNING_METRICS
+
+        pruning_metrics = tuple(PRUNING_METRICS)
+        case_metrics: dict[str, dict[str, dict[str, list[float]]]] = {
+            condition.label: {} for condition in conditions
+        }
         removed_elsewhere: dict[str, list[str]] = {}
         for condition in conditions:
             mine = set((condition.overrides or {}).get("skills_disabled") or [])
@@ -554,9 +859,21 @@ class ExperimentService:
                 for name in sorted(names):
                     if name not in usage["skills"]:
                         usage["skills"].append(name)
+            for metric in pruning_metrics:
+                metric_value = values.get(metric)
+                if isinstance(metric_value, (int, float)) and not isinstance(
+                    metric_value, bool
+                ):
+                    case_metrics[label].setdefault(metric, {}).setdefault(
+                        case_id, []
+                    ).append(float(metric_value))
             passed = values.get("task_validation_pass")
             if passed is not None:
                 outcomes[label].setdefault(case_id, []).append(bool(passed))
+                cost_value = values.get("cost_usd")
+                scored_costs[label].setdefault(case_id, []).append(
+                    float(cost_value) if isinstance(cost_value, (int, float)) else None
+                )
             cell = case_counts[label].setdefault(
                 case_id, {"runs": 0, "scored_runs": 0, "successes": 0}
             )
@@ -610,9 +927,13 @@ class ExperimentService:
         # mode that cannot support a causal claim never renders a
         # control-versus-treatment delta, whatever roles the rows happen to
         # carry.
+        # A harness x model grid (ADR-0066) has no single pair to compare: any
+        # control-versus-treatment delta across two cells would mix the model
+        # with the harness. It is read through its `factorial` block instead.
         if experiment.mode in (
             ExperimentMode.discovery,
             ExperimentMode.subject_validation,
+            ExperimentMode.harness_by_model,
         ):
             control = None
         if control is not None:
@@ -631,8 +952,13 @@ class ExperimentService:
                                 directions,
                             )
                         ],
+                        # Every repetition per case, so the delta's interval
+                        # is resampled by case rather than by run (ADR-0064).
                         "success": success_delta(
-                            summaries[control.label], summaries[condition.label]
+                            summaries[control.label],
+                            summaries[condition.label],
+                            control_cases=outcomes[control.label],
+                            treatment_cases=outcomes[condition.label],
                         ),
                         "case_matrix": paired_by_case(
                             verdicts[control.label], verdicts[condition.label]
@@ -674,6 +1000,16 @@ class ExperimentService:
             skill_usage=skill_usage,
             validity=validity,
         )
+        # Reliability across repetitions, every arm at one shared k, and the
+        # repetition count a 20-point move would need. Both are ADR-0064: the
+        # first says how often a case passes *every* time, the second is advice
+        # for the next design — offered only where arms are compared at all.
+        pass_k = pass_k_by_arm(outcomes)
+        plan = (
+            plan_repetitions(list(summaries.values()), cases=len(experiment.case_ids))
+            if control is not None
+            else None
+        )
 
         return {
             "experiment_id": experiment_id,
@@ -696,6 +1032,14 @@ class ExperimentService:
                     "runs": summary.runs,
                     "scored_runs": summary.scored_runs,
                     "success_rate": summary.success_rate,
+                    # The rate's 95% Wilson interval; None with nothing scored.
+                    "success_rate_ci_low": (
+                        summary.success_rate_ci[0] if summary.success_rate_ci else None
+                    ),
+                    "success_rate_ci_high": (
+                        summary.success_rate_ci[1] if summary.success_rate_ci else None
+                    ),
+                    "pass_k": pass_k.get(summary.label),
                     "warnings": summary.warnings,
                     "metrics": {
                         name: aggregate.__dict__
@@ -705,6 +1049,12 @@ class ExperimentService:
                 for summary in summaries.values()
             ],
             "comparisons": comparisons,
+            "repetition_plan": plan,
+            # The one planning figure, flat, for a reader that wants only it:
+            # repetitions per case per arm to detect a 20-point difference.
+            "repetitions_needed_for_20pp": (
+                plan["repetitions_per_case"] if plan else None
+            ),
             # Per-arm, per-case counts: {label: {case_id: {runs, scored_runs,
             # successes}}}. Not a comparison — `comparisons[].case_matrix` pairs
             # a control against a treatment, which a mode without a control
@@ -712,7 +1062,73 @@ class ExperimentService:
             # is the only matrix subject validation can show and is useful under
             # every mode.
             "case_outcomes": case_counts,
+            # The harness x model reading (ADR-0066); None under every other mode.
+            "factorial": (
+                _factorial_block(conditions, outcomes, scored_costs)
+                if experiment.mode == ExperimentMode.harness_by_model
+                else None
+            ),
+            # Per arm, the highest difficulty tier it does *reliably*, when the
+            # cases are tagged `tier:<name>` (ADR-0069). None otherwise.
+            "capability": _capability_block(
+                self.session, experiment.case_ids, conditions, outcomes
+            ),
+            # Leave-one-out: can each ablated item go? (ADR-0076). Only for a
+            # pruning family, whose every treatment removes exactly one item.
+            "pruning": (
+                _pruning_block(conditions, control.label, outcomes, case_metrics)
+                if control is not None
+                and str(experiment.family_id or "").startswith(PRUNING_FAMILY_PREFIX)
+                else None
+            ),
         }
+
+    def pruning_overview(self) -> list[dict[str, Any]]:
+        """Every pruning experiment's verdicts, with the model and prompt it held.
+
+        The harness-improvement worklist for skills (ADR-0085): what each
+        ablation says can go, for which model and under which prompt. A verdict
+        is only ever about that model on those cases, so both travel with it.
+        Newest first; an experiment with no verdict yet is listed with none.
+        """
+        # Local: experiment_audit_service imports this module.
+        from harness_lab_app.experiment_audit_service import TERMINAL_STATES
+
+        rows: list[dict[str, Any]] = []
+        for experiment in self.list_experiments():
+            if not str(experiment.family_id or "").startswith(PRUNING_FAMILY_PREFIX):
+                continue
+            runs = self.runs(experiment.experiment_id)
+            control = next(
+                (
+                    c
+                    for c in self.conditions(experiment.experiment_id)
+                    if c.role == ConditionRole.control
+                ),
+                None,
+            )
+            config = (
+                self.session.get(RunConfig, runs[0].run_config_id) if runs else None
+            )
+            summary = self.summarize(experiment.experiment_id) if runs else {}
+            rows.append(
+                {
+                    "experiment_id": experiment.experiment_id,
+                    "created_at": experiment.created_at,
+                    "case_ids": list(experiment.case_ids),
+                    "repetitions": experiment.repetitions,
+                    "model": getattr(config, "executor_model", None),
+                    "harness": getattr(config, "harness", None),
+                    "prompt": (control.overrides or {}).get("prompt_variant")
+                    if control is not None
+                    else None,
+                    "runs": len(runs),
+                    "finished": bool(runs)
+                    and all(run.state in TERMINAL_STATES for run in runs),
+                    "verdicts": summary.get("pruning") or [],
+                }
+            )
+        return rows
 
     def try_complete(self, experiment_id: str) -> Experiment | None:
         """Mark a running experiment complete once every run has stopped.
@@ -1017,6 +1433,9 @@ class ExperimentService:
     _LOCKED_FIELDS = (
         "harness",
         "executor_model",
+        # Effort (ADR-0081): two levels under one name are two measurements.
+        # Historical rows hold "", which is what a relaunch without one sends.
+        "executor_effort",
         "planner_model",
         "prompt_variant",
         "max_steps",
@@ -1080,6 +1499,7 @@ class ExperimentService:
             return {
                 "harness": config.harness,
                 "executor_model": config.executor_model,
+                "executor_effort": config.executor_effort,
                 "planner_model": config.planner_model,
                 "prompt_variant": config.prompt_variant,
                 "max_steps": config.max_steps,
@@ -1093,14 +1513,53 @@ class ExperimentService:
             }
         return None
 
-    def launch(self, experiment_id: str, base: RunConfigCreate) -> list[Run]:
+    def launch(
+        self, experiment_id: str, base: RunConfigCreate, parallel: int = 1
+    ) -> list[Run]:
         """Expand the declared design into runs, tagged with their arm.
 
         ``base`` carries the settings every arm shares (score mode, dry run, the
         model when the design does not vary it). A condition's overrides are
         applied on top, so the arm is exactly what was declared.
+
+        ``parallel`` is how many runs execute at once: 1 (the default, the
+        lab's one lane) or 2, which alternates the runs between the two lanes
+        so each lane gets every model in turn (ADR-0082). Two at a time is
+        refused for a run that rewrites the lab's shared tree — a skill
+        ablation regenerates `.claude/skills` for everyone (ADR-0011).
         """
+        if parallel not in (1, 2):
+            raise ExperimentError("Runs execute 1 or 2 at a time.")
         experiment = self.get_experiment(experiment_id)
+        if parallel == 2:
+            from harness_lab_app.model_comparison import (
+                model_comparison_shape_errors,
+            )
+
+            # Two at a time is a model comparison's option (ADR-0082): its arms
+            # differ only by harness and model and rewrite nothing shared. Any
+            # other design keeps the one lane ADR-0002 guarantees. Checked on
+            # the design itself — the `models-` family is only a name.
+            problems = model_comparison_shape_errors(
+                experiment.mode,
+                [
+                    (c.label, c.role, dict(c.overrides or {}))
+                    for c in self.conditions(experiment_id)
+                ],
+            )
+            if problems:
+                raise ExperimentError(
+                    "Only a model comparison (Evaluate → Compare models) runs two "
+                    f"at a time, and this experiment is not one: {'; '.join(problems)}. "
+                    "Launch it one at a time."
+                )
+            # Asked for two lanes with no way to publish on the second: running
+            # sequentially anyway would answer a request nobody made.
+            if self.enqueue_parallel is None:
+                raise ExperimentError(
+                    "Two at a time needs the second run lane, which this launch "
+                    "cannot reach. Launch it one at a time."
+                )
         conditions = self.conditions(experiment_id)
         if not conditions:
             raise ExperimentError(f"Experiment '{experiment_id}' has no conditions.")
@@ -1149,6 +1608,20 @@ class ExperimentService:
             raise ExperimentError(_variant_refusal(undefined))
         if not configs:
             raise ExperimentError(f"Experiment '{experiment_id}' expands to no runs.")
+        if parallel == 2:
+            shared = sorted(
+                {
+                    label
+                    for label, config in configs
+                    if config.skills_disabled or config.skills_extra
+                }
+            )
+            if shared:
+                raise ExperimentError(
+                    "These arms change the skill catalog, which every run reads "
+                    f"from the lab's one tree: {', '.join(shared)}. They run one "
+                    "at a time; launch this experiment sequentially."
+                )
 
         # One experiment, one measurement configuration. A second launch with a
         # different shared setup (another model, another budget) would file two
@@ -1163,22 +1636,12 @@ class ExperimentService:
         # intent, exactly as a batch is (ADR-0023).
         seen: set[tuple] = set()
         for _label, config in configs:
-            key = (
-                config.harness,
-                config.executor_model,
-                config.dry_run,
-                config.score_mode,
-                config.target_repo_id,
-                config.harness_source,
-                # The skill axes MUST be part of this key. They are exactly what
-                # a Mode A experiment varies, so without them the treatment arm
-                # dedupes onto its own baseline and its config is never
-                # preflighted — an unknown staged skill then fails at *run*
-                # time, inside one arm, which reads as a treatment effect.
-                tuple(sorted(config.skills_disabled)),
-                tuple(sorted(config.skills_extra)),
-                tuple(sorted(config.skills_invoke)),
-            )
+            # The batch path's key, not a local copy. Every field preflight
+            # reads must be in it (the skill axes, the effort): those are
+            # exactly what an experiment varies, and an arm that dedupes onto
+            # its baseline is never preflighted. It then fails at *run* time,
+            # inside one arm, which reads as a treatment effect.
+            key = _preflight_key(config)
             if key in seen:
                 continue
             seen.add(key)
@@ -1207,6 +1670,16 @@ class ExperimentService:
         self.session.add(experiment)
         self.session.commit()
 
-        for run in runs:
+        # Interleaved by arm, so with two lanes each lane runs every model in
+        # turn: [opus-1, local-1, opus-2, local-2] → lane 1 gets opus-1 and
+        # opus-2's partner order flips with the next repetition.
+        order = _interleave_by_arm(runs)
+        second_lane = parallel == 2 and self.enqueue_parallel is not None
+        for index, run in enumerate(order):
+            if second_lane and index % 2 == 1:
+                runs_service.enqueue = self.enqueue_parallel
+            else:
+                runs_service.enqueue = self.enqueue
             runs_service._publish(run.run_id)
+        runs_service.enqueue = self.enqueue
         return runs

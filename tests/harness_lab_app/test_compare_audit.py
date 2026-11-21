@@ -1,4 +1,4 @@
-"""The LLM reading of an ad-hoc comparison (ADR-0061).
+"""The LLM reading of an ad-hoc comparison (ADR-0060).
 
 Compare is a selection a person made in the browser, not a saved object, so
 these tests pin the one thing that is genuinely new: the key that gives that
@@ -239,7 +239,7 @@ def test_the_evidence_names_what_was_held_and_what_varied(session):
 
 
 def test_an_inconclusive_check_is_not_listed_as_a_failure(session):
-    """Failed and did-not-measure are two different claims (ADR-0063)."""
+    """Failed and did-not-measure are two different claims (ADR-0062)."""
     from harness_lab_app.models import Validation
 
     _make_run(session, "K-002", prompt_variant="default")

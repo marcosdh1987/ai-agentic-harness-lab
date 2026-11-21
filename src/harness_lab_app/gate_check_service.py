@@ -24,7 +24,7 @@ import shlex
 from typing import TYPE_CHECKING, Any
 
 from harness_lab_app.runner_capabilities import shell_for_command
-from harness_lab_app.validation import is_executable_command
+from harness_lab_app.validation import is_executable_command, render_command
 
 if TYPE_CHECKING:
     from harness_lab_app.models import TargetRepository
@@ -68,7 +68,7 @@ def _provision_commands(
     for raw in target.setup_commands:
         if not is_executable_command(raw):
             continue
-        rendered = raw.format(workspace=workspace, run_id=f"gate-{target.target_id}")
+        rendered = render_command(raw, workspace, f"gate-{target.target_id}")
         commands.append(
             {
                 "phase": "setup",
@@ -114,7 +114,7 @@ def build_case_dry_run_spec(
         )
     commands = _provision_commands(target, workspace, commit)
     for raw in validation:
-        rendered = raw.format(workspace=workspace, run_id=f"dry-{case.case_id}")
+        rendered = render_command(raw, workspace, f"dry-{case.case_id}")
         commands.append(
             {
                 "phase": "validate",
@@ -326,7 +326,7 @@ def health_at_pin(results: list[dict[str, Any]], *, measured: bool) -> dict[str,
     finished; a broken provision or setup is ``unmeasured`` with the phase
     that broke, because a suite that never ran says nothing about the tree.
 
-    So is a validate command that could not run *itself* (ADR-0063). The gate's
+    So is a validate command that could not run *itself* (ADR-0062). The gate's
     validate phase has no network, so a repository whose ``make test`` re-runs
     its installer dies in the installer — and ``fail`` there would publish "this
     repository's suite is red" on evidence that only says "we could not run it".
@@ -382,7 +382,7 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     stops there too, because running a test suite in a workspace whose setup
     failed measures the setup, not the suite.
 
-    A failure the environment caused is reported as one (ADR-0063). The gate's
+    A failure the environment caused is reported as one (ADR-0062). The gate's
     ``validate`` phase runs with no network by design, so a repository whose
     ``make test`` re-runs its own installer fails there every time — and calling
     that a red suite is a claim about someone else's repository that the lab

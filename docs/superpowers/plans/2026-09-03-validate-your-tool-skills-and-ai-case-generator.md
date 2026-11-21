@@ -213,7 +213,7 @@ git commit -m "feat(frontend): add CaseDraft types and api client call"
   - Filter pills: `Todas (${total})`, `Staged (${stagedCount})`, `Harness (${harnessCount})`.
   * Search input to filter by skill name or description.
   * Pick list with check icon and badge `[staged]` or `[harness]`.
-  * Checkbox: *"Isolate the run: disable every harness skill that is not selected above."*.
+  * Checkbox: *"Aislar ejecución: deshabilitar en el harness las demás skills no seleccionadas"*.
 
 - [ ] **Step 3: Update Readiness Gate & Experiment Launch**
   - Ready if `selectedSkills.length > 0` OR `alreadyGoverned` is checked.

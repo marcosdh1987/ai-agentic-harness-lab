@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from sqlmodel import Session, select
 
-from harness_lab_app.case_validation import check_case
+from harness_lab_app.case_profile import PROFILE_KEYS, profile_from_task
+from harness_lab_app.case_validation import check_case, check_requirements
 from harness_lab_app.config import get_settings
 from harness_lab_app.models import Case, CaseStatus, CaseSyncState, CaseType, utc_now
 from harness_lab_app.skill_import import safe_relpath
@@ -127,6 +128,112 @@ def resolve_prompt_variant_text(case: Case, variant: str) -> str | None:
     return None
 
 
+def _merge_metadata(
+    stored: dict[str, Any] | None, incoming: dict[str, Any] | None
+) -> dict[str, Any]:
+    """``stored`` with ``incoming`` laid over it, key by key.
+
+    A key the caller names replaces the stored one, and an empty value
+    (``None``, ``""``, ``[]``, ``{}``) removes it — so a form that owns one key
+    can clear it without knowing, or wiping, the rest.
+    """
+    merged = dict(stored or {})
+    for key, value in (incoming or {}).items():
+        if value in (None, "", [], {}):
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
+
+
+# The part of a phased case's prompt every phase carries (ADR-0079): from the
+# first of these headings up to the phase plan. Each step is a fresh agent
+# session with no memory of the last, so a phase that only said "now add the
+# AI" would be building against a contract it never read.
+CONTRACT_START = "## What is being judged"
+CONTRACT_END = "## How the work is paced"
+
+
+def contract_section(prompt_text: str) -> str:
+    """The contract block of a phased case's prompt, or ``""`` if it has none."""
+    start = prompt_text.find(CONTRACT_START)
+    end = prompt_text.find(CONTRACT_END)
+    if start < 0 or end <= start:
+        return ""
+    return prompt_text[start:end].strip()
+
+
+def step_budget_from_task(raw: dict, phases: list) -> int:
+    """How many agent steps a case runs by default.
+
+    One per phase when the case is phased (ADR-0079). Otherwise an explicit
+    ``max_steps`` in ``task.yaml`` wins over the historical ``target_level``
+    proxy: a case whose deliverable is a single report (a review, an audit)
+    must stop after it, because every extra step gets a generic "implement one
+    more increment" prompt that pushes the agent to change code it was told to
+    leave alone — `pr-review-v1-K-001/002` fixed the code under review in steps
+    2-4 (ADR-0087).
+    """
+    if phases:
+        return 1 + len(phases)
+    explicit = raw.get("max_steps")
+    if explicit is not None:
+        steps = int(explicit)
+        if steps < 1:
+            raise ValueError("max_steps must be at least 1.")
+        return steps
+    return int(raw.get("target_level", 1))
+
+
+def phase_prompts_from_task(raw: dict[str, Any], task_path: Path) -> list[str]:
+    """The text of each later phase a ``task.yaml`` declares, in order (ADR-0079).
+
+    ``phases`` lists prompt files, one per phase after the first: phase 1 is the
+    case prompt itself (its ``prompts`` variants), and ``phases[0]`` drives
+    step 2. Each path is resolved inside the case's own directory, so a case
+    cannot pull another file of the lab into its prompts.
+
+    Every phase is stored with the case's contract appended — the block of its
+    default prompt between :data:`CONTRACT_START` and :data:`CONTRACT_END` —
+    because the agent that runs it has not seen step 1's prompt.
+    """
+    paths = raw.get("phases") or []
+    if not isinstance(paths, list):
+        raise ValueError(f"{task_path}: phases must be a list of prompt files.")
+    case_dir = task_path.parent.resolve()
+    texts: list[str] = []
+    for item in paths:
+        relpath = safe_relpath(str(item))
+        candidate = (get_settings().repo_root / relpath).resolve() if relpath else None
+        if (
+            candidate is None
+            or case_dir not in candidate.parents
+            or not candidate.is_file()
+        ):
+            raise ValueError(
+                f"{task_path}: phase file '{item}' must be a file inside {case_dir.name}/."
+            )
+        texts.append(candidate.read_text().strip())
+    if not texts:
+        return texts
+    default = (raw.get("prompts") or {}).get("default")
+    relpath = safe_relpath(str(default)) if default else None
+    contract = ""
+    if relpath:
+        source = get_settings().repo_root / relpath
+        if source.is_file():
+            contract = contract_section(source.read_text())
+    if not contract:
+        raise ValueError(
+            f"{task_path}: a phased case's default prompt must contain the contract "
+            f"between '{CONTRACT_START}' and '{CONTRACT_END}'."
+        )
+    return [
+        f"{text}\n\n---\n\n# The full task contract (unchanged; for reference)\n\n{contract}\n"
+        for text in texts
+    ]
+
+
 class CaseService:
     def __init__(self, session: Session):
         self.session = session
@@ -198,6 +305,7 @@ class CaseService:
             dict(data.success_criteria or {}),
             str(getattr(data.type, "value", data.type) or ""),
         )
+        problems += check_requirements(data.metadata_json)
         if problems:
             raise CaseValidationError(problems)
 
@@ -213,6 +321,7 @@ class CaseService:
             raise CaseExistsError(f"Case already exists: {data.case_id}")
         self._validated(data)
         case = Case(**data.model_dump())
+        case.metadata_json = _merge_metadata({}, data.metadata_json)
         self.session.add(case)
         self.session.commit()
         self.session.refresh(case)
@@ -224,6 +333,12 @@ class CaseService:
         # same shapes, and an edit is exactly when somebody is trying to fix one.
         self._validated(data)
         payload = data.model_dump()
+        # Merged, not replaced: the editor sends no metadata, and a plain
+        # assignment wiped `validation_requirements` (ADR-0071), `starter_dir`
+        # and a SWE case's instance data on the first edit of anything else.
+        case.metadata_json = _merge_metadata(
+            case.metadata_json, payload.pop("metadata_json", None)
+        )
         for field_name, value in payload.items():
             setattr(case, field_name, value)
         case.updated_at = utc_now()
@@ -308,10 +423,39 @@ class CaseService:
                 seeded.append(self.import_task_yaml(task_path))
                 continue
             existing.prompt_variants = dict(raw.get("prompts", {}))
+            # Phases are authored like the prompts, and so is the step budget
+            # they imply: one step per phase (ADR-0079).
+            phases = phase_prompts_from_task(raw, task_path)
+            if phases or existing.step_prompts or raw.get("max_steps") is not None:
+                existing.step_prompts = phases
+                # A case that drops its phases goes back to the budget an
+                # unphased case is imported with, rather than keeping 1 + N
+                # steps for phases it no longer has.
+                existing.max_steps = step_budget_from_task(raw, phases)
             if raw.get("validation_commands"):
                 existing.validation_commands = [
                     str(cmd) for cmd in raw["validation_commands"]
                 ]
+            # The starter is authored like the commands: the file is its source.
+            meta = dict(existing.metadata_json or {})
+            if raw.get("starter"):
+                meta["starter_dir"] = str(raw["starter"])
+            else:
+                meta.pop("starter_dir", None)
+            if raw.get("validation_requirements"):
+                meta["validation_requirements"] = [
+                    str(item) for item in raw["validation_requirements"]
+                ]
+            else:
+                meta.pop("validation_requirements", None)
+            # The machine profile is authored like the starter (ADR-0078).
+            profile = profile_from_task(raw)
+            for key in PROFILE_KEYS:
+                if key in profile:
+                    meta[key] = profile[key]
+                else:
+                    meta.pop(key, None)
+            existing.metadata_json = meta
             existing.updated_at = utc_now()
             self.session.add(existing)
             self.session.commit()
@@ -322,6 +466,9 @@ class CaseService:
     def import_task_yaml(self, task_path: Path) -> Case:
         raw = yaml.safe_load(task_path.read_text())
         prompts = dict(raw.get("prompts", {}))
+        # A phased case runs one step per phase; the rest keep target_level as
+        # their step budget, as they always have.
+        phases = phase_prompts_from_task(raw, task_path)
         case_type = self._case_type_from_task(raw.get("category", ""))
         case = Case(
             case_id=raw["task_id"],
@@ -348,8 +495,27 @@ class CaseService:
                     else []
                 )
             ),
-            max_steps=int(raw.get("target_level", 1)),
-            metadata_json={"source_path": str(task_path)},
+            step_prompts=phases,
+            max_steps=step_budget_from_task(raw, phases),
+            metadata_json={
+                "source_path": str(task_path),
+                # Files the workspace starts from (ADR-0068); the runner copies
+                # them in and refuses any path outside benchmarks/.
+                **({"starter_dir": str(raw["starter"])} if raw.get("starter") else {}),
+                # Packages the graded tests import, installed before the offline
+                # checks (ADR-0071).
+                **(
+                    {
+                        "validation_requirements": [
+                            str(item) for item in raw["validation_requirements"]
+                        ]
+                    }
+                    if raw.get("validation_requirements")
+                    else {}
+                ),
+                # Its own image and play command (ADR-0078).
+                **profile_from_task(raw),
+            },
         )
         self.session.add(case)
         self.session.commit()

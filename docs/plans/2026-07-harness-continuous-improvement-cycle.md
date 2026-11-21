@@ -23,13 +23,13 @@ and MkDocs.
 
 **Plan status:** approved for future implementation; no implementation started.
 
-**Plan owner repository:** `marcosdh1987/ai-agentic-harness-lab`
+**Plan owner repository:** `xmartlabs/sdlc-ml-python-harness-lab`
 
 **Repositories in scope:**
 
-- `marcosdh1987/ai-agentic-harness-lab` (private experimental lab)
-- `marcosdh1987/ml-python-base` (public authoritative template)
-- `marcosdh1987/harness-engineering-guide` (public documentation)
+- `xmartlabs/sdlc-ml-python-harness-lab` (private experimental lab)
+- `xmartlabs/sdlc-ml-python-base` (public authoritative template)
+- `xmartlabs/sdlc-harness-engineering-guide` (public documentation)
 
 ---
 
@@ -63,7 +63,7 @@ dedicated planning branch until implementation begins. During implementation:
 
 | Milestone | Status | Evidence | Notes |
 |---|---|---|---|
-| 1 | In progress | Phase 1: [`ml-python-base` PR #27](https://github.com/marcosdh1987/ml-python-base/pull/27), merge `a97e98c`. Phase 2: re-created on local branch `feat/harness-traceable-release-contract` (uncommitted) on 2026-07-22; `make ci` green — 88 tests total (38 focused release tests), `make check-sync` no drift, schema/Make smoke tests pass. | Phase 1 is merged. **Note:** the Phase 2 work previously logged as complete was absent from `main` and `origin` of `ml-python-base` on this machine (no branch, no stash, no artifacts; `pyproject` still `0.1.0`), so it was re-implemented from the plan. Its PR, merge, baseline tag `v0.2.0`, GitHub Release, and release asset are still pending (human step). |
+| 1 | In progress | Phase 1: [`ml-python-base` PR #27](https://github.com/xmartlabs/sdlc-ml-python-base/pull/27), merge `a97e98c`. Phase 2: re-created on local branch `feat/harness-traceable-release-contract` (uncommitted) on 2026-07-22; `make ci` green — 88 tests total (38 focused release tests), `make check-sync` no drift, schema/Make smoke tests pass. | Phase 1 is merged. **Note:** the Phase 2 work previously logged as complete was absent from `main` and `origin` of `ml-python-base` on this machine (no branch, no stash, no artifacts; `pyproject` still `0.1.0`), so it was re-implemented from the plan. Its PR, merge, baseline tag `v0.2.0`, GitHub Release, and release asset are still pending (human step). |
 | 2 | In progress | Phase 3 (versioned proposals): implemented on local branch `feat/harness-versioned-proposals` (uncommitted) on 2026-07-22; `make ci` green (303 tests), no drift. Milestone 1's `v0.2.0` baseline release is published, unblocking Phase 4. | Phase 3 done and awaiting PR/merge. Phase 4 (safe installed state + candidate sync) not started; it consumes the published `v0.2.0` + its release manifest. |
 | 3 | Not started | — | — |
 | 4 | Not started | — | — |
@@ -283,7 +283,7 @@ status: proposed
 created_at: 2026-07-22T12:00:00Z
 
 source:
-  repository: marcosdh1987/ai-agentic-harness-lab
+  repository: xmartlabs/sdlc-ml-python-harness-lab
   runs:
     - run_id: custom-debug-loop-claude-sdlc-003
       condition_hash: sha256:...
@@ -356,7 +356,7 @@ Release. It is not committed with a self-referential commit SHA.
 ```yaml
 schema_version: 1
 release:
-  repository: marcosdh1987/ml-python-base
+  repository: xmartlabs/sdlc-ml-python-base
   version: 0.5.0
   ref: v0.5.0
   commit: <full-sha>
@@ -388,8 +388,8 @@ channels:
 
 provenance:
   proposals: [HEP-2026-014]
-  source_issues: [marcosdh1987/ml-python-base#31]
-  source_pull_requests: [marcosdh1987/ml-python-base#32]
+  source_issues: [xmartlabs/sdlc-ml-python-base#31]
+  source_pull_requests: [xmartlabs/sdlc-ml-python-base#32]
 
 artifacts:
   governance_tree_sha256: sha256:...
@@ -408,7 +408,7 @@ Canonical tracked file in the lab:
 ```yaml
 schema_version: 1
 installed:
-  repository: marcosdh1987/ml-python-base
+  repository: xmartlabs/sdlc-ml-python-base
   ref: v0.5.0
   commit: <full-sha>
   channel: governance
@@ -1015,7 +1015,7 @@ Compatibility outcomes:
 ### Phase 1 — Authoritative template and shared engine
 
 **Status:** Completed and merged on 2026-07-22 via
-[`ml-python-base` PR #27](https://github.com/marcosdh1987/ml-python-base/pull/27)
+[`ml-python-base` PR #27](https://github.com/xmartlabs/sdlc-ml-python-base/pull/27)
 at merge commit `a97e98c`. Post-merge verification passed `make check` (50
 tests, 88% coverage) and `make check-sync` with no drift.
 

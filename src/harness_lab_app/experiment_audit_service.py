@@ -43,6 +43,7 @@ RUN_METRICS = (
     "rubric_score",
     "cost_usd",
     "billed_tokens",
+    "output_tokens",
     "wall_time_minutes",
     "agent_turns",
     "agent_tool_calls",
@@ -68,8 +69,10 @@ EXPERIMENT_AUDIT_SYSTEM_PROMPT = (
     "Los brazos y qué difiere entre ellos, en una línea cada uno.\n"
     "## Resultado\n"
     "Éxito y costo por brazo con los números tal cual vienen (pasa/no pasa, "
-    "test_pass_rate, costo en USD, tokens facturados, minutos). Una tabla corta "
-    "está bien.\n"
+    "test_pass_rate, costo en USD, tokens facturados, tokens generados, minutos). "
+    "Una tabla corta está bien. Si un delta viene con comparable=false, escribí "
+    "'no comparable' y cuántas corridas no lo midieron; nunca compares un número "
+    "contra un faltante.\n"
     "## Qué se usó y qué no\n"
     "Por brazo: qué documentos de gobernanza leyó y cuáles no; qué skills invocó, "
     "cuáles se le pidieron y no invocó, y cuáles tenía disponibles y nunca abrió. "
@@ -124,7 +127,26 @@ def call_with_retry(
             index = min(attempt - 1, len(backoff) - 1) if backoff else -1
             sleep(backoff[index] if index >= 0 else 0.0)
     assert last is not None
-    raise type(last)(f"{last} (after {attempts} attempts)") from last
+    raise _with_attempt_count(last, attempts) from last
+
+
+def _with_attempt_count(error: Exception, attempts: int) -> Exception:
+    """The same error, its message saying how many times the gateway was asked.
+
+    ``GatewayHTTPError`` takes ``(code, body)``, not a message: rebuilding it as
+    ``type(error)(message)`` raised ``TypeError: missing 'body'`` — and that
+    TypeError, not the gateway's answer, is what a comparison stored as its
+    reason. The status stays on the rebuilt error so a caller can still read it.
+    """
+    from harness_lab_app.llm_transport import GatewayHTTPError, TransportError
+
+    suffix = f" (after {attempts} attempts)"
+    if isinstance(error, GatewayHTTPError):
+        return GatewayHTTPError(error.code, f"{error.body}{suffix}")
+    try:
+        return type(error)(f"{error}{suffix}")
+    except TypeError:  # a subclass with its own signature; keep the family
+        return TransportError(f"{error}{suffix}")
 
 
 def runs_finished(session: Session, experiment_id: str) -> tuple[bool, int, int]:
@@ -165,7 +187,7 @@ def build_evidence(session: Session, experiment_id: str) -> dict[str, Any]:
         effort = (validation.effort if validation else None) or {}
         # Failed and did-not-measure are two different claims, and an auditor
         # handed the second under the name of the first will write that the arm
-        # failed the check (ADR-0063).
+        # failed the check (ADR-0062).
         failed_checks = [
             {
                 # `command` first: rows written before validation emitted it
@@ -271,6 +293,9 @@ def build_evidence(session: Session, experiment_id: str) -> dict[str, Any]:
                         "treatment": d.get("treatment"),
                         "direction": d.get("direction"),
                         "exceeds_spread": d.get("exceeds_spread"),
+                        "comparable": d.get("comparable", True),
+                        "control_missing": d.get("control_missing", 0),
+                        "treatment_missing": d.get("treatment_missing", 0),
                     }
                     for d in c.get("deltas") or []
                 ],

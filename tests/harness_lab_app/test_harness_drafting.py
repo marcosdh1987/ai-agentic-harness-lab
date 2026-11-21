@@ -48,7 +48,7 @@ def test_draft_to_proposal() -> None:
         _DRAFT,
         proposal_id="HEP-2026-014",
         created_at=FIXED,
-        source=ProposalSource(repository="marcosdh1987/ai-agentic-harness-lab"),
+        source=ProposalSource(repository="xmartlabs/sdlc-ml-python-harness-lab"),
     )
     assert proposal.title.startswith("Add a retry budget")
     assert proposal.validation.success_criteria[0].metric == ("repeated_command_max")
@@ -66,7 +66,7 @@ def test_synthesize_issue_markdown_is_sanitized(tmp_path: Path) -> None:
     run_dir = _run_dir(tmp_path)
     markdown = drafting.synthesize_issue_markdown(
         run_dir,
-        repository="marcosdh1987/ml-python-base",
+        repository="xmartlabs/sdlc-ml-python-template",
         created_at=FIXED,
         gateway=lambda *_args: json.dumps(_DRAFT),
     )

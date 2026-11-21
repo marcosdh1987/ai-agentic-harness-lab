@@ -8,6 +8,31 @@ For the properties that are *inherent* to running a benchmarking lab — untrust
 model output, credentials in run containers, host-root reachability — see
 [SECURITY.md](../SECURITY.md). Those are design, not debt.
 
+## Measurements archived before 2026-10-21
+
+Two defects in `scripts/bench_run.py`, fixed on 2026-10-21, bias every run archived
+before that date. Read any earlier comparison of cost, steps or time with them in mind.
+
+### Build-from-scratch runs stopped at step 2
+
+`workspace_fingerprint` asked git for status and diff inside a workspace with no
+`.git` of its own. git answered for the lab repository, where `/workspace/` is
+ignored, so the fingerprint never changed and the loop stopped as `no_progress`
+after step 2 whatever the agent had done — 36 archived runs. A bare arm that
+signalled completion at step 1 and a harness arm cut at step 2 therefore stopped
+for different reasons, which makes the earlier "the harness costs more" readings on
+`tetris-v2` and `cli-textstats-v1` unreliable. Such a workspace is now fingerprinted
+by its file tree.
+
+### Cost lost when usage was merged
+
+The usage merge let a remote source that returned `cost_usd: None` overwrite the
+cost parsed from Claude's own `result` events: 37 archived claude runs show no cost
+while their events report $56.09 in total — more than the $47.57 the lab had
+recorded. `merge_usage` now never replaces a value with an empty one. Archived
+`usage.json` files were **not** rewritten; recompute a run's cost from
+`collect_claude_usage(<run dir>)` before using it.
+
 ## Batch runs
 
 ### `create_batch` is not transactional
@@ -91,6 +116,27 @@ failure reason, but the advice above it — check reachability, model id and
 context window — sends the reader to the wrong place. A quota marker set
 alongside `_COMPLETION_CAP_MARKERS` would let both layers name billing directly.
 
+### A Claude model the gateway does not serve is caught only by id
+
+In Docker the `claude` harness reaches Anthropic through the gateway
+(`ANTHROPIC_BASE_URL`), so a model without a gateway card dies on its first
+request with `Invalid model name`. Experiment `con-o-sin-harness` (2026-10-23)
+lost eight runs of `claude-haiku-5-5` that way, each listed as an "agent error".
+Preflight now asks the gateway and refuses such a model before anything is queued,
+the forms mark it "not on your gateway" with a warning under the picker, and the
+run list labels the old failures `model not served` / `harness error` and keeps
+them out of the counts. Two gaps remain: only the ids in `native_models.py` are
+checked (an id typed by hand is not), and a gateway that does not answer is
+treated as unknown, so the run is allowed.
+
+The same day, two `claude-opus-5-5` runs (K-006/007) — a model the gateway does
+serve — died on `claude_code_version_too_old`: the runner image's unpinned
+`npm install` had stayed on a cached Claude Code 2.1.197. The CLI is now pinned and
+labelled, Health and preflight read the label, and a harness error prints a short
+`Cause:` line last so the stored failure reason names it. Images built before the
+label existed report no version and are not blocked; `MIN_CLAUDE_CLI_VERSION` holds
+only floors the API has stated.
+
 ### The batch endpoint has no HTTP-level test
 
 `tests/harness_lab_app/test_run_batch.py` covers `RunService.create_batch`
@@ -138,6 +184,33 @@ loose sense that any two judges are, and nothing in the aggregate flags the
 difference for you. Host-mode development still needs
 `uv sync --extra deepeval`, and a plain `uv sync` removes it again — that
 remains the price of keeping it an optional extra.
+
+### Measurement honesty: what ADR-0073 fixed and what is still open
+
+[ADR-0073](adr/0073-a-measurement-names-its-real-instrument-and-its-reach.md) closed
+five gaps an external Monte Carlo review found. The follow-ups below are planned in
+[`2026-11-measurement-honesty-follow-ups.md`](plans/2026-11-measurement-honesty-follow-ups.md)
+and are **not** built yet:
+
+- `plan_repetitions` still uses the two-proportion formula. Its figure is a floor:
+  80% promised was 66–72% (even effect) and 32–66% (uneven effect) in simulation, and
+  it cannot say whether to add cases or repetitions.
+- An arm's Wilson interval assumes every run is independent. It describes *these
+  cases*. Read as "this model on tasks of this kind", it covered only 55–58% of the
+  time at 4 cases × 24 repetitions.
+- Nothing compares the judge (`task_completion`) with the checks
+  (`task_validation_pass`), and runs the judge could not score drop out of its mean
+  uncounted.
+- A repository audit is a single sample. Repeating it 2–3 times would cover more of
+  the cases it can propose.
+- `skill_adherence` divides by whatever item list the auditor returned, unchecked
+  against the catalog.
+- `rubric_score` and the run auditor (`bench_audit.py`) still record the requested
+  model, not the one that answered. On the Claude CLI every judged score now records
+  `temperature: null`, which means unknown, not zero.
+- On the gateway the request is recorded as the effective configuration. LiteLLM
+  aliases model names, and with `drop_params: true` it can drop a temperature the
+  backend rejects without saying so.
 
 ### Runs from before scoring existed have no scores
 

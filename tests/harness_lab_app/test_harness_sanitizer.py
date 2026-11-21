@@ -65,7 +65,7 @@ def _proposal_with_secret_in_private_field() -> Proposal:
         title="Add retry budget",
         created_at=FIXED,
         source=ProposalSource(
-            repository="marcosdh1987/ai-agentic-harness-lab",
+            repository="xmartlabs/sdlc-ml-python-harness-lab",
             runs=[
                 RunEvidence(
                     run_id="dbg-K-001",

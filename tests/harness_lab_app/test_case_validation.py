@@ -80,6 +80,24 @@ def test_a_check_that_cannot_fail_is_refused():
     assert problem.reason == REASON_TAUTOLOGICAL
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Imports the agent's module from the workspace and asserts on it.
+        "python3 -c \"import sys; sys.path.insert(0,'{workspace}'); import pipe; "
+        "s=pipe.summary(); sys.exit(0 if all(k in s for k in ('a','b')) else 1)\"",
+        # Runs the agent's entry point and checks what it returned.
+        'python3 -c "import subprocess,sys; r=subprocess.run([sys.executable,'
+        "'{workspace}/main.py']); sys.exit(0 if any([r.returncode == 0]) else 1)\"",
+    ],
+)
+def test_a_predicate_over_the_agents_own_code_is_a_real_check(command: str):
+    """A generated Iris case lost its EDA check to this rule: `all(...)` with no
+    file read, but over what the agent's module returned. Importing or running
+    what the agent wrote is reading it."""
+    assert check_command(command) is None
+
+
 @pytest.mark.parametrize("command", ["true", "echo done", ":"])
 def test_the_obvious_tautologies_are_refused(command: str):
     problem = check_command(command)
@@ -326,7 +344,7 @@ def test_an_unanchored_check_that_exits_127_settles_nothing(session):
     """127 on the clean tree used to read as "the case has something to measure".
 
     It is the shell saying the command does not exist — a fact about the case,
-    not about whether the case can distinguish work from no work (ADR-0063).
+    not about whether the case can distinguish work from no work (ADR-0062).
     """
     _seed_case_and_target(session, ["bash {workspace}/tests/run.sh"])
 

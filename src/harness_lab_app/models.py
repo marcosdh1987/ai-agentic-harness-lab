@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 
 from sqlalchemy import Column, UniqueConstraint
 from sqlalchemy.types import JSON
@@ -74,6 +75,10 @@ class ExperimentMode(StrEnum):
     cross_repo = "cross_repo"
     discovery = "discovery"
     subject_validation = "subject_validation"
+    # A full grid of harness levels x models (ADR-0066): the one design that can
+    # ask whether a stronger model needs less harness, because it measures the
+    # interaction instead of refusing it as a confound.
+    harness_by_model = "harness_by_model"
 
 
 class ExperimentStatus(StrEnum):
@@ -178,7 +183,8 @@ class Case(SQLModel, table=True):
     # benchmark exists to catch.
     files_expected: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     files_forbidden: list[str] = Field(default_factory=list, sa_column=Column(JSON))
-    metadata_json: dict[str, str] = Field(default_factory=dict, sa_column=Column(JSON))
+    # JSON, not only strings: `validation_requirements` is a list (ADR-0071).
+    metadata_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -233,9 +239,15 @@ class RunConfig(SQLModel, table=True):
     harness: str = "opencode"
     planner_model: str | None = None
     executor_model: str | None = None
+    # Reasoning effort (ADR-0081). "" is the CLI's own default, which is what
+    # every run before the selector got, so historical rows are accurate as-is.
+    executor_effort: str = ""
     score_mode: str = "manual"
     max_steps: int = 1
     resume: bool = False
+    # The step a "continue where it stopped" retry starts at (ADR-0083); the
+    # steps before it are kept as they ran. 0 runs every step, as always.
+    resume_from_step: int = 0
     dry_run: bool = False
     # Follow-up instruction for a continuation run (ADR-0026). Empty for every
     # ordinary run: it replaces the case prompt only when the run has a parent.
@@ -272,6 +284,9 @@ class Run(SQLModel, table=True):
     exit_code: int | None = None
     failure_reason: str | None = None
     cancel_requested: bool = False
+    # Seconds a person added to a slow phase with "Keep waiting". The phase
+    # watchdog reads it on every tick; a run nobody looked at keeps 0.
+    extra_wait_seconds: int = 0
     score: int | None = None
     interventions: int | None = None
     notes: str = ""
@@ -288,6 +303,11 @@ class Run(SQLModel, table=True):
     # for an original run, and for every run that predates continuations — no
     # backfill invents lineage that never existed.
     parent_run_id: str | None = Field(default=None, index=True)
+    # The queue of the worker executing the run (`runs` or `runs-parallel`,
+    # ADR-0082), set when it starts. A restarting worker reconciles a `running`
+    # row only when the lane that owns it answered; null for every run that
+    # predates the second lane, all of which ran on `runs`.
+    lane: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -844,3 +864,45 @@ class Attribution(SQLModel, table=True):
     steps_parsed: int = 0
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class LocalMachine(SQLModel, table=True):
+    """A machine a developer serves local models from (Tune your local model).
+
+    Entered by hand from a reference preset: the lab runs in Docker and the
+    server may sit elsewhere on the LAN, so it cannot read the hardware itself.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(index=True, unique=True)
+    memory_kind: str = "discrete"  # "unified" | "discrete"
+    gpu_gb: float = 0.0
+    ram_gb: float = 0.0
+    reserve_gb: float = 4.0
+    gpu_wired_fraction: float = 0.75
+    bandwidth_gbs: float | None = None
+    notes: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class TuningProfile(SQLModel, table=True):
+    """One tested configuration of one model on one machine and server.
+
+    Profiles are only ever compared within the same machine and model: speed is
+    a property of the hardware, so a cross-machine comparison measures nothing.
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    machine_id: int = Field(index=True)
+    server_kind: str  # "lmstudio" | "ollama"
+    server_url: str
+    model_id: str = Field(index=True)
+    label: str = ""
+    requested_config: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    served_config: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    estimate: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    results: list = Field(default_factory=list, sa_column=Column(JSON))
+    observed_memory_gb: float | None = None
+    server_version: str = ""
+    recommended: bool = False
+    created_at: datetime = Field(default_factory=utc_now)

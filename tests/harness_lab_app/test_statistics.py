@@ -17,11 +17,16 @@ from harness_lab_app.statistics import (
     confidence_interval,
     evidence_strength,
     objective_signature,
+    paired_bootstrap_interval,
     paired_by_case,
+    pass_at_k,
+    pass_k_by_arm,
+    plan_repetitions,
     repetition_warnings,
     success_delta,
     summarize_condition,
     verdict,
+    wilson_interval,
 )
 
 
@@ -223,6 +228,302 @@ def test_no_confidence_interval_below_three_observations(values):
 def test_an_interval_brackets_the_mean():
     low, high = confidence_interval([1.0, 2.0, 3.0, 4.0])
     assert low < 2.5 < high
+
+
+# --------------------------------------------------------------------------
+# An experiment shows its uncertainty (ADR-0064)
+# --------------------------------------------------------------------------
+
+
+def test_a_success_rate_interval_matches_the_wilson_score_interval():
+    """3 of 5 is "60% [23-88]": the width a validation-sized arm really has."""
+    low, high = wilson_interval(3, 5)
+    assert low == pytest.approx(0.2307, abs=1e-3)
+    assert high == pytest.approx(0.8824, abs=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("successes", "trials", "expected"),
+    [
+        # A normal approximation gives [0, 0] here and claims certainty from
+        # five runs. Wilson keeps the upper bound honest.
+        (0, 5, (0.0, 0.4345)),
+        (5, 5, (0.5655, 1.0)),
+        (1, 1, (0.2065, 1.0)),
+    ],
+)
+def test_a_unanimous_arm_still_has_an_interval(successes, trials, expected):
+    low, high = wilson_interval(successes, trials)
+    assert low == pytest.approx(expected[0], abs=1e-3)
+    assert high == pytest.approx(expected[1], abs=1e-3)
+    assert 0.0 <= low <= high <= 1.0
+
+
+def test_no_interval_without_a_scored_run():
+    assert wilson_interval(0, 0) is None
+
+
+def test_a_condition_carries_the_interval_of_its_success_rate():
+    summary = summarize_condition(
+        "arm",
+        [{"task_validation_pass": verdict} for verdict in (True, True, True)]
+        + [{"task_validation_pass": False}, {"task_validation_pass": False}, {}],
+    )
+    assert summary.success_rate == pytest.approx(0.6)
+    # Denominated in scored runs, like the rate it brackets.
+    assert summary.success_rate_ci == wilson_interval(3, 5)
+    assert summarize_condition("arm", [{}, {}]).success_rate_ci is None
+
+
+def _cases(**cells):
+    """`_cases(a="PPF")` -> {"a": [True, True, False]}."""
+    return {case: [mark == "P" for mark in marks] for case, marks in cells.items()}
+
+
+def test_the_delta_interval_is_reproducible():
+    """A page that redraws a different interval on every refresh is noise."""
+    control = _cases(a="PFF", b="FFF", c="PPF")
+    treatment = _cases(a="PPF", b="PFF", c="PPP")
+
+    first = paired_bootstrap_interval(control, treatment)
+    second = paired_bootstrap_interval(control, treatment)
+
+    assert first == second
+    assert first is not None
+
+
+def test_resampling_cases_widens_an_interval_that_one_case_would_narrow():
+    """Forty runs spread over four cases are not forty independent runs.
+
+    The treatment fixes two cases completely and leaves two untouched. Read as
+    one pool of 40 runs per arm, +50 points looks settled; resampled by case,
+    a different draw of four cases can show anything from 0 to +100.
+    """
+    control = _cases(a="F" * 10, b="F" * 10, c="F" * 10, d="F" * 10)
+    treatment = _cases(a="P" * 10, b="P" * 10, c="F" * 10, d="F" * 10)
+    pooled_control = {"all": [False] * 40}
+    pooled_treatment = {"all": [True] * 20 + [False] * 20}
+
+    clustered = paired_bootstrap_interval(control, treatment)
+    pooled = paired_bootstrap_interval(pooled_control, pooled_treatment)
+
+    assert clustered is not None
+    assert pooled is not None
+    assert clustered[0] < pooled[0]
+    assert clustered[1] > pooled[1]
+    assert clustered[0] <= 0.0
+
+
+def test_the_bootstrap_needs_a_case_both_arms_scored():
+    assert paired_bootstrap_interval(_cases(a="PP"), _cases(b="FF")) is None
+    assert paired_bootstrap_interval({}, {}) is None
+
+
+def _counted(label, passes, fails):
+    return summarize_condition(
+        label,
+        [{"task_validation_pass": True}] * passes
+        + [{"task_validation_pass": False}] * fails,
+    )
+
+
+def test_the_success_delta_carries_its_interval_in_points():
+    control = _counted("native", 1, 4)
+    treatment = _counted("injected", 4, 1)
+
+    delta = success_delta(
+        control,
+        treatment,
+        control_cases=_cases(a="PFFFF"),
+        treatment_cases=_cases(a="PPPPF"),
+    )
+
+    assert delta["points"] == pytest.approx(60.0)
+    assert delta["delta_ci_low"] < delta["points"] < delta["delta_ci_high"]
+    assert delta["paired_cases"] == 1
+    assert delta["interval_crosses_zero"] is (delta["delta_ci_low"] <= 0.0)
+
+
+def test_a_tie_over_five_runs_says_its_interval_includes_zero():
+    control = _counted("native", 3, 2)
+    treatment = _counted("injected", 3, 2)
+
+    delta = success_delta(
+        control,
+        treatment,
+        control_cases=_cases(a="PPPFF"),
+        treatment_cases=_cases(a="PPFPF"),
+    )
+
+    assert delta["points"] == pytest.approx(0.0)
+    assert delta["delta_ci_low"] < 0.0 < delta["delta_ci_high"]
+    assert delta["interval_crosses_zero"] is True
+
+
+def test_a_unanimous_split_is_not_reported_as_certain():
+    """0/5 against 5/5 resamples to +100 every time — the bootstrap's blind spot.
+
+    Every repetition agrees, so a plain bootstrap has nothing to resample and
+    returns [+100, +100]: certainty from ten runs. The interval is never
+    narrower than Newcombe's, which is built from the arms' own Wilson
+    intervals and does not collapse at 0/n or n/n.
+    """
+    control = _counted("native", 0, 5)
+    treatment = _counted("injected", 5, 0)
+
+    delta = success_delta(
+        control,
+        treatment,
+        control_cases=_cases(a="FFFFF"),
+        treatment_cases=_cases(a="PPPPP"),
+    )
+
+    assert delta["delta_ci_high"] == pytest.approx(100.0)
+    assert delta["delta_ci_low"] == pytest.approx(38.6, abs=0.5)
+
+
+def test_the_delta_interval_without_per_case_outcomes_still_brackets_the_point():
+    """Callers that only hold the arm totals still get an interval."""
+    control = _counted("native", 2, 3)
+    treatment = _counted("injected", 4, 1)
+
+    delta = success_delta(control, treatment)
+
+    assert delta["paired_cases"] == 0
+    assert delta["delta_ci_low"] < 40.0 < delta["delta_ci_high"]
+
+
+def test_no_delta_interval_until_both_arms_are_scored():
+    delta = success_delta(_counted("a", 2, 1), summarize_condition("b", [{}]))
+    assert delta["points"] is None
+    assert delta["delta_ci_low"] is None
+    assert delta["delta_ci_high"] is None
+    assert delta["interval_crosses_zero"] is None
+
+
+def test_pass_hat_k_is_strict_where_pass_at_k_is_lenient():
+    """pass^k is "every one of k tries passes" — the reliability a user feels."""
+    result = pass_at_k(_cases(a="PPP", b="PFF"))
+
+    assert result == {
+        "k": 3,
+        "cases": 2,
+        "pass_at_k": pytest.approx(1.0),
+        "pass_hat_k": pytest.approx(0.5),
+    }
+
+
+def test_pass_at_k_uses_the_unbiased_estimator_when_a_case_has_spare_runs():
+    """With n > k the estimator averages over every k-subset of the n runs."""
+    result = pass_at_k(_cases(a="PPFF"), k=2)
+
+    # pass^2 = C(2,2)/C(4,2); pass@2 = 1 - C(2,2)/C(4,2).
+    assert result["pass_hat_k"] == pytest.approx(1 / 6)
+    assert result["pass_at_k"] == pytest.approx(5 / 6)
+
+
+def test_pass_at_one_is_the_mean_case_rate():
+    result = pass_at_k(_cases(a="PF", b="PPPF"), k=1)
+    assert result["pass_at_k"] == pytest.approx((0.5 + 0.75) / 2)
+    assert result["pass_hat_k"] == result["pass_at_k"]
+
+
+def test_every_arm_is_read_at_the_same_k():
+    """pass^3 against pass^2 compares two different questions."""
+    arms = pass_k_by_arm(
+        {"control": _cases(a="PPP", b="PFP"), "treatment": _cases(a="PP", b="PP")}
+    )
+
+    assert arms["control"]["k"] == arms["treatment"]["k"] == 2
+    assert arms["treatment"]["pass_hat_k"] == pytest.approx(1.0)
+
+
+def test_an_arm_with_no_scored_case_has_no_pass_k():
+    assert pass_at_k({}) is None
+    assert pass_k_by_arm({"a": {}, "b": _cases(x="P")})["a"] is None
+
+
+def test_a_case_with_fewer_runs_than_k_is_left_out_not_padded():
+    """pass^3 over two runs would have to invent the third."""
+    assert pass_at_k(_cases(a="PP"), k=3) is None
+    result = pass_at_k(_cases(a="PP", b="PPF"), k=3)
+    assert result is not None
+    assert result["cases"] == 1
+    assert result["pass_hat_k"] == pytest.approx(0.0)
+
+
+def test_with_too_few_runs_the_plan_assumes_a_coin_flip():
+    """Below ten scored runs an observed rate is too loose to plan from."""
+    plan = plan_repetitions([_counted("a", 4, 0), _counted("b", 0, 4)], cases=1)
+
+    assert plan["basis"] == "assumed"
+    assert plan["base_rate"] == 0.5
+    assert plan["difference_points"] == 20
+    assert plan["runs_per_arm"] == 93
+    assert plan["repetitions_per_case"] == 93
+
+
+def test_the_plan_spreads_its_runs_over_the_cases():
+    plan = plan_repetitions([_counted("a", 1, 1)], cases=3)
+    assert plan["runs_per_arm"] == 93
+    assert plan["repetitions_per_case"] == 31
+
+
+def test_an_observed_rate_far_from_half_needs_fewer_runs():
+    plan = plan_repetitions([_counted("a", 12, 0), _counted("b", 11, 1)], cases=1)
+
+    assert plan["basis"] == "observed"
+    # The noisier of the two observed arms sets the plan, never the calmer one.
+    assert plan["base_rate"] == pytest.approx(11 / 12)
+    assert 0 < plan["runs_per_arm"] < 93
+
+
+def test_an_arm_without_enough_runs_keeps_the_plan_conservative():
+    plan = plan_repetitions([_counted("a", 12, 0), _counted("b", 1, 0)], cases=1)
+    assert plan["basis"] == "assumed"
+    assert plan["runs_per_arm"] == 93
+
+
+def test_no_plan_for_a_design_without_cases():
+    assert plan_repetitions([_counted("a", 1, 1)], cases=0) is None
+
+
+def test_a_delta_interval_that_includes_zero_is_said_in_the_verdict():
+    control, treatment = _pair(
+        [True, False, True, False, False], [True, True, False, True, False]
+    )
+    answer = verdict(
+        mode="harness_evaluation",
+        cases=1,
+        repetitions=5,
+        control=control,
+        treatment=treatment,
+        success=success_delta(
+            control,
+            treatment,
+            control_cases=_cases(a="PFPFF"),
+            treatment_cases=_cases(a="PPFPF"),
+        ),
+    )
+
+    caveat = next(c for c in answer["caveats"] if "95% interval" in c)
+    assert "includes zero" in caveat
+    # Descriptive, never the vocabulary of a test.
+    assert not any("significan" in c.lower() for c in answer["caveats"])
+
+
+def test_an_interval_clear_of_zero_adds_no_interval_caveat():
+    control, treatment = _pair([False] * 5, [True] * 5)
+    answer = verdict(
+        mode="harness_evaluation",
+        cases=1,
+        repetitions=5,
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+    )
+
+    assert not any("includes zero" in c for c in answer["caveats"])
 
 
 # --------------------------------------------------------------------------
@@ -628,6 +929,84 @@ def test_one_bad_run_out_of_five_degrades_rather_than_invalidates():
     assert validity["status"] == "degraded"
 
 
+def _paired(n_cases: int) -> tuple:
+    """A design with ``n_cases`` paired cases of five repetitions each."""
+    control_cases = {
+        f"c{i}": [False, False, True, False, False] for i in range(n_cases)
+    }
+    treatment_cases = {f"c{i}": [True, True, False, True, True] for i in range(n_cases)}
+    control = _counted("native", n_cases, 4 * n_cases)
+    treatment = _counted("injected", 4 * n_cases, n_cases)
+    success = success_delta(
+        control,
+        treatment,
+        control_cases=control_cases,
+        treatment_cases=treatment_cases,
+    )
+    return control, treatment, success
+
+
+@pytest.mark.parametrize("n_cases", [1, 4])
+def test_few_paired_cases_bound_the_reading_without_breaking_it(n_cases):
+    """Below five cases the interval describes the cases that ran.
+
+    A Monte Carlo check of this module saw the delta interval cover the
+    population effect ~83% of the time at 4 cases x 24 repetitions with an
+    uneven effect. That is a reading caveat, not a broken comparison: it
+    degrades, never invalidates, and it is listed last.
+    """
+    control, treatment, success = _paired(n_cases)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success,
+    )
+    assert validity["status"] == "degraded"
+    assert _codes(validity) == ["few_cases"]
+    issue = validity["issues"][0]
+    assert issue["severity"] == "degraded"
+    assert f"Only {n_cases} paired case" in issue["detail"]
+
+
+def test_five_paired_cases_raise_no_few_cases_issue():
+    control, treatment, success = _paired(5)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success,
+    )
+    assert "few_cases" not in _codes(validity)
+
+
+def test_a_delta_with_no_per_case_outcomes_is_not_called_few_cases():
+    """Zero paired cases means none were recorded — a different gap."""
+    control, treatment = _pair([False] * 5, [True] * 5)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+    )
+    assert "few_cases" not in _codes(validity)
+
+
+def test_few_cases_sorts_after_an_invalidating_issue():
+    control, treatment, success = _paired(2)
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success,
+        skill_usage={
+            treatment.label: {"skills": ["caveman"], "runs": 10, "invoked": 0}
+        },
+    )
+    assert validity["status"] == "invalid"
+    assert _codes(validity) == ["treatment_not_activated", "few_cases"]
+
+
 def test_a_mode_that_makes_no_causal_claim_has_nothing_to_invalidate():
     for mode in ("discovery", "cross_repo"):
         validity = assess_validity(
@@ -731,7 +1110,7 @@ def test_headline_metrics_lead_with_the_graded_outcome_and_the_billed_cost():
 
 
 # --------------------------------------------------------------------------
-# The floor, which is the ceiling's mirror (ADR-0063)
+# The floor, which is the ceiling's mirror (ADR-0062)
 # --------------------------------------------------------------------------
 
 
@@ -1059,3 +1438,96 @@ def test_the_outcome_metrics_are_not_read_as_a_price():
     )
 
     assert _tie(control, treatment)["headline"] == "No difference observed"
+
+
+# --------------------------------------------------------------------------
+# A metric one arm lacks is not compared
+# --------------------------------------------------------------------------
+
+
+def test_a_metric_missing_from_some_runs_is_not_compared():
+    """The bare arm had no tokens on any run and the full harness on three of
+    five; the page drew that as a token difference between the harnesses."""
+    from harness_lab_app.statistics import compare, summarize_condition
+
+    control = summarize_condition(
+        "bare", [{"task_validation_pass": True, "cost_usd": 0.0}] * 5
+    )
+    treatment = summarize_condition(
+        "full",
+        [{"task_validation_pass": True, "cost_usd": 0.0, "billed_tokens": 6e5}] * 3
+        + [{"task_validation_pass": True, "cost_usd": 0.0}] * 2,
+    )
+
+    by_name = {
+        d.name: d
+        for d in compare(control, treatment, {"billed_tokens": "lower_is_better"})
+    }
+
+    tokens = by_name["billed_tokens"]
+    assert tokens.comparable is False
+    assert (tokens.control_missing, tokens.treatment_missing) == (5, 2)
+    assert tokens.absolute is None and tokens.exceeds_spread is None
+    # A metric both arms measured on every run still compares.
+    assert by_name["cost_usd"].comparable is True
+    assert by_name["cost_usd"].absolute == 0.0
+
+
+def test_an_incomplete_cost_metric_degrades_validity_and_leaves_the_headline():
+    from harness_lab_app.statistics import assess_validity, summarize_condition
+
+    control = summarize_condition(
+        "bare",
+        [{"task_validation_pass": True, "cost_usd": 0.0, "wall_time_minutes": 9.0}] * 2,
+    )
+    treatment = summarize_condition(
+        "full",
+        [
+            {
+                "task_validation_pass": True,
+                "cost_usd": 0.0,
+                "wall_time_minutes": 12.0,
+                "billed_tokens": 5e5,
+            }
+        ]
+        * 2,
+    )
+
+    validity = assess_validity(
+        mode="harness_evaluation",
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+    )
+
+    (issue,) = [i for i in validity["issues"] if i["code"] == "incomplete_cost_metrics"]
+    assert issue["severity"] == "degraded"
+    assert "billed_tokens (bare 2/2 missing)" in issue["detail"]
+    # Measured on both sides, so not named.
+    assert "wall_time_minutes" not in issue["detail"]
+
+    answer = verdict(
+        mode="harness_evaluation",
+        cases=1,
+        repetitions=2,
+        control=control,
+        treatment=treatment,
+        success=success_delta(control, treatment),
+    )
+    metrics = {h["metric"] for h in answer["highlights"]}
+    assert "billed_tokens" not in metrics
+    assert "wall_time_minutes" in metrics
+
+
+def test_complete_cost_metrics_raise_no_issue():
+    from harness_lab_app.statistics import assess_validity, summarize_condition
+
+    runs = [{"task_validation_pass": True, "cost_usd": 0.0, "billed_tokens": 1.0}] * 2
+    control = summarize_condition("bare", runs)
+    treatment = summarize_condition("full", runs)
+
+    validity = assess_validity(
+        mode="harness_evaluation", control=control, treatment=treatment
+    )
+
+    assert all(i["code"] != "incomplete_cost_metrics" for i in validity["issues"])

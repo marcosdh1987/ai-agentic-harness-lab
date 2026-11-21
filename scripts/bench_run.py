@@ -26,6 +26,7 @@ Direct:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import functools
 import json
@@ -35,10 +36,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -67,6 +69,7 @@ from create_run import (
 )
 
 from harness_lab_app.provenance import enrich_metadata
+from harness_lab_app.validation import render_command
 
 try:
     import yaml
@@ -158,14 +161,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--executor-model", default=None, help="Gateway model alias for executor"
     )
     p.add_argument(
+        "--executor-effort",
+        default="",
+        choices=["", "low", "medium", "high", "xhigh", "max"],
+        help="Reasoning effort for the claude harness, passed as `claude "
+        "--effort` (ADR-0081). Empty (default) leaves the CLI's own default. "
+        "Which levels a model accepts is checked by the web preflight.",
+    )
+    p.add_argument(
         "--harness",
         default=None,
-        choices=["opencode", "codex", "claude"],
+        choices=["opencode", "codex", "claude", "gemini"],
         help=f"Agent CLI that drives the run (default: {DEFAULT_HARNESS}). All harnesses (opencode, codex, "
-        "claude) run inside the Docker runner under `make app-up`; claude auth "
-        "comes from .env (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY). Host mode "
-        "(`make app-host`, subprocess backend) is an alternative for driving a "
-        "host CLI's interactive/native auth. See docs/harness-adapters.md.",
+        "claude, gemini) run inside the Docker runner under `make app-up`; claude "
+        "auth comes from .env (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY), "
+        "codex and gemini use their own subscription login kept per provider in "
+        "HARNESS_LAB_AUTH_DIR (`make auth-codex` / `make auth-gemini`). Host mode "
+        "(`make app-host`, subprocess backend) is an alternative. See "
+        "docs/harness-adapters.md.",
     )
     p.add_argument(
         "--score-mode",
@@ -194,6 +207,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Allow running into an existing workspace (skip workspace existence check). "
         "Use when a previous run was interrupted and you want to continue.",
+    )
+    p.add_argument(
+        "--from-step",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Start the step loop at step N, keeping steps 1..N-1 as they ran "
+        "(a retry that continues where the run stopped, ADR-0083). The worker "
+        "has already restored the workspace from step N-1's snapshot.",
     )
     p.add_argument(
         "--fresh",
@@ -272,6 +294,86 @@ def resolve_prompt_file(
             f"Available: {list(prompts.keys())}"
         )
     return short_name, REPO_ROOT / prompts[short_name]
+
+
+# Provider error codes and phrases worth naming on their own line when a
+# harness dies: the raw error can be kilobytes long (LiteLLM echoes it with its
+# fallback table), and the worker keeps only the last 1000 characters.
+_CAUSE_MARKERS = (
+    "claude_code_version_too_old",
+    "Invalid model name",
+    "model_not_found",
+    "authentication_error",
+    "permission_error",
+    "rate_limit_error",
+    "overloaded_error",
+    # codex (`turn.failed`) and gemini (`result.error`), as rendered by
+    # harness_events: the provider's own words for a missing/expired login,
+    # an exhausted plan and an unknown model.
+    "401 Unauthorized",
+    "usage_limit_reached",
+    "UsageLimitReached",
+    "CreditsDepleted",
+    "429",
+    "RESOURCE_EXHAUSTED",
+    "model_not_supported",
+    "not supported when using Codex with a ChatGPT account",
+)
+_CAUSE_MAX = 300
+
+
+def _has_marker(line: str, marker: str) -> bool:
+    """A cause marker in ``line``; a bare status code only as a whole number."""
+    if marker.isdigit():
+        return re.search(rf"(?<!\d){marker}(?!\d)", line) is not None
+    return marker in line
+
+
+# Exit codes the Gemini CLI documents for headless mode (docs/cli/headless.md)
+# plus 41, which it returns when no auth method is configured. Named so a run
+# that never reached the model says why without opening its log.
+_GEMINI_EXIT_CAUSES = {
+    41: "Cause: gemini has no login — run `make auth-gemini` (Sign in with Google)",
+    42: "Cause: gemini rejected its input (invalid prompt or arguments)",
+    53: "Cause: gemini turn limit exceeded",
+}
+
+
+def harness_error_cause(
+    step_log: Path, *, harness: str = "", exit_code: int | None = None
+) -> str | None:
+    """One short line naming why a harness CLI died, or ``None``.
+
+    Reads the first ``API Error`` line of the step log and keeps the provider's
+    own sentence and error code, so the run's stored failure reason carries the
+    cause even when the full error is too long to fit. codex ``turn.failed`` and
+    gemini error ``result`` events are rendered with the same ``API Error``
+    prefix (:mod:`harness_lab_app.harness_events`), so one reader serves all
+    three. A gemini exit code the CLI documents is named when the log has no
+    provider line (exit 41: no login configured).
+    """
+    try:
+        text = step_log.read_text(errors="replace")
+    except OSError:
+        return None
+    line = next((ln for ln in text.splitlines() if "API Error" in ln), "")
+    if not line:
+        if harness == "gemini" and exit_code in _GEMINI_EXIT_CAUSES:
+            return _GEMINI_EXIT_CAUSES[exit_code]
+        return None
+    code = next((marker for marker in _CAUSE_MARKERS if _has_marker(line, marker)), "")
+    message = ""
+    start = line.find('"message":"')
+    if start != -1:
+        rest = line[start + len('"message":"') :]
+        message = rest[: rest.find('"')] if '"' in rest else rest
+    elif code:
+        at = line.find(code)
+        message = line[at : at + 160]
+    summary = " — ".join(part for part in (code, message.strip()) if part)
+    if not summary:
+        summary = line.strip()
+    return f"Cause: {summary}"[:_CAUSE_MAX]
 
 
 def extract_cell_id(run_id: str) -> str:
@@ -383,6 +485,52 @@ def _within(target: Path, root: Path) -> bool:
     return target == resolved or resolved in target.parents
 
 
+# Held while the lab's native skill views are rewritten. Two runs may start at
+# once in a parallel model comparison (ADR-0082), each from its own container
+# over the same repo bind; without it both unlink-and-relink the same symlinks
+# and one fails with FileExistsError half-way. A run that would change the set
+# holds the worker's exclusive shared-tree lease (shared_tree.py), so this only
+# serialises identical writes.
+#
+# A file created with O_EXCL, not flock: on Docker Desktop's bind mount flock and
+# lockf exclude nothing, not even two processes of one container, while O_EXCL
+# creation is refused across containers (probed 2026-11-15).
+SKILL_VIEWS_LOCK = REPO_ROOT / "data" / "app" / "skill-views.lock"
+# A rewrite takes seconds; a lock older than this was left by a killed run.
+SKILL_VIEWS_LOCK_STALE_SECONDS = 300
+SKILL_VIEWS_LOCK_WAIT_SECONDS = 600
+
+
+@contextlib.contextmanager
+def _skill_views_lock():
+    SKILL_VIEWS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + SKILL_VIEWS_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fd = os.open(SKILL_VIEWS_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            with contextlib.suppress(OSError):
+                age = time.time() - SKILL_VIEWS_LOCK.stat().st_mtime
+                if age > SKILL_VIEWS_LOCK_STALE_SECONDS:
+                    SKILL_VIEWS_LOCK.unlink()
+                    continue
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"{SKILL_VIEWS_LOCK} is still held after "
+                    f"{SKILL_VIEWS_LOCK_WAIT_SECONDS}s"
+                ) from None
+            time.sleep(0.2)
+            continue
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.close(fd)
+        break
+    try:
+        yield
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            SKILL_VIEWS_LOCK.unlink()
+
+
 def apply_skill_views(skills: list) -> None:
     """Project `skills` into every tool's native view + adapter files."""
     from ml_python_base.skills_sync.config import DEFAULT_REGISTRY_PATH, load_registry
@@ -391,11 +539,12 @@ def apply_skill_views(skills: list) -> None:
     from ml_python_base.skills_sync.renderer import render_tool
 
     registry = load_registry(REPO_ROOT / DEFAULT_REGISTRY_PATH)
-    for tool in registry.tools:
-        hashes = link_tool(REPO_ROOT, tool, skills)
-        if tool.needs_manifest and tool.manifest_path:
-            write_manifest(REPO_ROOT / tool.manifest_path, hashes)
-        render_tool(REPO_ROOT, registry, tool, skills=skills)
+    with _skill_views_lock():
+        for tool in registry.tools:
+            hashes = link_tool(REPO_ROOT, tool, skills)
+            if tool.needs_manifest and tool.manifest_path:
+                write_manifest(REPO_ROOT / tool.manifest_path, hashes)
+            render_tool(REPO_ROOT, registry, tool, skills=skills)
 
 
 def add_skills_to_native(workspace: Path, skills: list, tool_id: str) -> dict:
@@ -495,7 +644,46 @@ def restore_full_skill_views() -> None:
 
 
 @functools.cache
-def apply_gateway_overlay(direct_models: tuple[str, ...] = ()) -> str | None:
+def detected_context_windows(models: tuple[str, ...] = ()) -> tuple:
+    """The served context window of every self-hosted model this run uses.
+
+    Read off the serving host itself (LM Studio ``/api/v0/models``, Ollama
+    ``/api/ps``) the way the run form does, so the limit opencode is told is
+    the window the operator actually loaded — 41k today, 120k tomorrow — with
+    no variable to keep in sync. Cached per model set for the same reason as
+    :func:`apply_gateway_overlay`; empty when detection is off or nothing
+    answered, which leaves every model exactly as undeclared as before.
+    """
+    from harness_lab_app.context_window import autodetect_enabled, detect_windows
+
+    if not models or not autodetect_enabled():
+        return ()
+    try:
+        return tuple(detect_windows(models))
+    except Exception as exc:
+        print(f"  ⚠️  context window detection skipped: {exc!r}")
+        return ()
+
+
+# Where a run's opencode overlay lives, under its own directory. One lab-wide
+# file was safe while one run executed at a time; two at once (ADR-0082) could
+# each rewrite it while the other's opencode was still loading it, and a run
+# could start on the other arm's provider map.
+RUN_OVERLAY_FILE = "opencode-effective.json"
+
+# Set by main() from --run before the overlay is first written.
+_ACTIVE_RUN: str = ""
+
+
+def _overlay_path() -> Path | None:
+    """This run's overlay file, or None outside a run (the lab-wide default)."""
+    return DATA_DIR / _ACTIVE_RUN / RUN_OVERLAY_FILE if _ACTIVE_RUN else None
+
+
+@functools.cache
+def apply_gateway_overlay(
+    direct_models: tuple[str, ...] = (), run_models: tuple[str, ...] = ()
+) -> str | None:
     """Export the opencode routing overlay and return its content hash.
 
     A model enabled from the web lives in ``data/app/gateway-models.json``, not
@@ -516,11 +704,38 @@ def apply_gateway_overlay(direct_models: tuple[str, ...] = ()) -> str | None:
     when nothing is added to the tracked map, which is what keeps every
     historical ``condition_hash`` byte-identical.
     """
+    from harness_lab_app.context_window import describe, limits_by_model
     from harness_lab_app.opencode_overlay import build_overlay
 
-    env, digest = build_overlay(REPO_ROOT, direct_models)
+    windows = detected_context_windows(run_models)
+    for window in windows:
+        print(f"  ✓ {describe(window)}")
+    env, digest = build_overlay(
+        REPO_ROOT, direct_models, limits_by_model(windows), path=_overlay_path()
+    )
     os.environ.update(env)
     return digest
+
+
+def run_models(args: argparse.Namespace) -> tuple[str, ...]:
+    """Every model id this run addresses, in a stable order."""
+    candidates = (
+        getattr(args, "executor_model", None),
+        getattr(args, "planner_model", None),
+    )
+    return tuple(dict.fromkeys(str(m) for m in candidates if m))
+
+
+def usage_models(
+    args: argparse.Namespace, executor_model: str | None
+) -> tuple[str, ...]:
+    """The models a run's usage is attributed to: the resolved executor first.
+
+    ``executor_model`` may come from the run record rather than the command
+    line, so :func:`run_models` alone can miss it.
+    """
+    candidates = (executor_model, getattr(args, "planner_model", None))
+    return tuple(dict.fromkeys(str(m) for m in candidates if m))
 
 
 def direct_models(args: argparse.Namespace) -> tuple[str, ...]:
@@ -622,6 +837,18 @@ def skill_activation_block(invoke_skills: Sequence[str]) -> str:
     )
 
 
+def _entry_point(case_spec: dict | None) -> str:
+    """The workspace-relative entry point a case declares, ``main.py`` by default.
+
+    Refuses anything that is not a plain relative path inside the workspace: it
+    is printed into the prompt as ``{workspace}/<entry_point>``.
+    """
+    value = str((case_spec or {}).get("entry_point") or "").strip()
+    if not value or value.startswith("/") or ".." in value.split("/") or "\n" in value:
+        return "main.py"
+    return value
+
+
 def generate_prompt(
     run_id: str,
     prompt_short: str,
@@ -633,8 +860,14 @@ def generate_prompt(
     repo_note: str | None = None,
     invoke_skills: Sequence[str] = (),
     cwd_note: bool = False,
+    entry_point: str = "main.py",
 ) -> Path:
     """Write the final prompt: metadata header + location constraint + body.
+
+    ``entry_point`` is the case's own (``entry_point`` in its task.yaml):
+    ``main.py`` was right for the pygame cases it was written for and wrong for
+    a web page or a Godot project, whose agents were told to build a file the
+    task never asked for (ADR-0079).
 
     `repo_note` overrides the default build-from-scratch constraint (workspace
     main.py) for repo-task/SWE runs, where the correct wording depends on the
@@ -648,7 +881,7 @@ def generate_prompt(
         f"> path. It is the only directory preserved after the run; anything\n"
         f"> written elsewhere (for example `/workspace/{run_id}/`) is discarded\n"
         f"> when the container exits.\n"
-        f"> Entry point: `{workspace}/main.py`\n"
+        f"> Entry point: `{workspace}/{entry_point}`\n"
         + ("> That directory is your current working directory.\n" if cwd_note else "")
     )
     header = (
@@ -743,6 +976,7 @@ def generate_case_step_prompt(
     steps_dir: Path,
     step_text: str,
     invoke_skills: Sequence[str] = (),
+    phases_left: int = 0,
 ) -> Path:
     """Write step N's prompt from the case's own ``step_prompts`` list.
 
@@ -750,8 +984,21 @@ def generate_case_step_prompt(
     Neither generic continuation prompt fits it: one is Tetris-framed, the
     other SWE-bench-framed. Use the author's text and add only the continuity
     the agent needs (which step it is, and where its work lives).
+
+    ``phases_left`` counts the authored phases after this one (ADR-0079). While
+    any remain, the agent is told to stop at the end of *this* phase: the run
+    continues regardless, so a completion line would only invite it to build
+    ahead of a phase that has not been asked for.
     """
     workspace = agent_workspace_path(run_id)
+    closing = (
+        f"Stop when this phase is done and verified: state what you changed and "
+        f"how you verified it. Do not start the next phase — {phases_left} more "
+        f"will follow, each in its own step.\n"
+        if phases_left > 0
+        else "When this step is done, state what you changed. If the whole task "
+        "is complete, end with: ALL MILESTONES COMPLETE\n"
+    )
     text = (
         f"<!-- Case step {step_n} for RUN_ID={run_id} -->\n\n"
         f"This is step {step_n} of an ongoing task (RUN_ID={run_id}).\n\n"
@@ -759,8 +1006,7 @@ def generate_case_step_prompt(
         f"from scratch and do NOT rewrite unrelated code.\n\n"
         f"## Your task for this step\n\n"
         f"{step_text.strip()}\n\n"
-        f"When this step is done, state what you changed. If the whole task is "
-        f"complete, end with: ALL MILESTONES COMPLETE\n"
+        f"{closing}"
     )
     path = steps_dir / f"step-{step_n}-prompt.md"
     path.write_text(skill_activation_block(invoke_skills) + text)
@@ -919,15 +1165,43 @@ def generate_swe_continuation_prompt(
     return path
 
 
-def workspace_fingerprint(workspace: Path) -> str | None:
-    """Cheap change detector: hash of the workspace's git status + diff vs HEAD.
+def _tree_fingerprint(workspace: Path) -> str:
+    """Hash of every file's relative path and bytes under ``workspace``.
 
-    Used as the SWE stop fallback when no objective per-step evaluation is
-    possible — two consecutive identical fingerprints mean the agent's step
-    made no edits. Returns None (never raises) when git state is unreadable.
+    Symlinks are hashed by target, not followed, so a link loop cannot hang it.
     """
     import hashlib
 
+    digest = hashlib.sha256()
+    for path in sorted(workspace.rglob("*")):
+        if ".git" in path.relative_to(workspace).parts:
+            continue
+        rel = path.relative_to(workspace).as_posix()
+        if path.is_symlink():
+            digest.update(f"L {rel} -> {os.readlink(path)}\n".encode())
+        elif path.is_file():
+            digest.update(f"F {rel}\n".encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def workspace_fingerprint(workspace: Path) -> str | None:
+    """Cheap change detector: two identical fingerprints in a row mean the
+    agent's step made no edits.
+
+    A workspace that is its own git repository (SWE-bench, target clones) is
+    fingerprinted by git status + diff vs HEAD. A build-from-scratch workspace
+    has no ``.git`` and sits inside the lab repo, where ``/workspace/`` is
+    ignored, so git would answer for the enclosing repo and never change; its
+    file tree is hashed instead. Returns None (never raises) when unreadable.
+    """
+    import hashlib
+
+    if workspace.is_dir() and not (workspace / ".git").exists():
+        try:
+            return _tree_fingerprint(workspace)
+        except OSError:
+            return None
     try:
         status = _run_git(
             ["git", "-C", str(workspace), "status", "--porcelain"], cwd=REPO_ROOT
@@ -938,6 +1212,193 @@ def workspace_fingerprint(workspace: Path) -> str | None:
     if status.returncode != 0 or diff.returncode != 0:
         return None
     return hashlib.sha256((status.stdout + diff.stdout).encode()).hexdigest()
+
+
+# A snapshot is a copy of what the agent wrote, not of what it installed. The
+# same exclusions as diff.patch (DIFF_EXCLUDED_DIRS) plus .git, and a size cap:
+# a workspace that grew past it is snapshotted as a diff instead, never skipped
+# silently (ADR-0076).
+SNAPSHOT_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _snapshot_ignore(_dir: str, names: list[str]) -> list[str]:
+    return [n for n in names if n in DIFF_EXCLUDED_DIRS or n == ".git"]
+
+
+def _tree_bytes(root: Path, limit: int) -> int:
+    """Bytes under ``root`` outside the excluded dirs, stopping past ``limit``."""
+    total = 0
+    for path in root.rglob("*"):
+        rel = path.relative_to(root).parts
+        if any(part in DIFF_EXCLUDED_DIRS or part == ".git" for part in rel):
+            continue
+        if path.is_file() and not path.is_symlink():
+            total += path.stat().st_size
+            if total > limit:
+                break
+    return total
+
+
+def _snapshot_git_diff(workspace: Path, steps_dir: Path, step_n: int) -> dict:
+    """``steps/step-N.diff``: the working tree against HEAD, new files included.
+
+    Done on a **throwaway copy of the index** (``GIT_INDEX_FILE``), never the
+    agent's own: `git add -N` there makes untracked files visible to the diff,
+    and the agent's staged changes — which a reset of the real index would
+    silently drop between two of its steps — are never touched. Bytes in, bytes
+    out: a ``--binary`` patch decoded as text with replacement characters would
+    no longer apply.
+    """
+    git_dir = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "--absolute-git-dir"],
+        capture_output=True,
+        text=True,
+    )
+    if git_dir.returncode != 0:
+        return {"step": step_n, "kind": "error", "error": git_dir.stderr[-200:]}
+    # The commit the diff is taken against. Recorded because HEAD moves when the
+    # agent commits, and the worker can only rebuild this step's tree — to grade
+    # it where the runner could not (SWE-bench Pro needs docker) — from the
+    # exact base the diff was cut from. The commit stays in the archived clone.
+    head = subprocess.run(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    base = head.stdout.strip() if head.returncode == 0 else ""
+    real_index = Path(git_dir.stdout.strip()) / "index"
+    with tempfile.TemporaryDirectory() as scratch:
+        index = Path(scratch) / "index"
+        if real_index.is_file():
+            # copy2, not copyfile: the index's mtime is how git spots a "racy"
+            # entry — a file edited in the same second the index was written,
+            # whose cached stat cannot prove it unchanged. A copy stamped *now*
+            # makes every such entry look safely older than the index, so git
+            # trusts the stale stat and a same-size edit vanishes from the
+            # diff (the step looks like it changed nothing).
+            shutil.copy2(real_index, index)
+        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        subprocess.run(
+            ["git", "-C", str(workspace), "add", "-N", "."],
+            capture_output=True,
+            env=env,
+        )
+        diff = subprocess.run(
+            ["git", "-C", str(workspace), "diff", "--binary", "HEAD"],
+            capture_output=True,
+            env=env,
+        )
+    if diff.returncode != 0:
+        return {
+            "step": step_n,
+            "kind": "error",
+            "error": diff.stderr.decode(errors="replace")[-200:],
+        }
+    dest = steps_dir / f"step-{step_n}.diff"
+    dest.write_bytes(diff.stdout)
+    meta = {"step": step_n, "kind": "diff", "path": dest.name}
+    if base:
+        meta["base"] = base
+    return meta
+
+
+def snapshot_step(
+    workspace: Path, steps_dir: Path, step_n: int, *, git_workspace: bool | None = None
+) -> dict:
+    """Record the workspace as it stood when step ``step_n`` ended (ADR-0076).
+
+    The per-step reward grades these after the run, in the worker, with the
+    case's own checks — the agent never sees them, so measuring cannot change
+    what is measured. Two forms:
+
+    * ``snapshot`` — a copy of the tree at ``steps/step-N.snapshot/`` for a
+      build-from-scratch workspace (no ``.git``), small enough to copy.
+    * ``diff`` — ``steps/step-N.diff`` against the repository's HEAD for a
+      cloned repository (SWE-bench, a target), where copying the clone every
+      step would cost more than the run. Replayable onto the base commit.
+
+    Never raises: a missing snapshot is a gap in the reward curve, recorded as
+    such, not a reason to stop a run that is working.
+    """
+    if not workspace.is_dir():
+        return {"step": step_n, "kind": "missing"}
+    is_git = (workspace / ".git").exists() if git_workspace is None else git_workspace
+    try:
+        if not is_git and _tree_bytes(workspace, SNAPSHOT_MAX_BYTES) <= (
+            SNAPSHOT_MAX_BYTES
+        ):
+            dest = steps_dir / f"step-{step_n}.snapshot"
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(
+                workspace,
+                dest,
+                symlinks=True,
+                ignore_dangling_symlinks=True,
+                ignore=_snapshot_ignore,
+            )
+            return {"step": step_n, "kind": "snapshot", "path": dest.name}
+        if is_git:
+            return _snapshot_git_diff(workspace, steps_dir, step_n)
+        return {"step": step_n, "kind": "too_large"}
+    except Exception as exc:  # a snapshot must never stop the run
+        return {"step": step_n, "kind": "error", "error": repr(exc)[:200]}
+
+
+def kept_steps_start(args: argparse.Namespace, max_steps: int, steps_dir: Path) -> int:
+    """The step the loop starts at: 1, or where a continuing retry picks up.
+
+    A continuing retry (``--from-step N``, ADR-0083) is honoured only when steps
+    1..N-1 are all on record; otherwise it starts at 1, loudly, rather than
+    filing a run whose early steps cannot be accounted for.
+    """
+    wanted = int(getattr(args, "from_step", 1) or 1)
+    if wanted <= 1:
+        return 1
+    if wanted > max_steps:
+        sys.exit(f"❌ --from-step {wanted} is past the last step ({max_steps}).")
+    missing = [
+        n for n in range(1, wanted) if not (steps_dir / f"step-{n}.meta.json").is_file()
+    ]
+    if missing:
+        print(
+            f"  ⚠️  --from-step {wanted}: no record of step(s) "
+            f"{', '.join(map(str, missing))} — running every step instead."
+        )
+        return 1
+    return wanted
+
+
+def kept_steps_record(steps_dir: Path, first_step: int) -> tuple[float, list[str]]:
+    """The seconds and prompt kinds of the steps a continuing retry keeps."""
+    seconds = 0.0
+    kinds: list[str] = []
+    for n in range(1, first_step):
+        try:
+            meta = json.loads((steps_dir / f"step-{n}.meta.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        value = meta.get("seconds")
+        if isinstance(value, int | float):
+            seconds += float(value)
+        kinds.append(str(meta.get("prompt_kind") or "case"))
+    return seconds, kinds
+
+
+def write_step_meta(steps_dir: Path, meta: dict) -> None:
+    """Write ``steps/step-N.meta.json``: the step's snapshot, clock and stop.
+
+    The step's own cost is *not* computed here: claude records it in the step's
+    ``result`` event and the worker reads it from there
+    (``step_reward.claude_step_cost``); opencode sessions are per step and
+    priced from its database. What only the runner knows is the step clock,
+    which snapshot form it took, and the SWE lane's live verdict.
+    """
+    path = steps_dir / f"step-{meta['step']}.meta.json"
+    try:
+        path.write_text(json.dumps(meta, indent=2, sort_keys=True))
+    except OSError as exc:
+        print(f"  ⚠️  could not write {path.name}: {exc!r}")
 
 
 def swe_step_evaluation(workspace: Path, spec: dict) -> dict | None:
@@ -1022,6 +1483,17 @@ def write_metadata(
         "prompt_variant": prompt_short,
         "planner_model": args.planner_model,
         "executor_model": args.executor_model,
+        # Requested reasoning effort (ADR-0081); "" = the CLI's own default.
+        "executor_effort": getattr(args, "executor_effort", "") or "",
+        # The CLI that drove the run, as it reported itself, and the isolation
+        # its commands ran under (ADR-0094): "workspace-write"/"seatbelt" for
+        # the CLI's own sandbox on the host, "container" when the per-run
+        # runner container is the sandbox.
+        "harness_cli_version": harness_cli_version(run.get("harness", "")),
+        "harness_sandbox": harness_sandbox(run.get("harness", "")),
+        # How the run is paid for: a subscription's quota has no per-token
+        # price, so its cost is recorded as unknown, never as 0.
+        "billing_mode": run_billing_mode(run.get("harness", "")),
         "score_mode": args.score_mode,
         "max_steps": args.max_steps,
         # Exclusions are applied to the native views BEFORE metadata is written,
@@ -1051,6 +1523,11 @@ def write_metadata(
         # Friendly adopted-governance version at run time (leaderboard axis).
         "template_ref": read_template_ref(REPO_ROOT),
         "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        # The served window each self-hosted model had at launch and the limit
+        # opencode was told (ADR-0063). Empty when nothing was detected.
+        "context_windows": [
+            w.as_dict() for w in detected_context_windows(run_models(args))
+        ],
     }
     # Add the hashable trial condition manifest (condition_hash, harness
     # fingerprint, model condition, prompt/case hashes). Best-effort: if
@@ -1073,8 +1550,11 @@ def write_metadata(
             list(getattr(args, "extra_skill", []) or [])
         ),
         skills_extra_hash_algo=STAGED_SKILL_HASH_ALGO,
-        gateway_overlay_hash=apply_gateway_overlay(direct_models(args)),
+        gateway_overlay_hash=apply_gateway_overlay(
+            direct_models(args), run_models(args)
+        ),
         skills_invoke=tuple(meta["skills_invoke"]),
+        executor_effort=meta["executor_effort"],
     )
     path = out_dir / "metadata.json"
     path.write_text(json.dumps(meta, indent=2))
@@ -1125,6 +1605,42 @@ def validate_workspace(
             f"   Pass RESUME=1 to continue from the existing state, or remove it:\n"
             f"     rm -rf workspace/{run_id}/"
         )
+
+
+def resumed_effort(out_dir: Path, requested: str, *, resume: bool) -> str:
+    """The reasoning effort a run continues at (ADR-0081).
+
+    Effort is not in runs.yaml or the case spec, so the model-style fallback
+    does not reach it: ``RESUME=1`` without ``EXECUTOR_EFFORT`` would run the
+    rest of an explicit-effort run at the CLI default and rewrite
+    ``metadata.json`` as the default arm. On a resume, the ``metadata.json``
+    the first attempt wrote is the record of what already ran. An unset flag
+    takes the recorded level. A different level is refused, because part of
+    the run already ran at the recorded one. Without a readable record there
+    is nothing to restore, and the flag stands.
+    """
+    if not resume:
+        return requested
+    try:
+        recorded_meta = json.loads((out_dir / "metadata.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return requested
+    if not isinstance(recorded_meta, dict):
+        return requested
+    # A record from before effort existed ran at the CLI default.
+    recorded = str(recorded_meta.get("executor_effort") or "")
+    if not requested:
+        if recorded:
+            print(f"  Resuming at the recorded effort: {recorded}")
+        return recorded
+    if requested != recorded:
+        ran_at = f"effort '{recorded}'" if recorded else "the CLI default effort"
+        sys.exit(
+            f"Run {out_dir.name} ran at {ran_at}; resuming it at '{requested}' "
+            "would file one run under two conditions. Drop EXECUTOR_EFFORT to "
+            "resume at the recorded level, or start a new run."
+        )
+    return requested
 
 
 def resolve_or_synthesize_run(
@@ -1190,6 +1706,37 @@ def finalize_workspace(out_dir: Path, workspace: Path, run_id: str) -> int:
     return diff_lines
 
 
+# Directories an agent creates by installing or running things, not by writing
+# code. They stay in the archive; they are kept out of diff.patch, which the
+# judge and the auditor read as "the agent's code".
+DIFF_EXCLUDED_DIRS = frozenset(
+    {
+        "venv",
+        ".venv",
+        "env",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        "site-packages",
+    }
+)
+
+
+def _diffable_copy(dest: Path, into: Path) -> Path:
+    """A copy of ``dest`` without :data:`DIFF_EXCLUDED_DIRS`, for diffing."""
+    shutil.copytree(
+        dest,
+        into,
+        symlinks=True,
+        ignore_dangling_symlinks=True,
+        ignore=lambda _dir, names: [n for n in names if n in DIFF_EXCLUDED_DIRS],
+    )
+    return into
+
+
 def write_diff_patch(out_dir: Path, dest: Path) -> int:
     """Write ``diff.patch`` for an archived workspace and return its line count.
 
@@ -1238,10 +1785,16 @@ def write_diff_patch(out_dir: Path, dest: Path) -> int:
         # therefore shipped an empty diff.patch — and `bench_audit` gates its
         # "Código producido" section on that file being non-empty, so the audit
         # LLM judged runs it had never seen the code of.
-        with tempfile.TemporaryDirectory() as empty:
+        with (
+            tempfile.TemporaryDirectory() as empty,
+            tempfile.TemporaryDirectory() as scratch,
+        ):
+            code = _diffable_copy(dest, Path(scratch) / dest.name)
             result = _run_git(
-                ["git", "diff", "--no-index", empty, str(dest)], cwd=REPO_ROOT
+                ["git", "diff", "--no-index", empty, str(code)], cwd=REPO_ROOT
             )
+        # The copy's path appears in the patch headers; name the archive instead.
+        result.stdout = result.stdout.replace(str(code), str(dest))
     diff_path.write_text(result.stdout)
     diff_lines = result.stdout.count("\n")
     print(f"  diff.patch: {diff_lines} lines")
@@ -1350,7 +1903,7 @@ def _provision_git_target(
     swe.clone_checkout(workspace, repo_url, commit)
 
     for command in [str(item) for item in target.get("setup", []) if str(item).strip()]:
-        rendered = command.format(workspace=str(workspace))
+        rendered = render_command(command, str(workspace), workspace.name)
         print(f"  setup: {rendered}")
         # Shell is intentional and is the contract: setup entries are
         # operator-authored shell lines (`uv sync && make build`), exactly like
@@ -1399,6 +1952,49 @@ def _provision_git_target(
         cwd=REPO_ROOT,
     )
     print(f"  ✓ Target {target_id} provisioned at {commit[:10]}.")
+
+
+def report_deliverable(spec: dict | None) -> bool:
+    """Whether the case is measured on one handed-in report (ADR-0087)."""
+    return str((spec or {}).get("deliverable") or "").strip().lower() == "report"
+
+
+def seed_workspace(workspace: Path, spec: dict | None) -> int:
+    """Copy a case's starter files into an empty workspace (ADR-0068).
+
+    A bug-fix case needs the broken code to exist before the agent runs; a
+    workspace otherwise starts empty, from a git target, or from a SWE-bench
+    Pro image. ``starter_dir`` is a path under ``benchmarks/`` of this
+    repository — anything else is refused, because the spec is a file the
+    worker writes and a path outside the corpus would copy host files into a
+    run. Symlinks are skipped, not followed. A workspace that already holds
+    files (a resumed or continued run) is left alone. Returns the number of
+    files copied.
+    """
+    starter = str((spec or {}).get("starter_dir") or "").strip()
+    if not starter:
+        return 0
+    root = (REPO_ROOT / "benchmarks").resolve()
+    source = (REPO_ROOT / starter).resolve()
+    if Path(starter).is_absolute() or root not in source.parents:
+        sys.exit(
+            f"❌ starter_dir '{starter}' is not inside benchmarks/; refusing to seed."
+        )
+    if not source.is_dir():
+        sys.exit(f"❌ starter_dir '{starter}' does not exist.")
+    if workspace.exists() and any(workspace.iterdir()):
+        return 0
+    workspace.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for path in sorted(source.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        target = workspace / path.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        copied += 1
+    print(f"  Seeded workspace/{workspace.name}/ with {copied} starter file(s).")
+    return copied
 
 
 def provision_workspace(
@@ -1536,37 +2132,177 @@ def build_opencode_cmd(
 
 
 def _native_model(model: str | None) -> str | None:
-    """Return a native model id for codex/claude, or None to use the CLI default.
+    """Return a native model id for codex/claude/gemini, or None for the CLI default.
 
     The web form's executor models are namespaced by provider (``gateway/…`` for
     LiteLLM, ``lmstudio/…`` for the direct LM Studio route) and do not map to
-    native Codex/Claude model ids, so those are ignored (the CLI uses its
-    configured default). A bare id (no provider prefix) is treated as an
-    explicit native override.
+    native CLI model ids, so those are ignored (the CLI uses its configured
+    default). A bare id (no provider prefix) is treated as an explicit native
+    override. The web preflight refuses a namespaced id for codex/gemini, so a
+    managed run never reaches this with one.
     """
-    if not model or model.startswith(("gateway/", "lmstudio/")):
+    if not model or model.startswith(("gateway/", "lmstudio/", "ollama/")):
         return None
     return model
 
 
-def build_codex_cmd(executor_model: str | None, message: str) -> list[str]:
-    """Assemble a non-interactive OpenAI Codex CLI command (host, native auth).
+# Harnesses whose CLI takes the prompt on stdin (the `-` / empty `-p` forms):
+# a case prompt can be tens of KB, and argv has a limit stdin does not.
+STDIN_PROMPT_HARNESSES = frozenset({"codex", "gemini"})
 
-    --quiet prints only the final output; --full-auto auto-approves edits and
-    commands in the sandbox so a headless run does not block on approvals. The
-    prompt carries the ``workspace/<run_id>/`` path, so cwd stays REPO_ROOT like
-    opencode.
+# Codex's `workspace-write` sandbox needs bubblewrap to create a namespace, and
+# the runner container cannot (verified on harness-lab-runner, codex-cli
+# 0.171.0: "bwrap: No permissions to create a new namespace"; the legacy
+# Landlock path panics with "requires bubblewrap"). Inside the runner the
+# per-run container *is* the sandbox — the same reasoning that lets claude run
+# with --dangerously-skip-permissions there under IS_SANDBOX=1 — so codex is
+# told to rely on it. On the host the CLI's own sandbox stays on.
+CODEX_SANDBOX_HOST = "workspace-write"
+CODEX_SANDBOX_CONTAINER = "container"
+
+
+def in_runner_container() -> bool:
+    """True inside a lab runner container (set by ``build_run_environment``)."""
+    return os.environ.get("HARNESS_LAB_IN_RUNNER") == "1"
+
+
+def harness_sandbox(harness: str, *, in_container: bool | None = None) -> str:
+    """The isolation a harness's commands run under, as recorded in metadata.
+
+    ``workspace-write`` / ``seatbelt``: the CLI's own sandbox (host lane).
+    ``container``: the per-run runner container, the CLI's sandbox off.
+    ``""``: a harness the lab does not configure a sandbox for.
     """
-    cmd = ["codex", "--quiet", "--full-auto"]
+    container = in_runner_container() if in_container is None else in_container
+    if harness == "codex":
+        return CODEX_SANDBOX_CONTAINER if container else CODEX_SANDBOX_HOST
+    if harness == "gemini":
+        return CODEX_SANDBOX_CONTAINER if container else "seatbelt"
+    if harness == "claude" and container:
+        return CODEX_SANDBOX_CONTAINER
+    return ""
+
+
+@functools.cache
+def harness_cli_version(harness: str) -> str:
+    """``<cli> --version`` as the CLI reports it, or ``""`` (never raises).
+
+    Recorded in metadata.json so a run names the instrument that drove it
+    (ADR-0073). opencode's version is already in the harness fingerprint.
+    """
+    if harness not in {"codex", "claude", "gemini"} or not shutil.which(harness):
+        return ""
+    try:
+        result = subprocess.run(
+            [harness, "--version"], capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    lines = (result.stdout or result.stderr or "").strip().splitlines()
+    return lines[-1].strip()[:80] if lines else ""
+
+
+def run_billing_mode(harness: str) -> str:
+    """How this run is paid for (see :func:`native_auth.billing_mode`)."""
+    from harness_lab_app.native_auth import billing_mode
+
+    return billing_mode(harness)
+
+
+def harness_run_env(harness: str) -> dict[str, str] | None:
+    """The process environment for a codex/gemini step, or ``None`` (inherit).
+
+    Points the CLI at the lab's per-provider session directory, scrubs every
+    variable that would switch it to per-token billing, and gives it an empty
+    ``HOME`` so the operator's user-scope skills (``~/.agents/skills``,
+    ``~/.codex/skills``) never reach an arm. In the runner container the
+    executor has already mounted the session at ``/run/harness-auth/<h>`` and
+    set ``CODEX_HOME`` / ``GEMINI_CLI_HOME``; on the host the store is
+    ``HARNESS_LAB_AUTH_DIR``.
+    """
+    from harness_lab_app.native_auth import (
+        NATIVE_SESSION_HARNESSES,
+        ensure_session_dir,
+        harness_env,
+        prune_session_dir,
+    )
+
+    if harness not in NATIVE_SESSION_HARNESSES:
+        return None
+    env = dict(os.environ)
+    if in_runner_container():
+        variable = "CODEX_HOME" if harness == "codex" else "GEMINI_CLI_HOME"
+        root: str | Path = env.get(variable) or f"/run/harness-auth/{harness}"
+        home = Path(env.get("HARNESS_LAB_AGENT_HOME") or "/tmp/agent-home")  # nosec B108
+    else:
+        # The host lane reads the store in place (the CLI refreshes its token
+        # there), so whatever a previous run left beside the credential is
+        # removed first: only the allow-listed files may reach this run.
+        root = ensure_session_dir(harness)
+        prune_session_dir(harness)
+        # A fresh, empty HOME per step: nothing one run leaves in it reaches
+        # the next run or another arm.
+        home = Path(tempfile.mkdtemp(prefix=f"harness-lab-{harness}-home-"))
+    home.mkdir(parents=True, exist_ok=True)
+    return harness_env(harness, env, session_root=root, home=home)
+
+
+def build_codex_cmd(
+    executor_model: str | None, *, in_container: bool | None = None
+) -> list[str]:
+    """Assemble ``codex exec`` for a headless run on the ChatGPT login.
+
+    Verified against codex-cli 0.171.0 (``codex exec --help``): the old
+    ``codex --quiet --full-auto`` form is refused (``unexpected argument
+    '--full-auto'``). ``exec`` never asks for approval (``approval_policy =
+    never``), ``--json`` streams the JSONL events the lab archives and
+    translates (:mod:`harness_lab_app.harness_events`), and the trailing ``-``
+    reads the prompt from stdin. ``--skip-git-repo-check``: a workspace is not
+    always a git repository, and an empty bare workspace never is.
+    """
+    container = in_runner_container() if in_container is None else in_container
+    cmd = ["codex", "exec", "--json", "--skip-git-repo-check"]
+    if container:
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        cmd += ["--sandbox", CODEX_SANDBOX_HOST]
     native = _native_model(executor_model)
     if native:
         cmd += ["-m", native]
-    cmd.append(message)
+    cmd.append("-")
+    return cmd
+
+
+def build_gemini_cmd(
+    executor_model: str | None, *, in_container: bool | None = None
+) -> list[str]:
+    """Assemble a headless Gemini CLI command (Sign in with Google).
+
+    Verified against @google/gemini-cli 0.70.0: ``-p`` runs headless and
+    *appends* to stdin, so ``-p ""`` with the prompt on stdin carries any
+    length; ``--output-format stream-json`` emits ``init`` / ``message`` /
+    ``tool_use`` / ``tool_result`` / ``error`` / ``result`` events;
+    ``--approval-mode yolo`` auto-approves every tool, which is only allowed
+    inside a sandbox — the macOS Seatbelt profile (``-s``) on the host, the
+    runner container in Docker. Auth and workspace trust come from the
+    environment (:func:`harness_lab_app.native_auth.harness_env`).
+    """
+    container = in_runner_container() if in_container is None else in_container
+    cmd = ["gemini", "--output-format", "stream-json", "--approval-mode", "yolo"]
+    if not container:
+        cmd.append("--sandbox")
+    native = _native_model(executor_model)
+    if native:
+        cmd += ["-m", native]
+    cmd += ["-p", ""]
     return cmd
 
 
 def build_claude_cmd(
-    executor_model: str | None, message: str, add_dirs: Sequence[Path] = ()
+    executor_model: str | None,
+    message: str,
+    add_dirs: Sequence[Path] = (),
+    effort: str = "",
 ) -> list[str]:
     """Assemble a non-interactive Claude Code CLI command (host, native auth).
 
@@ -1580,6 +2316,9 @@ def build_claude_cmd(
     loads ``.claude/skills`` (and agents) from a directory that is not the cwd
     or one of its parents *inside the same repository*. See
     :func:`harness_add_dirs` for when the lab root has to be one.
+
+    ``effort`` becomes ``--effort`` (ADR-0081) only when set: an empty effort is
+    the CLI default, and omitting the flag keeps that command unchanged.
     """
     cmd = [
         "claude",
@@ -1592,8 +2331,14 @@ def build_claude_cmd(
     native = _native_model(executor_model)
     if native:
         cmd += ["--model", native]
+    if effort:
+        cmd += ["--effort", effort]
+    # `--add-dir <directories...>` is variadic: written as two tokens it also
+    # swallows the prompt that follows as one more directory, and the CLI dies
+    # with "Input must be provided ... when using --print" before any model
+    # call. The `=` form binds exactly one value.
     for directory in add_dirs:
-        cmd += ["--add-dir", str(directory)]
+        cmd.append(f"--add-dir={directory}")
     cmd.append(message)
     return cmd
 
@@ -1601,7 +2346,7 @@ def build_claude_cmd(
 def needs_staged_catalog(
     harness: str, agent_cwd: Path | None, lab_root_visible: bool
 ) -> bool:
-    """Whether this run has to hand the CLI a skill catalog of its own (ADR-0062).
+    """Whether this run has to hand the CLI a skill catalog of its own (ADR-0061).
 
     A ``lab_root`` claude run whose agent starts inside the workspace — the
     SWE lane's control-arm hygiene — starts inside a *clone*. Claude Code walks
@@ -1661,12 +2406,25 @@ def build_harness_cmd(
     agent: str | None,
     message: str,
     add_dirs: Sequence[Path] = (),
+    effort: str = "",
 ) -> list[str]:
-    """Dispatch to the per-harness command builder (opencode | codex | claude)."""
+    """Dispatch to the per-harness command builder (opencode | codex | claude | gemini).
+
+    ``effort`` only reaches claude; :func:`main` refuses it for any other
+    harness before a run starts, so it is never silently dropped here.
+
+    codex and gemini read their prompt from stdin (:data:`STDIN_PROMPT_HARNESSES`),
+    so ``message`` is not part of their argv: the caller passes it to
+    :func:`run_opencode` as ``stdin_text``.
+    """
     if harness == "codex":
-        return build_codex_cmd(executor_model, message)
+        return build_codex_cmd(executor_model)
+    if harness == "gemini":
+        return build_gemini_cmd(executor_model)
     if harness == "claude":
-        return build_claude_cmd(executor_model, message, add_dirs=add_dirs)
+        return build_claude_cmd(
+            executor_model, message, add_dirs=add_dirs, effort=effort
+        )
     return build_opencode_cmd(executor_model, agent, message)
 
 
@@ -1772,6 +2530,45 @@ def stamp_event_line(line: str, now_iso: str | None = None) -> str:
     return f'{{"_received_at":"{received}",' + line[1:]
 
 
+def step_clock() -> float:
+    """Monotonic seconds for timing harness steps (a seam for tests)."""
+    return time.monotonic()
+
+
+# How often a codex/gemini step's translated sidecar is rewritten while the
+# step runs (seconds). It is rewritten once more when the step ends.
+_EVENTS_REFRESH_SECONDS = 5.0
+
+
+def raw_events_path(events_path: Path) -> Path:
+    """``step-N.events.jsonl`` → ``step-N.raw.jsonl`` (the untouched CLI stream)."""
+    from harness_lab_app.harness_events import RAW_EVENTS_SUFFIX
+
+    return events_path.with_name(
+        events_path.name.removesuffix(".events.jsonl") + RAW_EVENTS_SUFFIX
+    )
+
+
+def write_normalized_events(harness: str, raw_path: Path, events_path: Path) -> int:
+    """Translate a step's raw codex/gemini stream into the claude-shaped sidecar.
+
+    Every reader the lab has (attribution, trajectory, scoring, progress, the
+    Langfuse exporter) reads ``step-N.events.jsonl`` in claude's shape; the raw
+    stream stays beside it as provenance. Never raises: a translation failure
+    leaves the raw stream and an empty sidecar, which the readers treat as "no
+    events" rather than as a crash.
+    """
+    from harness_lab_app.harness_events import translate
+
+    try:
+        lines = raw_path.read_text(errors="replace").splitlines()
+        translated = translate(harness, lines)
+    except OSError:
+        translated = []
+    events_path.write_text("".join(f"{line}\n" for line in translated))
+    return len(translated)
+
+
 def run_opencode(
     cmd: list[str],
     log_path: Path,
@@ -1779,24 +2576,40 @@ def run_opencode(
     label: str = "opencode",
     cwd: Path | None = None,
     events_path: Path | None = None,
+    stdin_text: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> int:
     """Run the harness CLI, streaming output to terminal and capturing to log_path.
 
     If also_append is given, output is also appended to that file (combined log).
     `label` names the harness in the log header (used by the step counter).
     `cwd` overrides the working directory (default REPO_ROOT). When
-    `events_path` is given (claude stream-json mode), every raw line is teed
-    there and the log receives the human-readable rendering instead.
+    `events_path` is given (a harness with a JSON event stream), every raw line
+    is teed and the log receives the human-readable rendering instead. For
+    claude the tee *is* ``events_path``; for codex/gemini the raw stream goes to
+    ``step-N.raw.jsonl`` and ``events_path`` receives its claude-shaped
+    translation once the step ends (:func:`write_normalized_events`).
+    `stdin_text`, when given, is written to the CLI's stdin and closed (codex
+    and gemini take their prompt there). `env` replaces the process
+    environment (codex/gemini: the provider session, scrubbed of API keys).
     """
     import datetime as _dt
 
+    from harness_lab_app.harness_events import TRANSLATED_HARNESSES, render_event
+
     header = f"# {label} run started {_dt.datetime.utcnow().isoformat()}Z\n"
-    cmd_line = "# cmd: " + " ".join(cmd[:-1]) + " <prompt>\n\n"
+    shown = cmd if stdin_text is not None else cmd[:-1]
+    cmd_line = "# cmd: " + " ".join(shown) + " <prompt>\n\n"
+
+    translated = label in TRANSLATED_HARNESSES and events_path is not None
+    tee_path = (
+        raw_events_path(events_path) if translated and events_path else events_path
+    )
 
     append_fh = None
     if also_append is not None:
         append_fh = also_append.open("a")
-    events_fh = events_path.open("w") if events_path is not None else None
+    events_fh = tee_path.open("w") if tee_path is not None else None
 
     with log_path.open("w") as log:
         log.write(header + cmd_line)
@@ -1808,17 +2621,46 @@ def run_opencode(
         proc = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd is not None else REPO_ROOT,
+            stdin=subprocess.PIPE if stdin_text is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=env,
         )
+        if stdin_text is not None:
+            assert proc.stdin is not None
+            try:
+                proc.stdin.write(stdin_text)
+            except BrokenPipeError:
+                pass  # the CLI died before reading; its exit code says why
+            finally:
+                with contextlib.suppress(BrokenPipeError):
+                    proc.stdin.close()
         assert proc.stdout is not None
+        last_refresh = 0.0
         for line in proc.stdout:
             if events_fh is not None:
                 events_fh.write(stamp_event_line(line))
                 events_fh.flush()
-                rendered = render_claude_event(line)
+                # Keep the translated sidecar current while the step runs, so
+                # live progress reads it and a step the watchdog kills still
+                # leaves its usage and attribution behind. Throttled: each
+                # refresh re-translates the step so far.
+                if (
+                    translated
+                    and tee_path is not None
+                    and events_path is not None
+                    and time.monotonic() - last_refresh >= _EVENTS_REFRESH_SECONDS
+                    and ('"item.completed"' in line or '"tool_result"' in line)
+                ):
+                    write_normalized_events(label, tee_path, events_path)
+                    last_refresh = time.monotonic()
+                rendered = (
+                    render_event(label, line)
+                    if translated
+                    else render_claude_event(line)
+                )
                 if rendered is None:
                     continue
                 line = rendered
@@ -1833,6 +2675,8 @@ def run_opencode(
         events_fh.close()
     if append_fh:
         append_fh.close()
+    if translated and tee_path is not None and events_path is not None:
+        write_normalized_events(label, tee_path, events_path)
 
     return proc.returncode
 
@@ -1892,12 +2736,17 @@ def parse_log_usage(log_path: Path) -> dict | None:
     if files_touched:
         result["files_touched"] = sorted(files_touched)
 
-    # Detected model
-    m = re.search(
-        r"(?:Using model|model)[:\s]+([a-zA-Z0-9/._:\-]+)", text, re.IGNORECASE
-    )
-    if m:
-        result["detected_model"] = m.group(1)
+    # Detected model. opencode's --print-logs names it exactly on every stream
+    # line; the loose fallback once read "tracking" out of ordinary prose.
+    served = re.search(r"providerID=(\S+) modelID=(\S+)", text)
+    if served:
+        result["detected_model"] = f"{served.group(1)}/{served.group(2)}"
+    else:
+        m = re.search(
+            r"(?:Using model|model)[:\s]+([a-zA-Z0-9/._:\-]+)", text, re.IGNORECASE
+        )
+        if m:
+            result["detected_model"] = m.group(1)
 
     # Detected session/provider
     s = re.search(r"session[_\-]?id[:\s]+([a-zA-Z0-9\-]+)", text, re.IGNORECASE)
@@ -1940,69 +2789,156 @@ def pull_usage_litellm(run_id: str) -> dict | None:
     return None
 
 
-def pull_usage_opencode_db(run_id: str) -> dict | None:
-    """Query the local opencode SQLite DB for token usage summed across all sessions for this run.
+# Every session opencode opens is announced in its own --print-logs output as
+# `message=created id=ses_… … parentID=…` — the step's main session and every
+# sub-agent session it spawns. That line is the only join key that survives
+# both runner layouts: the session title is invented by the model (opencode's
+# `title` agent), and the session directory is `/app` for a full-harness run
+# but `/app/workspace/<run>` for a masked bare one (ADR-0049).
+_OPENCODE_SESSION_RE = re.compile(r"message=created id=(ses_[A-Za-z0-9]+)")
 
-    Matches sessions where the title contains run_id and directory is the repo root.
-    time_minutes = sum of per-session durations (excludes user breaks between steps).
-    The gateway always reports cost=0.0, so we leave cost_usd null.
+
+def opencode_session_ids(log_paths: Sequence[Path]) -> list[str]:
+    """Every opencode session id the run's own logs announce, in order, once."""
+    seen: dict[str, None] = {}
+    for path in log_paths:
+        if not path.exists():
+            continue
+        for match in _OPENCODE_SESSION_RE.finditer(path.read_text(errors="replace")):
+            seen.setdefault(match.group(1), None)
+    return list(seen)
+
+
+def opencode_db_path() -> Path:
+    """Where opencode keeps its sessions: ``$XDG_DATA_HOME`` or ``~/.local/share``."""
+    root = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(root) / "opencode" / "opencode.db"
+
+
+def _opencode_token_totals(cur: Any, ids: Sequence[str]) -> tuple[list[str], tuple]:
+    """The run's sessions (its own plus their sub-agents) and their token sums."""
+    marks = ",".join("?" for _ in ids)
+    cur.execute(
+        f"SELECT id FROM session WHERE id IN ({marks}) "  # nosec B608 - placeholders only
+        f"OR parent_id IN ({marks})",
+        (*ids, *ids),
+    )
+    every = sorted({row[0] for row in cur.fetchall()})
+    if not every:
+        return [], ()
+    marks = ",".join("?" for _ in every)
+    cur.execute(
+        f"""
+        SELECT
+            COALESCE(SUM(tokens_input), 0),
+            COALESCE(SUM(tokens_output), 0),
+            COALESCE(SUM(tokens_reasoning), 0),
+            COALESCE(SUM(tokens_cache_read), 0),
+            COALESCE(SUM(tokens_cache_write), 0),
+            COALESCE(SUM(cost), 0)
+        FROM session WHERE id IN ({marks})
+        """,  # nosec B608 - placeholders only
+        every,
+    )
+    return every, cur.fetchone()
+
+
+def _opencode_work_counts(cur: Any, every: Sequence[str]) -> tuple[int, int, int]:
+    """``(turns, model_ms, tool_calls)`` for the given sessions.
+
+    One assistant message is one model turn, and its ``time`` brackets the
+    request: the sum is how long the model itself was working, which the step
+    clock (harness start-up, tool execution) does not isolate. Zeros when the
+    schema or SQLite build cannot answer — these are a bonus over the token
+    totals, never a reason to lose them.
     """
     import sqlite3
 
-    db_path = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
-    if not db_path.exists():
+    marks = ",".join("?" for _ in every)
+    try:
+        cur.execute(
+            f"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(
+                    json_extract(data, '$.time.completed')
+                    - json_extract(data, '$.time.created')
+                ), 0)
+            FROM message
+            WHERE session_id IN ({marks})
+              AND json_extract(data, '$.role') = 'assistant'
+            """,  # nosec B608 - placeholders only
+            list(every),
+        )
+        turns, model_ms = cur.fetchone()
+        cur.execute(
+            f"SELECT COUNT(*) FROM part WHERE session_id IN ({marks}) "  # nosec B608
+            "AND json_extract(data, '$.type') = 'tool'",
+            list(every),
+        )
+        (tool_calls,) = cur.fetchone()
+    except sqlite3.Error:
+        return 0, 0, 0
+    return int(turns or 0), int(model_ms or 0), int(tool_calls or 0)
+
+
+def pull_usage_opencode_db(
+    session_ids: Sequence[str], db_path: Path | None = None
+) -> dict | None:
+    """Token and work totals for exactly the sessions this run opened.
+
+    Joined by session id — never by title or directory, which silently matched
+    nothing for every bare arm and for any run whose model titled its session
+    without the run id. Sub-agent sessions are included twice over: their
+    ``created`` line is in the log, and ``parent_id`` catches one that was not.
+
+    ``output_tokens`` is everything the model generated, reasoning included:
+    opencode counts reasoning separately, and a model that thinks for 40k tokens
+    has generated them whether or not they reached the answer. The reasoning
+    share is kept beside it.
+
+    Never raises: usage is evidence about a run, not a reason to fail it.
+    """
+    import sqlite3
+
+    ids = list(dict.fromkeys(session_ids))
+    path = db_path or opencode_db_path()
+    if not ids or not path.exists():
         return None
     try:
-        con = sqlite3.connect(str(db_path))
-        cur = con.cursor()
-        cur.execute(
-            """
-            SELECT
-                COUNT(*) as session_count,
-                SUM(tokens_input) as total_input,
-                SUM(tokens_output) as total_output,
-                SUM(tokens_cache_read) as total_cache_read,
-                SUM(tokens_cache_write) as total_cache_write,
-                SUM(tokens_reasoning) as total_reasoning,
-                SUM(time_updated - time_created) as total_active_ms
-            FROM session
-            WHERE title LIKE ?
-              AND directory = ?
-              AND (tokens_input > 0 OR tokens_output > 0)
-            """,
-            (f"%{run_id}%", str(REPO_ROOT)),
-        )
-        row = cur.fetchone()
-        con.close()
-        if not row or row[0] == 0:
-            return None
-        (
-            session_count,
-            total_input,
-            total_output,
-            cache_read,
-            cache_write,
-            reasoning,
-            total_active_ms,
-        ) = row
-        result: dict = {
-            "input_tokens": int(total_input or 0) or None,
-            "output_tokens": int(total_output or 0) or None,
-        }
-        if reasoning:
-            result["tokens_reasoning"] = int(reasoning)
-        if cache_read:
-            result["tokens_cache_read"] = int(cache_read)
-        if cache_write:
-            result["tokens_cache_write"] = int(cache_write)
-        if session_count and session_count > 1:
-            result["turns"] = int(session_count)
-        if total_active_ms and total_active_ms > 0:
-            # Sum of per-session durations = actual LLM execution time (excludes user breaks between steps)
-            result["time_minutes"] = round(total_active_ms / 60000.0, 1)
-        return result
-    except Exception:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
         return None
+    try:
+        cur = con.cursor()
+        every, totals = _opencode_token_totals(cur, ids)
+        if not every:
+            return None
+        turns, model_ms, tool_calls = _opencode_work_counts(cur, every)
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    tokens_in, tokens_out, reasoning, cache_read, cache_write, cost = totals
+    result: dict = {
+        "sessions": len(every),
+        "input_tokens": int(tokens_in),
+        "output_tokens": int(tokens_out) + int(reasoning),
+        "reasoning_tokens": int(reasoning),
+        "cache_read_tokens": int(cache_read),
+        "cache_creation_tokens": int(cache_write),
+        "turns": turns or None,
+        "tool_calls": tool_calls or None,
+        "model_minutes": round(model_ms / 60000.0, 2) if model_ms else None,
+        "usage_source": "opencode_db",
+    }
+    # opencode prices a model from its catalog; a direct-host model has no
+    # price there and reports 0. A positive cost is kept; a zero is left to
+    # `self_hosted_cost`, which knows whether that zero is a fact about the
+    # model or a gap in opencode's catalog.
+    if cost:
+        result["cost_usd"] = round(float(cost), 6)
+    return result
 
 
 def pull_usage_langfuse(session_id: str) -> dict | None:
@@ -2038,6 +2974,23 @@ def pull_usage_langfuse(session_id: str) -> dict | None:
     return None
 
 
+def merge_usage(*sources: dict | None) -> dict:
+    """Merge usage dicts, lowest priority first; a later source wins per field.
+
+    An empty value (None or "") never overwrites a populated one: a remote
+    source that knows the session but has no cost for it must not erase the
+    cost a lower-priority source did record.
+    """
+    merged: dict = {}
+    for source in sources:
+        for key, value in (source or {}).items():
+            if value is None or value == "":
+                merged.setdefault(key, value)
+            else:
+                merged[key] = value
+    return merged
+
+
 def collect_claude_usage(out_dir: Path) -> dict:
     """Aggregate usage from claude stream-json event files (never raises).
 
@@ -2054,11 +3007,20 @@ def collect_claude_usage(out_dir: Path) -> dict:
 
     input_tokens = output_tokens = 0
     cache_read_tokens = cache_creation_tokens = 0
-    cost = 0.0
+    # `total_cost_usd` is the *session's* running total, not the response's:
+    # a session that answers again — a background task finishing after the
+    # agent's final message — emits a second `result` carrying the first's
+    # cost plus its own. So cost is the last value per session, summed across
+    # sessions (one per step). `usage`, `num_turns` and `duration_ms` are
+    # per-response and are summed. eda-ml-iris K-002 reported $0.83 for $0.49.
+    session_cost: dict[str, float] = {}
     turns = tool_calls = 0
     duration_ms = 0
+    reasoning_tokens = 0
     files_modified: set[str] = set()
     detected_model: str | None = None
+    billing_modes: set[str] = set()
+    model_output: dict[str, int] = {}
     saw_result = False
     for path in events_files:
         for raw in path.read_text(errors="replace").splitlines():
@@ -2098,12 +3060,36 @@ def collect_claude_usage(out_dir: Path) -> dict:
                 # bare one while costing 71% more.
                 cache_read_tokens += usage.get("cache_read_input_tokens") or 0
                 cache_creation_tokens += usage.get("cache_creation_input_tokens") or 0
+                reasoning_tokens += usage.get("reasoning_output_tokens") or 0
+                if event.get("billing_mode"):
+                    billing_modes.add(str(event["billing_mode"]))
+                for name, per_model in (event.get("modelUsage") or {}).items():
+                    if isinstance(per_model, dict):
+                        model_output[str(name)] = model_output.get(str(name), 0) + int(
+                            per_model.get("outputTokens") or 0
+                        )
                 if isinstance(event.get("total_cost_usd"), (int, float)):
-                    cost += event["total_cost_usd"]
+                    session = f"{path.name}:{event.get('session_id') or ''}"
+                    session_cost[session] = float(event["total_cost_usd"])
                 turns += event.get("num_turns") or 0
                 duration_ms += event.get("duration_ms") or 0
     if not saw_result and tool_calls == 0:
         return {}
+    if billing_modes:
+        # codex/gemini events (translated by harness_events) carry how the run
+        # was paid for. A subscription has no per-token price: the cost is
+        # *unknown*, never 0, and it must not be estimated from a price list.
+        collected_mode = (
+            sorted(billing_modes)[0] if len(billing_modes) == 1 else "mixed"
+        )
+    else:
+        collected_mode = ""
+    # The model that answered, when the stream names several (gemini's `auto`
+    # routes between Pro and Flash): the one with the most output, the same
+    # rule llm_transport applies to claude's `modelUsage` (ADR-0073).
+    if model_output and (not detected_model or detected_model == "auto"):
+        detected_model = max(model_output, key=lambda name: model_output[name])
+    cost = sum(session_cost.values())
     collected: dict = {
         "turns": turns or None,
         "tool_calls": tool_calls or None,
@@ -2115,7 +3101,11 @@ def collect_claude_usage(out_dir: Path) -> dict:
         "time_minutes": round(duration_ms / 60000, 2) if duration_ms else None,
         "files_modified": sorted(files_modified),
         "detected_model": detected_model,
+        "reasoning_tokens": reasoning_tokens or None,
+        "billing_mode": collected_mode or None,
     }
+    if collected_mode == "subscription":
+        collected["cost_source"] = "subscription_quota"
     return {k: v for k, v in collected.items() if v not in (None, [])}
 
 
@@ -2144,6 +3134,104 @@ def write_usage_json(out_dir: Path, usage: dict | None) -> Path:
     path = out_dir / "usage.json"
     path.write_text(json.dumps(skeleton, indent=2))
     return path
+
+
+# Model ids served by a machine the operator owns. Direct lanes carry the
+# backend as an opencode provider prefix; gateway aliases name it as the alias
+# prefix (``gateway/lmstudio-qwen3.6-35b``), the same convention the gateway
+# catalog groups by.
+_SELF_HOSTED_DIRECT = ("lmstudio/", "ollama/")
+_SELF_HOSTED_ALIASES = ("lmstudio-", "ollama-")
+
+
+def is_self_hosted_model(model: str | None) -> bool:
+    """True when ``model`` runs on a local host — no per-token price exists."""
+    if not model:
+        return False
+    if model.startswith(_SELF_HOSTED_DIRECT):
+        return True
+    alias = model[len("gateway/") :] if model.startswith("gateway/") else model
+    return alias.startswith(_SELF_HOSTED_ALIASES)
+
+
+def self_hosted_cost(harness: str, models: Sequence[str]) -> float | None:
+    """``0.0`` when every model this run addressed is self-hosted, else ``None``.
+
+    Only opencode actually talks to the addressed model: claude and codex drop
+    a ``lmstudio/…`` id and fall back to their own cloud default
+    (:func:`_native_model`), so for them a local id says nothing about spend.
+    """
+    if harness != "opencode" or not models:
+        return None
+    return 0.0 if all(is_self_hosted_model(m) for m in models) else None
+
+
+def assemble_usage(
+    out_dir: Path,
+    opencode_log: Path,
+    *,
+    run_id: str,
+    session_id: str,
+    harness: str,
+    models: Sequence[str],
+    harness_seconds: float,
+    completed_steps: int,
+    stop_reason: str | None,
+    prompt_kinds: Sequence[str],
+) -> dict:
+    """Every usage source merged into the one dict ``usage.json`` records.
+
+    One function for the managed and the interactive path: the two used to
+    merge in different orders, so the same run could record different numbers
+    depending on how it was launched.
+
+    Two figures are the lab's own instrument and override every source,
+    because a comparison is only fair when each arm is measured the same way:
+
+    * ``time_minutes`` — the step clock, the wall time of every harness
+      invocation summed. The same clock for opencode, claude and codex, for a
+      masked bare arm and a full-harness one. Provisioning, scoring and
+      archiving stay outside it.
+    * ``cost_usd`` — ``0.0`` when every addressed model is self-hosted
+      (:func:`self_hosted_cost`): measured as free, not unknown.
+    """
+    db_usage = None
+    if harness == "opencode":
+        logs = [opencode_log, *sorted((out_dir / "steps").glob("step-*.log"))]
+        db_usage = pull_usage_opencode_db(opencode_session_ids(logs))
+    remote_usage = pull_usage_litellm(run_id) or pull_usage_langfuse(session_id)
+    # Lowest priority first: claude stream-json events (claude runs) < log
+    # estimates < opencode DB < remote API.
+    usage = merge_usage(
+        collect_claude_usage(out_dir),
+        parse_log_usage(opencode_log),
+        db_usage,
+        remote_usage,
+    )
+    if completed_steps:
+        usage["steps"] = completed_steps
+        usage["time_minutes"] = round(harness_seconds / 60.0, 2)
+        usage["time_source"] = "step_clock"
+    free = self_hosted_cost(harness, models)
+    if free is not None and usage.get("cost_usd") in (None, "", 0, 0.0):
+        usage["cost_usd"] = free
+        usage["cost_source"] = "self_hosted"
+    if harness in STDIN_PROMPT_HARNESSES:
+        # codex/gemini spend a subscription plan's quota, never a per-token
+        # bill: the cost is unknown, recorded as such, and never filled with 0
+        # or with a figure some other source attributed to this run id.
+        usage["cost_usd"] = None
+        usage["billing_mode"] = "subscription"
+        usage["cost_source"] = "subscription_quota"
+    if stop_reason:
+        usage["stop_reason"] = stop_reason
+    if prompt_kinds:
+        # One entry per executed step, naming the template that wrote its
+        # prompt. The SWE-bench leak was invisible in every stored number and
+        # turned up only by opening a step prompt by hand; this makes the class
+        # of defect readable straight off the artifacts.
+        usage["prompt_kinds"] = list(prompt_kinds)
+    return usage
 
 
 # ---------------------------------------------------------------------------
@@ -2346,7 +3434,9 @@ def close_run(
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _ACTIVE_RUN
     args = parse_args(argv)
+    _ACTIVE_RUN = str(args.run or "")
     _load_env()
     # Headless by default for everything this process spawns, in both lanes.
     # The docker image and the run container already set these, but a host-mode
@@ -2360,7 +3450,7 @@ def main(argv: list[str] | None = None) -> int:
     # Export the routing overlay before anything builds a harness command, so a
     # model enabled from the web — or addressed directly at LM Studio —
     # resolves in both the docker and host lanes.
-    apply_gateway_overlay(direct_models(args))
+    apply_gateway_overlay(direct_models(args), run_models(args))
 
     out_dir = DATA_DIR / args.run
     case_spec = _load_case_spec(out_dir)
@@ -2471,7 +3561,7 @@ def main(argv: list[str] | None = None) -> int:
     args.planner_model = planner_model
     # A resumed run learns its models from stored metadata, after the overlay
     # was first written; re-apply so a direct LM Studio executor is routable.
-    apply_gateway_overlay(direct_models(args))
+    apply_gateway_overlay(direct_models(args), run_models(args))
     # opencode resolves its project config from the cwd, so a run launched from
     # the workspace would lose the lab's provider block — its gateway routing —
     # along with the governance it is meant to lose. Routing is not part of the
@@ -2496,6 +3586,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     run["harness"] = args.harness or declared or DEFAULT_HARNESS
     args.harness = run["harness"]
+    # A resume continues at the effort it already ran at, like the models
+    # above; it is restored before the harness check so that check sees it.
+    args.executor_effort = resumed_effort(
+        out_dir, args.executor_effort, resume=args.resume
+    )
+    # Effort is a claude CLI flag (ADR-0081). Any other harness would drop it
+    # while metadata.json and the condition hash still recorded it — a run
+    # filed under a condition it never ran under. Refuse instead.
+    if args.executor_effort and args.harness != "claude":
+        sys.exit(
+            f"--executor-effort is only supported by the claude harness, not "
+            f"'{args.harness}'. Drop the flag or pass --harness claude."
+        )
 
     workspace = WORKSPACE_ROOT / args.run
 
@@ -2539,7 +3642,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    {out_dir.relative_to(REPO_ROOT)}/steps/step-{s}.log{extra}")
         print(f"    workspace/{args.run}/")
         print()
-        preview = build_harness_cmd(args.harness, executor_model, None, "<prompt>")
+        preview = build_harness_cmd(
+            args.harness,
+            executor_model,
+            None,
+            "<prompt>",
+            effort=args.executor_effort,
+        )
         if args.harness != "opencode" or detect_run_subcommand():
             print("  Execution: " + " ".join(preview))
             if args.max_steps > 1:
@@ -2666,6 +3775,10 @@ def main(argv: list[str] | None = None) -> int:
             case_spec,
             _inject if harness_source == "injected" else None,
         )
+    elif case_spec is not None:
+        # A case that starts from files (a broken page to fix) rather than an
+        # empty folder or a cloned repository (ADR-0068).
+        seed_workspace(workspace, case_spec)
 
     # A `native` arm that stages skills has to have them placed in the
     # workspace, or the agent — whose cwd is the clone — never sees them and the
@@ -2697,7 +3810,7 @@ def main(argv: list[str] | None = None) -> int:
         # Pre-existing control-arm hygiene for the SWE lane, unchanged.
         agent_cwd = workspace
     # A cwd inside a clone hides the lab's skill catalog from Claude Code even
-    # under `lab_root`; the CLI has to be handed one of its own (ADR-0062).
+    # under `lab_root`; the CLI has to be handed one of its own (ADR-0061).
     add_dirs: tuple[Path, ...] = ()
     if needs_staged_catalog(args.harness, agent_cwd, lab_root_visible):
         staged_catalog = stage_skill_catalog(out_dir, effective_skills, args.harness)
@@ -2727,6 +3840,7 @@ def main(argv: list[str] | None = None) -> int:
         repo_note=repo_note,
         invoke_skills=args.invoke_skill,
         cwd_note=agent_cwd is not None and not provisions_repo,
+        entry_point=_entry_point(case_spec),
     )
     print(f"  Prompt:      {prompt_path.relative_to(REPO_ROOT)}")
     print(
@@ -2812,18 +3926,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.harness == "opencode":
         has_run_cmd = detect_run_subcommand()
     else:
-        # codex/claude are host CLIs; availability = the binary is on PATH.
+        # codex/claude/gemini are native CLIs; availability = the binary is on PATH.
         has_run_cmd = shutil.which(args.harness) is not None
-    # codex/claude can run against their CLI's default model, so a missing
-    # executor model is only fatal for opencode (gateway-routed).
+    # codex/claude/gemini can run against their CLI's default model, so a
+    # missing executor model is only fatal for opencode (gateway-routed).
     needs_model = args.harness == "opencode"
     max_steps = max(1, args.max_steps)
+    # A case whose deliverable is a report (a review, an audit) is measured on
+    # the report the agent hands in. Every later step would get a generic
+    # "implement one more increment" prompt, and `pr-review-v1-K-001/002` used
+    # theirs to fix the code under review and to rewrite the lab's own grader
+    # (ADR-0087). The case says so; the form's step budget cannot override it.
+    if report_deliverable(case_spec):
+        if max_steps > 1:
+            print(
+                f"  The case's deliverable is a report: running 1 step, not {max_steps}."
+            )
+        max_steps = 1
     steps_dir = out_dir / "steps"
     completed_steps = 0
+    # Wall time of every harness invocation, summed: the run's time figure.
+    harness_seconds = 0.0
     # Which criterion ended the step loop. Recorded because a cost comparison
     # between two arms is only readable against how each of them terminated:
     # an arm that ran out of budget did not spend more, it was cut off.
     stop_reason: str | None = None
+    harness_cause: str | None = None
     # Which template wrote each step's prompt, in order. Recorded in usage.json
     # so a later audit can see from the artifacts alone which framing a run was
     # given — the SWE-bench leak showed up in no stored number and turned up
@@ -2850,7 +3978,21 @@ def main(argv: list[str] | None = None) -> int:
 
         last_swe_eval: dict | None = None
         last_workspace_fp: str | None = None
-        for step_n in range(1, max_steps + 1):
+        first_step = kept_steps_start(args, max_steps, steps_dir)
+        if first_step > 1:
+            kept_seconds, kept_kinds = kept_steps_record(steps_dir, first_step)
+            harness_seconds += kept_seconds
+            completed_steps += first_step - 1
+            prompt_kinds.extend(kept_kinds)
+            # The kept step's state is the baseline the no-progress check
+            # compares the next step against, as it would have been.
+            last_workspace_fp = workspace_fingerprint(workspace)
+            print(
+                f"\n  Continuing at step {first_step}/{max_steps}: steps 1-"
+                f"{first_step - 1} are kept as they ran "
+                f"({kept_seconds / 60:.0f} min)."
+            )
+        for step_n in range(first_step, max_steps + 1):
             if max_steps > 1:
                 if step_n == 1:
                     step_prompt_path = prompt_path
@@ -2877,16 +4019,20 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"  ❌ {error}")
                         stop_reason = "harness_error"
                         break
-                elif step_n - 1 < len(case_step_prompts):
+                elif step_n - 2 < len(case_step_prompts):
                     # The case author wrote this step; neither canned
-                    # continuation prompt (Tetris / SWE-bench) applies. The list
-                    # is 1:1 with steps, and step 1 already used the case prompt.
+                    # continuation prompt (Tetris / SWE-bench) applies. Step 1
+                    # used the case prompt, so `step_prompts[0]` drives step 2 —
+                    # the contract the case form and the drafting prompt state.
+                    # This read `[step_n - 1]` until ADR-0079: the first
+                    # authored step was skipped and the last never ran.
                     step_prompt_path = generate_case_step_prompt(
                         args.run,
                         step_n,
                         steps_dir,
-                        case_step_prompts[step_n - 1],
+                        case_step_prompts[step_n - 2],
                         invoke_skills=args.invoke_skill,
+                        phases_left=len(case_step_prompts) - (step_n - 1),
                     )
                     prompt_kind = "case_step"
                 elif runs_path is not None:
@@ -2921,10 +4067,20 @@ def main(argv: list[str] | None = None) -> int:
 
             prompt_text = step_prompt_path.read_text()
             cmd = build_harness_cmd(
-                args.harness, executor_model, None, prompt_text, add_dirs=add_dirs
+                args.harness,
+                executor_model,
+                None,
+                prompt_text,
+                add_dirs=add_dirs,
+                effort=args.executor_effort,
             )
             print(f"  Harness:     {args.harness}")
             print(f"  Model:       {executor_model or '(harness default)'}")
+            if args.executor_effort:
+                print(f"  Effort:      {args.executor_effort}")
+            sandbox = harness_sandbox(args.harness)
+            if sandbox:
+                print(f"  Sandbox:     {sandbox}")
             print(f"  Log:         {step_log.relative_to(REPO_ROOT)}")
             if agent_cwd is not None:
                 print(
@@ -2940,12 +4096,16 @@ def main(argv: list[str] | None = None) -> int:
 
             # For multi-step, each step log is primary; combined goes to opencode.log
             also_append = opencode_log if max_steps > 1 else None
-            # claude stream-json: raw events per step for attribution/usage.
+            # Event-stream harnesses: raw events per step for attribution/usage.
+            # claude's stream is the shape the readers speak; codex/gemini keep
+            # their raw stream in step-N.raw.jsonl and get a translated
+            # step-N.events.jsonl (harness_lab_app.harness_events).
             events_path = (
                 step_log.with_suffix(".events.jsonl")
-                if args.harness == "claude"
+                if args.harness in {"claude", *STDIN_PROMPT_HARNESSES}
                 else None
             )
+            step_started = step_clock()
             rc = run_opencode(
                 cmd,
                 step_log,
@@ -2953,7 +4113,13 @@ def main(argv: list[str] | None = None) -> int:
                 label=args.harness,
                 cwd=agent_cwd,
                 events_path=events_path,
+                stdin_text=(
+                    prompt_text if args.harness in STDIN_PROMPT_HARNESSES else None
+                ),
+                env=harness_run_env(args.harness),
             )
+            step_seconds = step_clock() - step_started
+            harness_seconds += step_seconds
             completed_steps += 1
 
             print("-" * 66)
@@ -2961,8 +4127,20 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"  ⚠️  {args.harness} exited with code {rc} — see {step_log.relative_to(REPO_ROOT)}"
                 )
+                harness_cause = harness_error_cause(
+                    step_log, harness=args.harness, exit_code=rc
+                )
                 stop_reason = "harness_error"
                 break
+
+            # The workspace as this step left it, for the per-step reward
+            # (ADR-0076). Taken before any stop check so the step that ends the
+            # loop is on the curve too, and graded later by the worker — never
+            # here, where the agent could come to see its own reward.
+            steps_dir.mkdir(exist_ok=True)
+            step_meta = snapshot_step(workspace, steps_dir, step_n)
+            step_meta["seconds"] = round(step_seconds, 2)
+            step_meta["prompt_kind"] = prompt_kind
 
             if is_swe_bench:
                 # SWE-bench lane: the stop criterion is objective — evaluate the
@@ -2970,6 +4148,18 @@ def main(argv: list[str] | None = None) -> int:
                 swe_eval = swe_step_evaluation(workspace, case_spec or {})
                 if swe_eval is not None:
                     last_swe_eval = swe_eval
+                    # Kept, not only printed: this is the step's reward on the
+                    # SWE lane, measured live by the same F2P/P2P criterion.
+                    step_meta["swe_eval"] = {
+                        key: swe_eval.get(key)
+                        for key in (
+                            "resolved",
+                            "f2p_passed",
+                            "f2p_total",
+                            "p2p_passed",
+                            "p2p_total",
+                        )
+                    }
                     print(
                         f"  SWEBENCH: resolved={swe_eval['resolved']} "
                         f"F2P={swe_eval['f2p_passed']}/{swe_eval['f2p_total']} "
@@ -2980,7 +4170,9 @@ def main(argv: list[str] | None = None) -> int:
                             f"  ✅ SWE-bench resolved after step {step_n} — stopping."
                         )
                         stop_reason = "swe_resolved"
+                        write_step_meta(steps_dir, step_meta)
                         break
+            write_step_meta(steps_dir, step_meta)
 
             if max_steps > 1:
                 # A step that changed nothing in the workspace is the strongest
@@ -3006,7 +4198,17 @@ def main(argv: list[str] | None = None) -> int:
                 # own. This used to exclude any run that provisioned a
                 # repository, so a target-paired case could not signal
                 # completion at all and paid for its whole step budget.
-                if not is_swe_bench and detect_stop_signal(step_text):
+                # A phased case is not the agent's to end early: every authored
+                # phase is a measured step, and a run that declared victory in
+                # phase 1 skipped the very milestones the case exists to grade
+                # one at a time (ADR-0079). The signal still ends the run once
+                # the phases are spent.
+                phases_pending = step_n - 1 < len(case_step_prompts)
+                if (
+                    not is_swe_bench
+                    and not phases_pending
+                    and detect_stop_signal(step_text)
+                ):
                     print(f"  Agent signaled completion at step {step_n}.")
                     stop_reason = "completion_signal"
                     break
@@ -3056,24 +4258,18 @@ def main(argv: list[str] | None = None) -> int:
         # Still write usage.json before exiting
         print()
         print("  [4/5] Writing usage skeleton...")
-        log_usage = parse_log_usage(opencode_log)
-        remote_usage = pull_usage_litellm(args.run) or pull_usage_langfuse(session_id)
-        db_usage = pull_usage_opencode_db(args.run)
-        usage: dict = {}
-        # claude stream-json events are the ground truth for claude runs.
-        usage.update(collect_claude_usage(out_dir))
-        if log_usage:
-            usage.update(log_usage)
-        if db_usage:
-            usage.update(db_usage)
-        if remote_usage:
-            usage.update(remote_usage)
-        if completed_steps:
-            usage["steps"] = completed_steps
-        if stop_reason:
-            usage["stop_reason"] = stop_reason
-        if prompt_kinds:
-            usage["prompt_kinds"] = list(prompt_kinds)
+        usage = assemble_usage(
+            out_dir,
+            opencode_log,
+            run_id=args.run,
+            session_id=session_id,
+            harness=args.harness,
+            models=usage_models(args, executor_model),
+            harness_seconds=harness_seconds,
+            completed_steps=completed_steps,
+            stop_reason=stop_reason,
+            prompt_kinds=prompt_kinds,
+        )
         write_usage_json(out_dir, usage or None)
         if args.fresh:
             # Managed web run: the API owns scoring (POST /score), so Phase 5
@@ -3095,6 +4291,9 @@ def main(argv: list[str] | None = None) -> int:
                 "(stop_reason=harness_error). This run measured the "
                 "connection, not the subject."
             )
+            # Last on purpose: the worker stores the tail of this output.
+            if harness_cause:
+                print(f"  {harness_cause}")
             return 2
         return 0
     else:  # interactive
@@ -3159,30 +4358,18 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("  [4/5] Enriching with usage data...")
 
-    log_usage = parse_log_usage(opencode_log)
-    remote_usage = pull_usage_litellm(args.run) or pull_usage_langfuse(session_id)
-    db_usage = pull_usage_opencode_db(args.run)
-
-    # Merge priority (highest wins): remote API > opencode DB > log estimates >
-    # claude stream-json events (claude runs: the only populated source).
-    merged_usage: dict = {}
-    merged_usage.update(collect_claude_usage(out_dir))
-    if log_usage:
-        merged_usage.update(log_usage)
-    if db_usage:
-        merged_usage.update(db_usage)
-    if remote_usage:
-        merged_usage.update(remote_usage)
-    if completed_steps > 1:
-        merged_usage["steps"] = completed_steps
-    if stop_reason:
-        merged_usage["stop_reason"] = stop_reason
-    if prompt_kinds:
-        # One entry per executed step, naming the template that wrote its
-        # prompt. The SWE-bench leak was invisible in every stored number and
-        # turned up only by opening a step prompt by hand; this makes the class
-        # of defect readable straight off the artifacts.
-        merged_usage["prompt_kinds"] = list(prompt_kinds)
+    merged_usage = assemble_usage(
+        out_dir,
+        opencode_log,
+        run_id=args.run,
+        session_id=session_id,
+        harness=args.harness,
+        models=usage_models(args, executor_model),
+        harness_seconds=harness_seconds,
+        completed_steps=completed_steps,
+        stop_reason=stop_reason,
+        prompt_kinds=prompt_kinds,
+    )
 
     usage_path = write_usage_json(out_dir, merged_usage or None)
     if merged_usage:
@@ -3230,7 +4417,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("  Next:")
-    print("    open the Runs page in the web app")
+    print("    make bench-results")
     next_run = find_next_run(runs_path, args.run) if runs_path is not None else None
     if next_run:
         nr_id = next_run["run_id"]

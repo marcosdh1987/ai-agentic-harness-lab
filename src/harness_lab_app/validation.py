@@ -21,8 +21,10 @@ import json
 import re
 import shlex
 import shutil
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from harness_lab_app.case_profile import runner_image_for
 from harness_lab_app.config import get_settings
 from harness_lab_app.models import CaseType
 from harness_lab_app.runner_capabilities import (
@@ -84,6 +86,24 @@ def command_deadline_seconds(
     return default
 
 
+def spec_deadline_seconds(spec: dict[str, Any]) -> int:
+    """The longest one pass over a spec can take: every command at its deadline.
+
+    The commands run one after another, each under the watchdog of
+    :func:`command_deadline_seconds`, so their sum bounds the whole pass. A
+    caller that must not overlap a pass in flight (the final validation after a
+    live phase grade) waits this long, never a guess shorter than one command.
+    """
+    setup = sum(
+        command_deadline_seconds("validation setup") for _ in spec.get("setup") or []
+    )
+    checks = sum(
+        command_deadline_seconds(argv[-1] if argv else "")
+        for argv in spec.get("commands") or []
+    )
+    return setup + checks
+
+
 # Exit codes that mean "we did not get an answer", not "the answer was wrong":
 # 124 is GNU timeout's own status, 137 and 143 are SIGKILL and SIGTERM (128+n),
 # -1 is this process failing to launch the command at all, and 127 is the shell
@@ -99,7 +119,48 @@ INCONCLUSIVE_LABELS = {
     "not_launched": "never launched",
     "not_found": "command not found",
     "no_network": "no network",
+    "missing_dependency": "grader dependency missing",
 }
+
+# `No module named 'x'` from Python's import system. Read only for modules the
+# agent was not supposed to write: a missing `clinic` is the agent's failure,
+# a missing `pandas` is the grader's environment (ADR-0071).
+_MISSING_MODULE_RE = re.compile(r"No module named '([A-Za-z0-9_]+)(?:\.[^']*)?'")
+
+# A requirement the setup step will pass to pip: a distribution name, optional
+# extras, and an optional version clause. Anything else is dropped rather than
+# quoted into a shell — the list is case data, not a free-form command.
+_REQUIREMENT_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?"
+    r"((==|>=|<=|~=|!=|>|<)[A-Za-z0-9.*+!_-]+(,(==|>=|<=|~=|!=|>|<)[A-Za-z0-9.*+!_-]+)*)?$"
+)
+
+#: Where a run's grader dependencies are installed, relative to the lab root.
+VALIDATION_DEPS_DIR = "validation-deps"
+
+# The lab's two placeholders, and the doubled braces `str.format` read as one.
+# One left-to-right pass, so `{{workspace}}` stays the literal `{workspace}` it
+# always was.
+_PLACEHOLDER_RE = re.compile(r"\{\{|\}\}|\{workspace\}|\{run_id\}")
+
+
+def render_command(command: str, workspace: str, run_id: str) -> str:
+    """A validation command with the lab's placeholders filled in.
+
+    Only ``{workspace}`` and ``{run_id}`` are the lab's. Every other brace is
+    the check's own code — a dict in a ``python3 -c`` check, an awk program, a
+    JS object — and ``str.format`` read each as a placeholder: the case editor
+    accepted ``d={'a': 1}`` and validation then died on ``KeyError`` for every
+    run of the case. ``{{`` and ``}}`` still mean one brace, as they did.
+    """
+    values = {
+        "{workspace}": workspace,
+        "{run_id}": run_id,
+        "{{": "{",
+        "}}": "}",
+    }
+    return _PLACEHOLDER_RE.sub(lambda match: values[match.group(0)], command)
+
 
 _EXIT_CODE_REASONS = {
     -1: "not_launched",
@@ -133,7 +194,37 @@ _NO_NETWORK_RE = re.compile(
 )
 
 
-def classify_inconclusive(exit_code: Any, output: str = "") -> str | None:
+def workspace_modules(workspace: Path) -> set[str]:
+    """Top-level module and package names the agent's workspace provides."""
+    names: set[str] = set()
+    try:
+        for entry in workspace.iterdir():
+            if entry.suffix == ".py":
+                names.add(entry.stem)
+            elif entry.is_dir() and (entry / "__init__.py").exists():
+                names.add(entry.name)
+    except OSError:
+        pass
+    return names
+
+
+def requirement_is_installable(requirement: str) -> bool:
+    """Whether the validation setup step would pass this requirement to pip."""
+    return bool(_REQUIREMENT_RE.match(requirement.strip()))
+
+
+def validation_requirements(case: Any) -> list[str]:
+    """The pip requirements a case's graders need, validated, in order."""
+    meta = getattr(case, "metadata_json", None) or {}
+    raw = meta.get("validation_requirements") if isinstance(meta, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if requirement_is_installable(str(item))]
+
+
+def classify_inconclusive(
+    exit_code: Any, output: str = "", own_modules: set[str] | None = None
+) -> str | None:
     """Why this check settled nothing, or ``None`` when it produced a verdict.
 
     Two families. The exit codes in :data:`INCONCLUSIVE_EXIT_CODES` say it on
@@ -157,6 +248,9 @@ def classify_inconclusive(exit_code: Any, output: str = "") -> str | None:
         return "not_found"
     if _NO_NETWORK_RE.search(text):
         return "no_network"
+    missing = _MISSING_MODULE_RE.search(text)
+    if missing and missing.group(1) not in (own_modules or set()):
+        return "missing_dependency"
     return None
 
 
@@ -218,6 +312,19 @@ def collect_cost(run_dir: Path) -> dict[str, Any]:
         "billed_tokens": billed,
         "cost_usd": usage.get("cost_usd"),
         "time_minutes": usage.get("time_minutes"),
+        # How long the model itself was generating, summed over its turns
+        # (opencode only). Beside the step clock, not instead of it.
+        "model_minutes": usage.get("model_minutes"),
+        "reasoning_tokens": usage.get("reasoning_tokens"),
+        # Where each figure came from, so a reader can tell a measured $0
+        # (self-hosted) from a missing one, and the step clock from an estimate.
+        "usage_source": usage.get("usage_source"),
+        "time_source": usage.get("time_source"),
+        "cost_source": usage.get("cost_source"),
+        # How the run was paid for (ADR-0094): "subscription" means the cost is
+        # a plan's quota with no per-token price — unknown, never $0.
+        "billing_mode": usage.get("billing_mode"),
+        "detected_model": usage.get("detected_model"),
     }
 
 
@@ -277,7 +384,7 @@ def build_validation_spec(
     :func:`gate_check_service.build_gate_check_spec` already does. Without it
     every target-paired run validated the *lab*: the eight runs of
     `audit-ml-python-base` all recorded `0/2 checks passed` from the lab's own
-    Makefile, and the experiment read as "the harness did not help" (ADR-0063).
+    Makefile, and the experiment read as "the harness did not help" (ADR-0062).
     Case commands are not prefixed: they anchor on ``{workspace}`` themselves,
     and a ``cd`` would break the lab-relative paths some of them also use.
     """
@@ -301,7 +408,7 @@ def build_validation_spec(
         # `.` for a target command: it already runs *inside* the workspace, and
         # the lab-relative path would resolve under itself after the cd.
         rendered = _portable_timeout(
-            raw.format(workspace="." if in_workspace else workspace, run_id=run_id)
+            render_command(raw, "." if in_workspace else workspace, run_id)
         )
         if in_workspace:
             rendered = f"cd {shlex.quote(workspace)} && {rendered}"
@@ -316,9 +423,42 @@ def build_validation_spec(
     # no socket, so those commands must execute where the socket lives (the
     # worker process / host) — flagged here, honored by ValidationService.
     local = case.type == CaseType.swe_pro_instance
+    # The graders' own dependencies (ADR-0071). The checks run offline in a
+    # clean container, so a case whose tests import pandas must have it
+    # installed first, by a step that has network, into the run's own folder.
+    # Never the workspace's requirements.txt: the agent wrote it.
+    setup: list[list[str]] = []
+    requirements = validation_requirements(case)
+    if requirements and commands:
+        deps = f"data/runs/{run_id}/{VALIDATION_DEPS_DIR}"
+        # uv first: the runner's /opt/venv is built by uv and ships no pip.
+        # pip remains the fallback for a host or image that has it.
+        packages = " ".join(shlex.quote(item) for item in requirements)
+        target = shlex.quote(deps)
+        install = (
+            f"rm -rf {target} && if command -v uv >/dev/null 2>&1; then "
+            f"uv pip install --quiet --python python --target {target} {packages}; "
+            f"else python -m pip install --quiet --disable-pip-version-check "
+            f"--no-input --target {target} {packages}; fi"
+        )
+        setup.append(["sh", "-c", install])
+        # Absolute, resolved before any `cd` the check makes into the workspace.
+        commands = [
+            [
+                *argv[:-1],
+                f'export PYTHONPATH="$PWD/{deps}${{PYTHONPATH:+:$PYTHONPATH}}"; {argv[-1]}',
+            ]
+            for argv in commands
+        ]
     return {
         "strategy": strategy,
+        "setup": setup,
         "commands": commands,
+        # The image the checks run in: the case's own when it names one
+        # (ADR-0078) — its grader drives the engine the agent built for —
+        # and the shared runner otherwise. A target's gates run in the shared
+        # runner whatever the case says: they are the repository's commands.
+        "image": "" if target_commands else runner_image_for(case),
         "workspace": workspace,
         # Where the gate ran. Informational — the `cd` is already in the argv —
         # but a run whose checks all failed should be able to say from where.
@@ -338,7 +478,7 @@ def parse_objective(results: list[dict[str, Any]], strategy: str) -> dict[str, A
     three outcomes accordingly: ``False`` when something conclusively failed,
     ``None`` when nothing failed but something could not be measured, ``True``
     only when every check ran and passed. ``inconclusive_reason`` says which of
-    those it was, so a red gate names its own cause (ADR-0063).
+    those it was, so a red gate names its own cause (ADR-0062).
     """
     checks: list[dict[str, Any]] = []
     swebench_line: str | None = None
@@ -347,7 +487,9 @@ def parse_objective(results: list[dict[str, Any]], strategy: str) -> dict[str, A
         output = result.get("output", "")
         swebench_line = _swebench_summary(output) or swebench_line
         command = str(result.get("command", "") or "")
-        reason = classify_inconclusive(exit_code, output)
+        reason = result.get("inconclusive_reason") or classify_inconclusive(
+            exit_code, output, result.get("own_modules")
+        )
         checks.append(
             {
                 # `name` is what the UI and the audit have always read; the

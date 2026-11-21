@@ -21,6 +21,7 @@ from harness_lab_app.validation import (
     command_deadline_seconds,
     compute_composite,
     parse_objective,
+    workspace_modules,
 )
 
 if TYPE_CHECKING:
@@ -76,7 +77,53 @@ class ValidationService:
         # that lets it reach the daemon. Everything else is an audited
         # repository's own command and takes the hardened lane.
         hardened = not spec.get("local")
+        # Passed only when the case names one, so an executor that predates
+        # per-case images (and every fake in the tests) is called as before.
+        image = {"image": spec["image"]} if spec.get("image") else {}
         results: list[dict[str, Any]] = []
+        # The graders' dependencies, installed with network before the offline
+        # checks (ADR-0071). A grader that could not be equipped measured
+        # nothing: its checks are recorded inconclusive without running.
+        for command in spec.get("setup") or []:
+            try:
+                handle = executor.start(
+                    f"{run_id}-setup",
+                    command,
+                    hardened=hardened,
+                    phase="setup",
+                    **image,
+                )
+                output, exit_code = self._drain(handle, "validation setup")
+            except Exception as exc:
+                output, exit_code = f"executor error: {exc!r}", -1
+            if exit_code != 0:
+                self.session.add(
+                    RunEvent(
+                        run_id=run_id,
+                        level="warning",
+                        message="Validation setup could not install the graders' "
+                        f"dependencies (exit {exit_code}): {output[-400:]}",
+                    )
+                )
+                return parse_objective(
+                    [
+                        {
+                            "command": argv[-1] if argv else "",
+                            "exit_code": 1,
+                            "output": "validation setup failed; check not run",
+                            "inconclusive_reason": "missing_dependency",
+                        }
+                        for argv in spec["commands"]
+                    ],
+                    spec["strategy"],
+                )
+        # What the agent wrote: a missing one of these is its failure, never a
+        # missing grader dependency. The archived copy when there is one, the
+        # live workspace otherwise — the same choice the spec made.
+        archived = self._run_dir(run_id) / "workspace"
+        # data/runs/<id> → the lab root is three levels up.
+        live = self._run_dir(run_id).parents[2] / "workspace" / run_id
+        own_modules = workspace_modules(archived if archived.exists() else live)
         for command in spec["commands"]:
             label = command[-1] if command else ""
             try:
@@ -85,6 +132,7 @@ class ValidationService:
                     command,
                     hardened=hardened,
                     phase="validate",
+                    **image,
                 )
                 output, exit_code = self._drain(handle, label)
             except Exception as exc:  # record the failure, never crash the run
@@ -96,7 +144,14 @@ class ValidationService:
                     }
                 )
                 continue
-            results.append({"command": label, "exit_code": exit_code, "output": output})
+            results.append(
+                {
+                    "command": label,
+                    "exit_code": exit_code,
+                    "output": output,
+                    "own_modules": own_modules,
+                }
+            )
         return parse_objective(results, spec["strategy"])
 
     def _drain(self, handle: Any, label: str) -> tuple[str, int]:
@@ -193,6 +248,11 @@ class ValidationService:
         )
 
         validation = self._upsert(run_id)
+        # The per-step trajectory is computed by `validate_steps` and lives on
+        # the same JSON; a re-validate of the final state must not erase it.
+        previous_steps = (validation.objective or {}).get("per_step")
+        if previous_steps is not None:
+            objective = {**objective, "per_step": previous_steps}
         validation.objective = objective
         validation.cost = cost
         validation.effort = effort
@@ -215,6 +275,310 @@ class ValidationService:
         self.session.commit()
         self.session.refresh(validation)
         return validation
+
+    def grade_step_live(
+        self, run_id: str, step: int, *, install_deps: bool = False
+    ) -> dict[str, Any] | None:
+        """Grade one finished step's snapshot while the run is still going.
+
+        The live half of the per-step reward: the operator sees how far each
+        phase got as soon as it ends, instead of a spinner until the whole run
+        is over. Same spec, executor and parser as :meth:`validate_steps`.
+        ``install_deps`` runs the graders' setup once, before the first live
+        grade — the final validation that normally installs them has not
+        happened yet. Returns ``{passed, total, progress}``, or None when the
+        step cannot be graded (no snapshot, or no command names the workspace).
+
+        Recorded nowhere but the return value: the caller keeps it in the run's
+        ``live_steps.json``. The authoritative per-step curve is still the one
+        :meth:`validate_steps` writes after the run.
+        """
+        from harness_lab_app.step_reward import progress_of, snapshot_dirs
+
+        run = RunService(self.session).get_run(run_id)
+        config = RunService(self.session).get_run_config(run.run_config_id)
+        if config.target_repo_id:
+            return None
+        case = CaseService(self.session).get_case(config.case_id)
+        snapshots = dict(snapshot_dirs(self._run_dir(run_id)))
+        if step not in snapshots:
+            return None
+        spec = build_validation_spec(case, run_id)
+        if spec.get("local") or not spec["commands"]:
+            return None
+        snapshot_rel = f"data/runs/{run_id}/steps/{snapshots[step].name}"
+        pointed = [
+            [*argv[:-1], argv[-1].replace(spec["workspace"], snapshot_rel)]
+            for argv in spec["commands"]
+            if argv and spec["workspace"] in argv[-1]
+        ]
+        if not pointed:
+            return None
+        objective = self._run_objective(
+            {
+                **spec,
+                "commands": pointed,
+                "setup": spec["setup"] if install_deps else [],
+            },
+            run_id,
+        )
+        conclusive = [
+            c for c in objective["checks"] if c.get("conclusive") is not False
+        ]
+        return {
+            "passed": sum(1 for c in conclusive if c.get("passed")),
+            "total": len(conclusive),
+            "progress": progress_of(objective),
+        }
+
+    def _step_costs(self, run_id: str, steps: list[int]) -> dict[int, dict[str, Any]]:
+        """Each step's own cost: claude's per-step ``result`` event when present."""
+        from harness_lab_app.step_reward import claude_step_cost, step_record_files
+
+        records = step_record_files(self._run_dir(run_id))
+        costs: dict[int, dict[str, Any]] = {}
+        for step in steps:
+            events = records.get(step, {}).get("events")
+            if events is not None:
+                cost = claude_step_cost(events.read_text(errors="replace").splitlines())
+                if cost:
+                    costs[step] = cost
+        return costs
+
+    def _grade_step_tree(
+        self,
+        run_id: str,
+        step: int,
+        step_meta: dict[str, Any],
+        spec: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """One SWE-bench Pro step's F2P/P2P verdict, graded in the worker.
+
+        Rebuilds the tree the step left (its diff on the commit it was cut
+        from, in a worktree of the archived clone) and runs the case's own
+        command pointed at it. None when the tree cannot be rebuilt or the
+        command printed no verdict — the step is then unmeasured, never
+        credited with the final state.
+        """
+        from harness_lab_app.step_reward import parse_swe_verdict
+        from harness_lab_app.step_trees import StepTreeError, step_tree
+
+        run_dir = self._run_dir(run_id)
+        diff = run_dir / "steps" / str(step_meta.get("path") or f"step-{step}.diff")
+        if not diff.is_file():
+            return None
+        outputs: list[str] = []
+        try:
+            with step_tree(
+                run_dir / "workspace", str(step_meta["base"]), diff, run_dir, step
+            ) as tree:
+                # Absolute: the validator resolves it against its own cwd.
+                for argv in spec["commands"]:
+                    command = [*argv[:-1], f"{argv[-1]} --repo-dir {tree.resolve()}"]
+                    # The Pro suite shells out to docker itself; like the final
+                    # validation it runs here, where the socket is.
+                    handle = SubprocessRunExecutor().start(
+                        f"{run_id}-step-{step}", command, hardened=False
+                    )
+                    output, _exit_code = self._drain(handle, command[-1])
+                    outputs.append(output)
+        except (StepTreeError, ValueError, OSError) as exc:
+            self._step_not_graded(run_id, step, str(exc))
+            return None
+        for output in outputs:
+            # Read the whole output, not the check's one-line summary: a suite
+            # that never ran still prints `F2P=0/n` as a placeholder, and only
+            # the error line beside it says that nothing was measured.
+            if "SWEBENCH-ERROR:" in output:
+                reason = output.split("SWEBENCH-ERROR:", 1)[1].strip().splitlines()[0]
+                self._step_not_graded(run_id, step, f"the suite did not run: {reason}")
+                return None
+            verdict = parse_swe_verdict(output)
+            if verdict is not None:
+                return verdict
+        self._step_not_graded(run_id, step, "the validator printed no verdict")
+        return None
+
+    def _step_not_graded(self, run_id: str, step: int, reason: str) -> None:
+        self.session.add(
+            RunEvent(
+                run_id=run_id,
+                level="warning",
+                message=f"Per-step reward: step {step} not graded — {reason}",
+            )
+        )
+
+    def validate_steps(self, run_id: str) -> dict[str, Any] | None:
+        """Grade every step's snapshot with the case's own checks (ADR-0076).
+
+        The per-step reward: the same spec, the same executor and the same
+        parser as the final validation (ADR-0075), pointed at
+        ``steps/step-N.snapshot`` instead of the final workspace. Run after the
+        agent has finished, so the agent never sees a reward it could steer by.
+
+        The SWE lane needs no re-run when the runner measured F2P/P2P live
+        after every step and kept it in ``step-N.meta.json``. SWE-bench Pro
+        cannot be measured live (its suite runs in docker, which the runner
+        lacks), so each step recorded as a diff with its ``base`` is rebuilt
+        into a self-contained clone and graded here with the case's own
+        command; a suite that did not run leaves that step unmeasured. A
+        target repository's per-step diffs are listed but not regraded yet;
+        the gap shows as an unmeasured step.
+
+        Stored on ``Validation.objective["per_step"]`` and returned; None when
+        the run left no per-step record at all.
+        """
+        from harness_lab_app.attribution_service import AttributionService
+        from harness_lab_app.step_reward import (
+            build_trajectory,
+            progress_of,
+            read_step_meta,
+            snapshot_dirs,
+            swe_progress,
+        )
+
+        run_dir = self._run_dir(run_id)
+        meta = read_step_meta(run_dir)
+        snapshots = dict(snapshot_dirs(run_dir))
+        if not meta and not snapshots:
+            return None
+
+        services = RunService(self.session)
+        run = services.get_run(run_id)
+        config = services.get_run_config(run.run_config_id)
+        case = CaseService(self.session).get_case(config.case_id)
+        target_commands: list[str] | None = None
+        if config.target_repo_id:
+            with contextlib.suppress(TargetError):
+                target = TargetService(self.session).get_target(config.target_repo_id)
+                target_commands = list(target.validation_commands) or None
+        spec = build_validation_spec(case, run_id, target_commands)
+        final_workspace = spec["workspace"]
+
+        consulted = AttributionService(self.session).per_step_consulted(run_id)
+        steps_numbers = sorted(set(meta) | set(snapshots))
+        costs = self._step_costs(run_id, steps_numbers)
+        rows: list[dict[str, Any]] = []
+        for step in steps_numbers:
+            step_meta = meta.get(step, {})
+            row: dict[str, Any] = {
+                "step": step,
+                "snapshot": step_meta.get("kind")
+                or ("snapshot" if step in snapshots else "missing"),
+                "seconds": step_meta.get("seconds"),
+                "consulted": consulted.get(step, []),
+                **costs.get(step, {}),
+            }
+            swe = step_meta.get("swe_eval")
+            if isinstance(swe, dict) and swe.get("f2p_total"):
+                row["passed"] = int(swe.get("f2p_passed") or 0)
+                row["total"] = int(swe.get("f2p_total") or 0)
+                row["progress"] = swe_progress(swe)
+                row["source"] = "swe_live"
+            elif (
+                spec.get("local")
+                and step_meta.get("kind") == "diff"
+                and step_meta.get("base")
+                and spec["commands"]
+            ):
+                # SWE-bench Pro: its suite runs in the instance image, the
+                # runner has no docker, so the live verdict was skipped. The
+                # worker has the socket: rebuild the step's tree and grade it
+                # with the case's own command.
+                swe = self._grade_step_tree(run_id, step, step_meta, spec)
+                if swe is not None and swe.get("f2p_total"):
+                    row["passed"] = int(swe.get("f2p_passed") or 0)
+                    row["total"] = int(swe.get("f2p_total") or 0)
+                    row["progress"] = swe_progress(swe)
+                    row["source"] = "swe_regraded"
+                else:
+                    row["progress"] = None
+                    row["source"] = "unmeasured"
+            elif step in snapshots and spec["commands"] and not spec.get("local"):
+                snapshot_rel = f"data/runs/{run_id}/steps/{snapshots[step].name}"
+                # Only a command that names the workspace can be pointed at a
+                # snapshot. One that does not (an absolute path of its own, a
+                # tamper guard on the lab's git state) would grade the *final*
+                # state and credit it to every step, so it sits this pass out.
+                pointed = [
+                    [*argv[:-1], argv[-1].replace(final_workspace, snapshot_rel)]
+                    for argv in spec["commands"]
+                    if argv and final_workspace in argv[-1]
+                ]
+                if not pointed:
+                    row["progress"] = None
+                    row["source"] = "unmeasured"
+                    rows.append(row)
+                    continue
+                step_spec = {
+                    **spec,
+                    "commands": pointed,
+                    # The graders' deps were installed for the final run (and
+                    # live in the run dir); a per-step pass reuses them.
+                    "setup": [],
+                }
+                objective = self._run_objective(step_spec, run_id)
+                conclusive = [
+                    c for c in objective["checks"] if c.get("conclusive") is not False
+                ]
+                row["passed"] = sum(1 for c in conclusive if c.get("passed"))
+                row["total"] = len(conclusive)
+                row["progress"] = progress_of(objective)
+                row["source"] = "snapshot_checks"
+            else:
+                row["progress"] = None
+                row["source"] = "unmeasured"
+            rows.append(row)
+
+        trajectory = build_trajectory(rows).as_dict()
+        trajectory["sources"] = sorted({row["source"] for row in rows})
+        validation = self._upsert(run_id)
+        objective = dict(validation.objective or {})
+        objective["per_step"] = trajectory
+        validation.objective = objective
+        validation.updated_at = utc_now()
+        self.session.add(validation)
+        resolved = trajectory.get("steps_to_resolve")
+        graded = len(rows) - int(trajectory.get("unmeasured_steps") or 0)
+        if not graded:
+            # Not "never fully resolved": nothing was measured, which is a
+            # statement about the grader, not about the agent.
+            self.session.add(
+                RunEvent(
+                    run_id=run_id,
+                    level="warning",
+                    message=(
+                        f"Per-step reward: none of {len(rows)} step(s) could be "
+                        "graded (no snapshot the case's checks can run on), so "
+                        "the run has a final verdict but no per-step curve."
+                    ),
+                )
+            )
+            self.session.commit()
+            return trajectory
+        self.session.add(
+            RunEvent(
+                run_id=run_id,
+                level="info",
+                message=(
+                    f"Per-step reward: {graded} of {len(rows)} step(s) graded; "
+                    + (
+                        f"resolved at step {resolved}"
+                        if resolved
+                        else "never fully resolved"
+                    )
+                    + (
+                        f", {trajectory['post_resolution_cost_share']:.0%} of cost "
+                        "spent after resolution"
+                        if trajectory.get("post_resolution_cost_share") is not None
+                        else ""
+                    )
+                    + "."
+                ),
+            )
+        )
+        self.session.commit()
+        return trajectory
 
     def apply_subjective(
         self,

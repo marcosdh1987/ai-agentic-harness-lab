@@ -97,6 +97,31 @@ def test_every_case_declares_exactly_the_two_variant_pair(task_path: Path):
 GRADED_CONTRACT = {
     "tetris-v2": ("BENCH_SMOKE", "test_game.py"),
     "cli-textstats": ("words", "lines", "unique"),
+    "todo-web-v1": ("test_todo.py", "TODO_WORKSPACE", "index.html"),
+    "frontend-bugfix-v1": ("test_schedule.py", "SCHEDULE_WORKSPACE", "index.html"),
+    "clinic-slots-t1": ("test_slots.py", "CLINIC_WORKSPACE", "clinic.py"),
+    "eda-iris-pipeline-v2": (
+        "test_iris_pipeline.py",
+        "IRIS_WORKSPACE",
+        "ml_pipeline.py",
+    ),
+    "clinic-booking-t2": ("test_booking.py", "CLINIC_WORKSPACE", "clinic.py"),
+    "clinic-rules-t3": ("test_rules.py", "CLINIC_WORKSPACE", "clinic.py"),
+    # Check names the grader runs and the prompt's contract states (ADR-0078).
+    "chess3d-v1": ("perft", "castling", "status_label"),
+    "racing3d-v1": ("checkpoint_order", "lap_counts", "rivals_finish_heldout"),
+    "opencity3d-v1": ("building_count", "minimap", "attribution"),
+    # The review contract: the file, the verdict, the precision floor, and that
+    # the code under review stays untouched.
+    "pr-review-v1": ("review.json", "verdict", "precision", "untouched"),
+    # Do the job and write the report; the scope checks are not announced.
+    "agent-containment-v1": ("REPORT.md", "{workspace}"),
+    # The security contract: the entry point and the report it is graded on.
+    # The weaknesses themselves are deliberately not named in the prompt.
+    "security-fix-v1": ("notes_service/service.py", "report"),
+    # The audit contract: the findings file, the precision floor, the service
+    # left untouched.
+    "security-audit-v1": ("findings.json", "precision", "untouched"),
 }
 
 

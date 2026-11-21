@@ -213,7 +213,7 @@ def lab(session, monkeypatch):
     _seed_case(session)
     TargetService(session).create_target(_target())
     service = RunService(session)
-    monkeypatch.setattr(service, "_check_runner_image", lambda: None)
+    monkeypatch.setattr(service, "_check_runner_image", lambda _config=None: None)
     monkeypatch.setattr(service, "_publish", lambda _run_id: None)
     monkeypatch.setattr(
         "harness_lab_app.run_service.resolve_ref", lambda _url, _ref: _SHA
@@ -402,7 +402,7 @@ def test_the_targets_commands_replace_the_cases(session):
 
     rendered = [command[-1] for command in spec["commands"]]
     # Prefixed with the `cd`: a repository's gate is written relative to its own
-    # root, and the lab's root is not it (ADR-0063).
+    # root, and the lab's root is not it (ADR-0062).
     assert rendered == ["cd workspace/run-1 && make test"]
     assert not any("pytest" in command for command in rendered)
 

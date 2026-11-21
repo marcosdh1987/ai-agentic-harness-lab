@@ -22,6 +22,74 @@ def _args(**over) -> Namespace:
     return Namespace(**base)
 
 
+def test_run_models_lists_each_model_once_in_a_stable_order():
+    args = Namespace(executor_model="gateway/a", planner_model="gateway/b")
+    assert bench_run.run_models(args) == ("gateway/a", "gateway/b")
+    same = Namespace(executor_model="lmstudio/x", planner_model="lmstudio/x")
+    assert bench_run.run_models(same) == ("lmstudio/x",)
+    assert (
+        bench_run.run_models(Namespace(executor_model=None, planner_model=None)) == ()
+    )
+
+
+def test_detected_windows_are_off_under_the_probe_kill_switch(monkeypatch):
+    """The autouse fixture sets HARNESS_LAB_DISABLE_GATEWAY_PROBE; no host is asked."""
+    from harness_lab_app import context_window
+
+    monkeypatch.setattr(
+        context_window,
+        "detect_windows",
+        lambda *_a, **_k: pytest.fail("a host was probed under the kill switch"),
+    )
+    bench_run.detected_context_windows.cache_clear()
+    assert bench_run.detected_context_windows(("gateway/lmstudio-35b",)) == ()
+
+
+def test_detected_windows_reach_the_overlay_as_limits(tmp_path, monkeypatch):
+    from harness_lab_app import context_window
+    from harness_lab_app.context_window import ContextWindow
+
+    (tmp_path / "opencode.json").write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "gateway": {
+                        "npm": "x",
+                        "models": {"lmstudio-35b": {"name": "35B"}},
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(bench_run, "REPO_ROOT", tmp_path)
+    monkeypatch.delenv("HARNESS_LAB_DISABLE_GATEWAY_PROBE", raising=False)
+    window = ContextWindow(
+        "gateway/lmstudio-35b",
+        "lmstudio",
+        "http://gpu:1234",
+        "q/35b",
+        41216,
+        37120,
+        4096,
+    )
+    monkeypatch.setattr(context_window, "detect_windows", lambda *_a, **_k: [window])
+    bench_run.detected_context_windows.cache_clear()
+    bench_run.apply_gateway_overlay.cache_clear()
+
+    digest = bench_run.apply_gateway_overlay((), ("gateway/lmstudio-35b",))
+
+    assert digest is not None
+    effective = json.loads(
+        (tmp_path / "data" / "app" / "opencode-effective.json").read_text()
+    )
+    assert effective["provider"]["gateway"]["models"]["lmstudio-35b"]["limit"] == {
+        "context": 37120,
+        "output": 4096,
+    }
+    bench_run.detected_context_windows.cache_clear()
+    bench_run.apply_gateway_overlay.cache_clear()
+
+
 def test_resolve_returns_registered_run(tmp_path):
     runs_path = tmp_path / "runs.yaml"
     runs_path.write_text(
@@ -114,6 +182,46 @@ def test_workspace_fingerprint_detects_changes(tmp_path):
     assert bench_run.workspace_fingerprint(ws) != fp1  # edit → changes
     # Unreadable git state → None, never raises.
     assert bench_run.workspace_fingerprint(tmp_path / "not-a-repo") is None
+
+
+def test_merge_usage_never_overwrites_a_value_with_an_empty_one():
+    """A remote source that knows the session but has no cost (an unpriced
+    Langfuse trace) returns `cost_usd: None`. A plain dict.update let that None
+    erase the cost the claude stream-json events had reported, which is how 37
+    archived claude runs lost their cost."""
+    events = {"cost_usd": 0.42, "input_tokens": 1200, "turns": 7}
+    remote = {"cost_usd": None, "input_tokens": None, "turns": 3}
+
+    merged = bench_run.merge_usage(events, None, {}, remote)
+
+    assert merged["cost_usd"] == 0.42
+    assert merged["input_tokens"] == 1200
+    assert merged["turns"] == 3  # a populated, higher-priority value still wins
+
+
+def test_workspace_fingerprint_sees_edits_in_an_ignored_nested_workspace(tmp_path):
+    """A build-from-scratch workspace has no .git of its own and lives under the
+    lab repo, where /workspace/ is git-ignored. git then answers for the
+    enclosing repo, its status/diff never change, and every such run used to
+    stop as `no_progress` at step 2 whatever the agent did."""
+    import subprocess
+
+    lab = tmp_path / "lab"
+    lab.mkdir()
+    ident = ["-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(lab)], check=True)
+    (lab / ".gitignore").write_text("/workspace/\n")
+    subprocess.run(["git", "-C", str(lab), "add", "-A"], check=True)
+    subprocess.run(["git", *ident, "-C", str(lab), "commit", "-qm", "base"], check=True)
+    ws = lab / "workspace" / "run-1"
+    ws.mkdir(parents=True)
+    (ws / "main.py").write_text("print(1)\n")
+
+    fp1 = bench_run.workspace_fingerprint(ws)
+    assert fp1 is not None
+    assert bench_run.workspace_fingerprint(ws) == fp1  # no edits → stable
+    (ws / "game.py").write_text("class Game: ...\n")
+    assert bench_run.workspace_fingerprint(ws) != fp1  # new file → changes
 
 
 def test_validate_workspace_fresh_resets_stale_dir(tmp_path, capsys):
@@ -706,3 +814,722 @@ def test_finalize_workspace_includes_files_the_agent_created(tmp_path):
     assert "+echo new" in patch
     assert "tests/test_new.sh" in patch and "+exit 0" in patch
     assert "build/out.bin" not in patch
+
+
+# --- seeding a workspace from a case's starter files (ADR-0068) ---------------
+
+
+def _starter(root):
+    starter = root / "benchmarks" / "fixit" / "starter"
+    (starter / "src").mkdir(parents=True)
+    (starter / "index.html").write_text("<h1>broken</h1>\n")
+    (starter / "src" / "app.js").write_text("console.log(1)\n")
+    return starter
+
+
+def test_a_starter_dir_seeds_an_empty_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench_run, "REPO_ROOT", tmp_path)
+    _starter(tmp_path)
+    ws = tmp_path / "workspace" / "run-1"
+    ws.mkdir(parents=True)
+
+    copied = bench_run.seed_workspace(ws, {"starter_dir": "benchmarks/fixit/starter"})
+
+    assert copied == 2
+    assert (ws / "index.html").read_text() == "<h1>broken</h1>\n"
+    assert (ws / "src" / "app.js").exists()
+
+
+def test_seeding_never_overwrites_a_workspace_that_has_files(tmp_path, monkeypatch):
+    """A resumed or continued run already holds the agent's work."""
+    monkeypatch.setattr(bench_run, "REPO_ROOT", tmp_path)
+    _starter(tmp_path)
+    ws = tmp_path / "workspace" / "run-1"
+    ws.mkdir(parents=True)
+    (ws / "index.html").write_text("<h1>agent's fix</h1>\n")
+
+    assert (
+        bench_run.seed_workspace(ws, {"starter_dir": "benchmarks/fixit/starter"}) == 0
+    )
+    assert (ws / "index.html").read_text() == "<h1>agent's fix</h1>\n"
+
+
+@pytest.mark.parametrize(
+    "starter", ["../outside", "/etc", "benchmarks/../../etc", "src/harness_lab_app"]
+)
+def test_a_starter_outside_benchmarks_is_refused(tmp_path, monkeypatch, starter):
+    monkeypatch.setattr(bench_run, "REPO_ROOT", tmp_path)
+    (tmp_path / "src" / "harness_lab_app").mkdir(parents=True)
+    ws = tmp_path / "workspace" / "run-1"
+    ws.mkdir(parents=True)
+    with pytest.raises(SystemExit):
+        bench_run.seed_workspace(ws, {"starter_dir": starter})
+
+
+def test_a_symlink_in_a_starter_is_not_followed_out_of_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench_run, "REPO_ROOT", tmp_path)
+    starter = _starter(tmp_path)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("token")
+    (starter / "leak.txt").symlink_to(secret)
+    ws = tmp_path / "workspace" / "run-1"
+    ws.mkdir(parents=True)
+
+    bench_run.seed_workspace(ws, {"starter_dir": "benchmarks/fixit/starter"})
+
+    # Links are skipped: a starter can never carry a host file into a run.
+    assert not (ws / "leak.txt").exists()
+    assert not (ws / "leak.txt").is_symlink()
+
+
+def test_no_starter_dir_seeds_nothing(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    assert bench_run.seed_workspace(ws, {}) == 0
+    assert bench_run.seed_workspace(ws, None) == 0
+
+
+def test_a_harness_error_names_its_cause_in_one_short_line(tmp_path):
+    """K-006 stored 1000 chars of tail and the cause was not in them: LiteLLM
+    repeats the provider error twice with its fallback table. The verdict line
+    must carry the provider's error code on its own, short enough to survive."""
+    log = tmp_path / "step-1.log"
+    log.write_text(
+        "# claude session init (model claude-opus-5-5)\n"
+        'API Error: 400 litellm.BadRequestError: AnthropicException - {"type":"error",'
+        '"error":{"type":"invalid_request_error","message":"Claude Code 2.1.197 does not '
+        'support this model; version 2.1.280 or newer is required.","details":'
+        '{"error_code":"claude_code_version_too_old"}}}'
+        + " Fallbacks=[...]" * 80
+        + "\n"
+    )
+    line = bench_run.harness_error_cause(log)
+    assert line is not None
+    assert "claude_code_version_too_old" in line
+    assert "2.1.280" in line
+    assert len(line) <= 300
+
+
+def test_a_rejected_model_is_named_too(tmp_path):
+    log = tmp_path / "step-1.log"
+    log.write_text(
+        "API Error: 400 anthropic_messages: Invalid model name passed in "
+        "model=claude-haiku-5-5. Call `/v1/models` to view available models.\n"
+    )
+    line = bench_run.harness_error_cause(log)
+    assert line is not None and "Invalid model name" in line
+
+
+def test_no_api_error_means_no_cause_line(tmp_path):
+    log = tmp_path / "step-1.log"
+    log.write_text("# claude session init\nTraceback: SyntaxError\n")
+    assert bench_run.harness_error_cause(log) is None
+
+
+def test_a_workspace_with_a_virtualenv_still_archives(tmp_path):
+    """eda-ml-iris-categ-numerico-K-008 (2026-10-23): the agent created `venv/`
+    in its workspace, `git diff` returned 2.6 MB of binary, and decoding it as
+    UTF-8 killed the run after the agent had finished its work."""
+    dest = tmp_path / "workspace"
+    (dest / "venv" / "lib").mkdir(parents=True)
+    (dest / "venv" / "lib" / "blob.so").write_bytes(bytes(range(256)) * 64)
+    (dest / "__pycache__").mkdir()
+    (dest / "__pycache__" / "m.cpython-311.pyc").write_bytes(b"\xa4\x00\xff")
+    (dest / "main.py").write_text("print('hi')\n")
+    lines = bench_run.write_diff_patch(tmp_path, dest)
+    patch = (tmp_path / "diff.patch").read_text()
+    assert lines > 0
+    assert "main.py" in patch
+    # The agent's code is the diff; installed packages and caches are not.
+    assert "venv/" not in patch and "__pycache__" not in patch
+    # The archive itself keeps everything.
+    assert (dest / "venv" / "lib" / "blob.so").exists()
+
+
+def test_git_output_that_is_not_utf8_never_raises(tmp_path):
+    (tmp_path / "f.bin").write_bytes(b"\xa4\xff\x00 binary")
+    result = bench_run._run_git(
+        ["git", "diff", "--no-index", "--text", "/dev/null", str(tmp_path / "f.bin")],
+        cwd=tmp_path,
+    )
+    assert isinstance(result.stdout, str)
+
+
+# --------------------------------------------------------------------------
+# Usage: opencode sessions joined by id, one clock for every arm
+# --------------------------------------------------------------------------
+
+# Verbatim shape of opencode 1.19.5 `--print-logs` lines. The bare arm's session
+# lives under the run's workspace (ADR-0049 masking); the full-harness arm's
+# under /app. The old title/directory join matched neither reliably.
+_BARE_LOG = (
+    "timestamp=2026-11-07T19:51:47.755Z level=INFO run=c313e96e message=created "
+    "id=ses_bareMain01 slug=mighty-pixel version=1.19.5 projectID=499d "
+    'directory=/app/workspace/tetris-v2-K-035 path="" workspaceID=undefined '
+    'parentID=undefined title="Tetris in pygame"\n'
+    "timestamp=2026-11-07T19:51:48.082Z level=INFO run=c313e96e message=stream "
+    "providerID=lmstudio modelID=prism-ml/bonsai-27b session.id=ses_bareMain01 "
+    "small=true agent=title mode=primary\n"
+)
+_FULL_LOG = (
+    "timestamp=2026-11-07T20:01:00.000Z level=INFO run=aa message=created "
+    "id=ses_fullMain01 slug=neon-mountain version=1.19.5 projectID=499d "
+    'directory=/app path="" workspaceID=undefined parentID=undefined\n'
+    "timestamp=2026-11-07T20:02:00.000Z level=INFO run=aa message=created "
+    "id=ses_fullChild1 slug=sub version=1.19.5 projectID=499d "
+    'directory=/app path="" workspaceID=undefined parentID=ses_fullMain01\n'
+)
+
+
+def _opencode_db(path: Path, sessions: list[dict]) -> Path:
+    """A minimal opencode.db with the three tables the reader touches."""
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+            tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+            tokens_cache_read INTEGER, tokens_cache_write INTEGER, cost REAL
+        );
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+        """
+    )
+    for n, s in enumerate(sessions):
+        con.execute(
+            "INSERT INTO session VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                s["id"],
+                s.get("parent_id"),
+                s.get("directory", "/app"),
+                s.get("title", "an invented title"),
+                s.get("input", 0),
+                s.get("output", 0),
+                s.get("reasoning", 0),
+                s.get("cache_read", 0),
+                s.get("cache_write", 0),
+                s.get("cost", 0.0),
+            ),
+        )
+        for turn in range(s.get("turns", 0)):
+            con.execute(
+                "INSERT INTO message VALUES (?,?,?)",
+                (
+                    f"msg_{n}_{turn}",
+                    s["id"],
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "time": {"created": 0, "completed": 30_000},
+                        }
+                    ),
+                ),
+            )
+        for call in range(s.get("tools", 0)):
+            con.execute(
+                "INSERT INTO part VALUES (?,?,?)",
+                (f"prt_{n}_{call}", s["id"], json.dumps({"type": "tool"})),
+            )
+    con.commit()
+    con.close()
+    return path
+
+
+def test_session_ids_come_from_the_run_logs_for_both_runner_layouts(tmp_path):
+    bare = tmp_path / "step-1.log"
+    bare.write_text(_BARE_LOG)
+    full = tmp_path / "step-2.log"
+    full.write_text(_FULL_LOG + _FULL_LOG)  # a repeated line counts once
+
+    ids = bench_run.opencode_session_ids([bare, full, tmp_path / "missing.log"])
+
+    assert ids == ["ses_bareMain01", "ses_fullMain01", "ses_fullChild1"]
+
+
+def test_a_masked_bare_session_is_counted_whatever_its_title_or_directory(tmp_path):
+    """Every bare arm recorded no tokens: its session sits under
+    /app/workspace/<run>, and the old query demanded directory = /app plus a
+    title containing the run id — a title the model writes, not the lab."""
+    db = _opencode_db(
+        tmp_path / "opencode.db",
+        [
+            {
+                "id": "ses_bareMain01",
+                "directory": "/app/workspace/tetris-v2-K-035",
+                "title": "Tetris in pygame",
+                "input": 100_000,
+                "output": 2_000,
+                "reasoning": 500,
+                "turns": 4,
+                "tools": 3,
+            },
+            # Another run's session in the same DB must not leak in.
+            {"id": "ses_otherRun", "input": 9_999_999, "output": 9_999},
+        ],
+    )
+
+    usage = bench_run.pull_usage_opencode_db(["ses_bareMain01"], db_path=db)
+
+    assert usage is not None
+    assert usage["input_tokens"] == 100_000
+    # Generated tokens include reasoning: the model produced them either way.
+    assert usage["output_tokens"] == 2_500
+    assert usage["reasoning_tokens"] == 500
+    assert usage["turns"] == 4
+    assert usage["tool_calls"] == 3
+    assert usage["model_minutes"] == 2.0  # 4 turns x 30 s
+    assert usage["usage_source"] == "opencode_db"
+    # opencode reports 0 for an unpriced model; that is left to the
+    # self-hosted rule, not recorded as a measured price here.
+    assert "cost_usd" not in usage
+
+
+def test_sub_agent_sessions_are_summed_with_their_parent(tmp_path):
+    db = _opencode_db(
+        tmp_path / "opencode.db",
+        [
+            {"id": "ses_fullMain01", "input": 50_000, "output": 1_000, "cache_read": 7},
+            # Not announced in the log, but its parent was: still this run's.
+            {"id": "ses_hiddenKid", "parent_id": "ses_fullMain01", "input": 5_000},
+        ],
+    )
+
+    usage = bench_run.pull_usage_opencode_db(["ses_fullMain01"], db_path=db)
+
+    assert usage["sessions"] == 2
+    assert usage["input_tokens"] == 55_000
+    # The key collect_cost reads; `tokens_cache_read` was never picked up.
+    assert usage["cache_read_tokens"] == 7
+
+
+def test_no_sessions_or_no_db_is_unknown_never_zero(tmp_path):
+    db = _opencode_db(tmp_path / "opencode.db", [{"id": "ses_x", "input": 1}])
+    assert bench_run.pull_usage_opencode_db([], db_path=db) is None
+    assert bench_run.pull_usage_opencode_db(["ses_absent"], db_path=db) is None
+    assert (
+        bench_run.pull_usage_opencode_db(["ses_x"], db_path=tmp_path / "nope.db")
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("harness", "models", "expected"),
+    [
+        ("opencode", ["lmstudio/prism-ml/bonsai-27b"], 0.0),
+        ("opencode", ["ollama/qwen3.6:27b"], 0.0),
+        ("opencode", ["gateway/lmstudio-qwen3.6-35b"], 0.0),
+        # One cloud model in the run and nothing can be said about spend.
+        ("opencode", ["lmstudio/a", "gateway/gpt-5"], None),
+        ("opencode", ["gateway/claude-sonnet"], None),
+        # claude/codex drop a local id and use their own cloud default.
+        ("claude", ["lmstudio/prism-ml/bonsai-27b"], None),
+        ("opencode", [], None),
+    ],
+)
+def test_self_hosted_cost_is_zero_only_when_every_model_is_local(
+    harness, models, expected
+):
+    assert bench_run.self_hosted_cost(harness, models) == expected
+
+
+def test_both_arms_get_the_same_usage_fields(tmp_path, monkeypatch):
+    """The bare and full-harness arms of one experiment must be measured by the
+    same instrument; a field one arm has and the other lacks is a gap in the
+    comparison, not a difference between harnesses."""
+    db = _opencode_db(
+        tmp_path / "opencode.db",
+        [
+            {
+                "id": "ses_bareMain01",
+                "directory": "/app/workspace/r",
+                "input": 10,
+                "output": 2,
+                "turns": 1,
+                "tools": 1,
+            },
+            {"id": "ses_fullMain01", "input": 30, "output": 4, "turns": 2, "tools": 1},
+            {"id": "ses_fullChild1", "parent_id": "ses_fullMain01", "input": 5},
+        ],
+    )
+    monkeypatch.setattr(bench_run, "opencode_db_path", lambda: db)
+    for name in ("pull_usage_litellm", "pull_usage_langfuse"):
+        monkeypatch.setattr(bench_run, name, lambda *_a, **_k: None)
+
+    recorded = {}
+    for arm, log_text in (("bare", _BARE_LOG), ("full", _FULL_LOG)):
+        out_dir = tmp_path / arm
+        (out_dir / "steps").mkdir(parents=True)
+        (out_dir / "steps" / "step-1.log").write_text(log_text)
+        recorded[arm] = bench_run.assemble_usage(
+            out_dir,
+            out_dir / "opencode.log",
+            run_id=f"run-{arm}",
+            session_id=f"bench-run-{arm}",
+            harness="opencode",
+            models=["lmstudio/prism-ml/bonsai-27b"],
+            harness_seconds=90.0,
+            completed_steps=1,
+            stop_reason="completion_signal",
+            prompt_kinds=["case"],
+        )
+
+    measured = ("input_tokens", "output_tokens", "turns", "tool_calls", "cost_usd")
+    for arm, usage in recorded.items():
+        for key in measured:
+            assert usage.get(key) is not None, (arm, key)
+        assert usage["time_minutes"] == 1.5, arm
+        assert usage["time_source"] == "step_clock"
+        assert usage["cost_usd"] == 0.0
+        assert usage["cost_source"] == "self_hosted"
+    assert recorded["full"]["input_tokens"] == 35  # child session included
+
+
+def test_the_step_clock_is_the_recorded_time_and_spans_every_step(
+    tmp_path, monkeypatch
+):
+    """`time_minutes` came from opencode session spans that only covered the
+    sessions whose title matched — 5.8 min recorded for a 109-minute run."""
+    clock = iter([0.0, 120.0, 1000.0, 1180.0])
+    monkeypatch.setattr(bench_run, "step_clock", lambda: next(clock))
+
+    code, out_dir, _ = _managed_run(
+        tmp_path, monkeypatch, rc=0, argv_extra=("--max-steps", "2")
+    )
+
+    assert code == 0
+    usage = json.loads((out_dir / "usage.json").read_text())
+    assert usage["time_minutes"] == 5.0  # (120 + 180) s across both steps
+    assert usage["time_source"] == "step_clock"
+
+
+# --------------------------------------------------------------------------
+# Per-step snapshots for the step reward (ADR-0076)
+# --------------------------------------------------------------------------
+
+
+def test_snapshot_step_copies_a_scratch_workspace_without_installed_dirs(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "__pycache__").mkdir(parents=True)
+    (ws / ".venv" / "lib").mkdir(parents=True)
+    (ws / "main.py").write_text("print(1)\n")
+    (ws / "__pycache__" / "main.pyc").write_bytes(b"\0")
+    (ws / ".venv" / "lib" / "big.so").write_bytes(b"\0" * 10)
+    steps = tmp_path / "steps"
+    steps.mkdir()
+
+    meta = bench_run.snapshot_step(ws, steps, 1)
+
+    assert meta == {"step": 1, "kind": "snapshot", "path": "step-1.snapshot"}
+    snap = steps / "step-1.snapshot"
+    assert (snap / "main.py").read_text() == "print(1)\n"
+    assert not (snap / "__pycache__").exists()
+    assert not (snap / ".venv").exists()
+
+
+def test_snapshot_step_is_a_point_in_time_copy(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    steps = tmp_path / "steps"
+    steps.mkdir()
+    (ws / "main.py").write_text("v1\n")
+    bench_run.snapshot_step(ws, steps, 1)
+    (ws / "main.py").write_text("v2\n")
+    bench_run.snapshot_step(ws, steps, 2)
+
+    assert (steps / "step-1.snapshot" / "main.py").read_text() == "v1\n"
+    assert (steps / "step-2.snapshot" / "main.py").read_text() == "v2\n"
+
+
+def test_snapshot_step_records_a_cloned_repo_as_a_diff_with_new_files(tmp_path):
+    import subprocess
+
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    ident = ["-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    (ws / "a.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(["git", *ident, "-C", str(ws), "commit", "-qm", "base"], check=True)
+    (ws / "a.py").write_text("x = 2\n")
+    (ws / "new.py").write_text("y = 1\n")
+    steps = tmp_path / "steps"
+    steps.mkdir()
+
+    meta = bench_run.snapshot_step(ws, steps, 3)
+
+    assert meta["kind"] == "diff"
+    # The commit the diff was cut from, so the worker can rebuild this step's
+    # tree after the run even if the agent commits and moves HEAD later.
+    head = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert meta["base"] == head.stdout.strip()
+    patch = (steps / "step-3.diff").read_text()
+    assert "x = 2" in patch
+    assert "new.py" in patch
+    # The intent-to-add lived in a throwaway index: nothing is left in the
+    # agent's own index, not even an intent-to-add entry for new.py.
+    staged = subprocess.run(
+        ["git", "-C", str(ws), "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert staged.stdout == ""
+    status = subprocess.run(
+        ["git", "-C", str(ws), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "?? new.py" in status.stdout
+
+
+def test_snapshot_step_sees_a_same_size_edit_made_in_the_index_second(tmp_path):
+    """Racy git: an edit in the same second the index was written, same size.
+
+    git spots such an entry only by comparing it with the index's own mtime.
+    The snapshot copies the index to a throwaway file; a copy stamped with the
+    current time made the entry look safely old, git trusted the stale stat,
+    and the edit vanished from the step's diff — intermittently, whenever the
+    copy landed in a later second. Forced here by staging the file a minute in
+    the past and keeping the edit in that second: a copy that drops the
+    index's mtime is stamped *now*, a minute after, exactly like a snapshot
+    taken later — and git then trusts the stale stat.
+    """
+    import os
+    import subprocess
+    import time
+
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    ident = ["-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    # ctime cannot be set from Python; a second boundary crossed between two
+    # writes would expose the edit by ctime and pass the test by luck.
+    subprocess.run(
+        ["git", "-C", str(ws), "config", "core.trustctime", "false"], check=True
+    )
+    past = int(time.time()) - 60
+    (ws / "a.py").write_text("x = 1\n")
+    os.utime(ws / "a.py", (past, past))  # staged with this cached mtime
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(["git", *ident, "-C", str(ws), "commit", "-qm", "base"], check=True)
+    os.utime(ws / ".git" / "index", (past, past))  # index written that second
+    (ws / "a.py").write_text("x = 2\n")  # same size...
+    os.utime(ws / "a.py", (past, past))  # ...and the same cached mtime
+    steps = tmp_path / "steps"
+    steps.mkdir()
+
+    bench_run.snapshot_step(ws, steps, 1)
+
+    assert "x = 2" in (steps / "step-1.diff").read_text()
+
+
+def test_snapshot_step_keeps_the_agents_own_staged_changes(tmp_path):
+    """A reset of the real index between steps would drop what the agent staged."""
+    import subprocess
+
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    ident = ["-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    (ws / "a.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(["git", *ident, "-C", str(ws), "commit", "-qm", "base"], check=True)
+    (ws / "a.py").write_text("x = 2\n")
+    subprocess.run(["git", "-C", str(ws), "add", "a.py"], check=True)  # the agent's
+    steps = tmp_path / "steps"
+    steps.mkdir()
+
+    bench_run.snapshot_step(ws, steps, 1)
+
+    staged = subprocess.run(
+        ["git", "-C", str(ws), "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert staged.stdout.strip() == "a.py"
+    assert "x = 2" in (steps / "step-1.diff").read_text()
+
+
+def test_snapshot_step_never_raises_on_a_missing_workspace(tmp_path):
+    steps = tmp_path / "steps"
+    steps.mkdir()
+    assert bench_run.snapshot_step(tmp_path / "gone", steps, 1) == {
+        "step": 1,
+        "kind": "missing",
+    }
+
+
+def test_snapshot_step_records_too_large_rather_than_skipping(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "blob.bin").write_bytes(b"\0" * 64)
+    steps = tmp_path / "steps"
+    steps.mkdir()
+    monkeypatch.setattr(bench_run, "SNAPSHOT_MAX_BYTES", 10)
+
+    assert bench_run.snapshot_step(ws, steps, 1)["kind"] == "too_large"
+
+
+def test_write_step_meta_writes_one_file_per_step(tmp_path):
+    bench_run.write_step_meta(tmp_path, {"step": 2, "kind": "snapshot", "seconds": 3})
+    data = json.loads((tmp_path / "step-2.meta.json").read_text())
+    assert data == {"kind": "snapshot", "seconds": 3, "step": 2}
+
+
+def test_two_runs_never_rewrite_the_skill_views_at_once(tmp_path, monkeypatch) -> None:
+    """A parallel model comparison starts two runs over one repo (ADR-0082).
+
+    Both re-sync the lab's native skill views; interleaved, one unlinks a
+    symlink the other just made and fails with FileExistsError. The second
+    process must wait for the first to release the lock.
+    """
+    import multiprocessing
+    import threading
+    import time
+
+    lock = tmp_path / "data" / "app" / "skill-views.lock"
+    monkeypatch.setattr(bench_run, "SKILL_VIEWS_LOCK", lock)
+    held = multiprocessing.Event()
+    release = multiprocessing.Event()
+
+    def holder() -> None:
+        with bench_run._skill_views_lock():
+            held.set()
+            release.wait(5)
+
+    process = multiprocessing.get_context("fork").Process(target=holder)
+    process.start()
+    try:
+        assert held.wait(5)
+        waited = time.monotonic()
+        threading.Timer(0.3, release.set).start()
+        with bench_run._skill_views_lock():
+            assert time.monotonic() - waited >= 0.25
+        assert not lock.exists()
+    finally:
+        release.set()
+        process.join(5)
+
+
+def test_the_skill_views_lock_is_a_file_created_exclusively(
+    tmp_path, monkeypatch
+) -> None:
+    """Not flock: on Docker Desktop's bind mount it excludes nothing at all.
+
+    A run killed while holding the lock leaves the file behind, so one older
+    than the staleness bound is taken over instead of waited on forever.
+    """
+    import os
+    import time
+
+    lock = tmp_path / "data" / "app" / "skill-views.lock"
+    lock.parent.mkdir(parents=True)
+    monkeypatch.setattr(bench_run, "SKILL_VIEWS_LOCK", lock)
+    lock.write_text("12345\n")
+    old = time.time() - bench_run.SKILL_VIEWS_LOCK_STALE_SECONDS - 5
+    os.utime(lock, (old, old))
+
+    with bench_run._skill_views_lock():
+        assert lock.read_text() == f"{os.getpid()}\n"
+    assert not lock.exists()
+
+
+def test_a_run_writes_its_own_opencode_overlay(tmp_path, monkeypatch) -> None:
+    """Two runs at once must not share the provider map opencode loads.
+
+    With one lab-wide `opencode-effective.json`, a run with another direct
+    model or context window could rewrite it while the other's opencode was
+    loading it, and start on the other arm's providers.
+    """
+    from harness_lab_app import opencode_overlay
+
+    written: list = []
+
+    def build(repo_root, direct, limits, path=None):
+        written.append(path)
+        return {}, None
+
+    monkeypatch.setattr(opencode_overlay, "build_overlay", build)
+    monkeypatch.setattr(bench_run, "detected_context_windows", lambda _m: ())
+    monkeypatch.setattr(bench_run, "_ACTIVE_RUN", "chess3d-v1-K-031")
+    bench_run.apply_gateway_overlay.cache_clear()
+    try:
+        bench_run.apply_gateway_overlay(("lmstudio/x",), ())
+    finally:
+        bench_run.apply_gateway_overlay.cache_clear()
+
+    assert written == [
+        bench_run.DATA_DIR / "chess3d-v1-K-031" / "opencode-effective.json"
+    ]
+
+
+def _kept_step(steps_dir, n: int, seconds: float, kind: str = "case_step") -> None:
+    steps_dir.mkdir(parents=True, exist_ok=True)
+    (steps_dir / f"step-{n}.meta.json").write_text(
+        json.dumps(
+            {"step": n, "kind": "snapshot", "seconds": seconds, "prompt_kind": kind}
+        )
+    )
+
+
+def test_a_continuing_retry_starts_after_the_kept_steps(tmp_path) -> None:
+    """`--from-step 4` runs steps 4..max, steps 1-3 kept as they ran (ADR-0083)."""
+    import argparse
+
+    steps = tmp_path / "steps"
+    for n, seconds in ((1, 611.0), (2, 1333.0), (3, 477.0)):
+        _kept_step(steps, n, seconds, "case" if n == 1 else "case_step")
+    args = argparse.Namespace(from_step=4)
+
+    assert bench_run.kept_steps_start(args, 5, steps) == 4
+    seconds, kinds = bench_run.kept_steps_record(steps, 4)
+    assert seconds == 611.0 + 1333.0 + 477.0
+    assert kinds == ["case", "case_step", "case_step"]
+
+
+def test_a_continuing_retry_with_a_missing_step_runs_every_step(tmp_path, capsys):
+    """A gap means the early steps cannot be accounted for: start at 1, loudly."""
+    import argparse
+
+    steps = tmp_path / "steps"
+    _kept_step(steps, 1, 60.0)
+    _kept_step(steps, 3, 60.0)
+
+    assert bench_run.kept_steps_start(argparse.Namespace(from_step=4), 5, steps) == 1
+    assert "no record of step(s) 2" in capsys.readouterr().out
+
+
+def test_an_ordinary_run_starts_at_step_one(tmp_path) -> None:
+    import argparse
+
+    assert bench_run.kept_steps_start(argparse.Namespace(from_step=1), 5, tmp_path) == 1
+    assert bench_run.kept_steps_start(argparse.Namespace(), 5, tmp_path) == 1
+
+
+def test_from_step_past_the_budget_is_refused(tmp_path) -> None:
+    import argparse
+
+    with pytest.raises(SystemExit):
+        bench_run.kept_steps_start(argparse.Namespace(from_step=6), 5, tmp_path)
+
+
+def test_from_step_reaches_the_command_only_for_a_continuing_retry() -> None:
+    from harness_lab_app.runner_adapter import BenchRunAdapter
+    from harness_lab_app.schemas import RunConfigCreate
+
+    base = {"case_id": "chess3d-v1", "prompt_variant": "harness", "max_steps": 5}
+    plain = BenchRunAdapter().build_command("K-1", RunConfigCreate(**base))
+    assert "--from-step" not in plain
+    cont = BenchRunAdapter().build_command(
+        "K-1", RunConfigCreate(**base, resume=True, resume_from_step=4)
+    )
+    assert cont[cont.index("--from-step") + 1] == "4"

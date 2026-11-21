@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,8 +25,17 @@ from sqlmodel import Session, select
 
 from harness_lab_app import llm_transport, run_failures
 from harness_lab_app.audit_service import AuditService
+from harness_lab_app.case_profile import (
+    CaseProfileError,
+    agent_hidden_for,
+    play_command_for,
+    run_timeout_for,
+    runner_image_for,
+    sandbox_image_for,
+    slow_policy_for,
+)
 from harness_lab_app.case_service import CaseService, resolve_prompt_variant_text
-from harness_lab_app.celery_app import celery_app
+from harness_lab_app.celery_app import RUN_QUEUE, RUN_QUEUES, celery_app
 from harness_lab_app.config import get_settings
 from harness_lab_app.db import engine, init_db
 from harness_lab_app.executors import (
@@ -44,17 +55,39 @@ from harness_lab_app.models import (
     RunState,
     utc_now,
 )
+from harness_lab_app.phase_watch import (
+    LivePhaseGrader,
+    PhaseWatch,
+    expected_seconds,
+    phase_history,
+)
 from harness_lab_app.run_service import RunService, continuation_source_dir
 from harness_lab_app.runner_adapter import BenchRunAdapter
 from harness_lab_app.sandbox_service import SandboxService
 from harness_lab_app.schemas import RunConfigCreate
+from harness_lab_app.shared_tree import (
+    LEASE_SECONDS,
+    REFRESH_SECONDS,
+    TreeLeases,
+    redis_leases,
+    rewrites_shared_tree,
+)
 from harness_lab_app.target_service import TargetError, TargetService, clone_source
-from harness_lab_app.validation import describe_objective_for_judge
+from harness_lab_app.validation import (
+    build_validation_spec,
+    describe_objective_for_judge,
+    spec_deadline_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
+# How often a run waiting for the shared tree asks again (ADR-0082).
+SHARED_TREE_POLL_SECONDS = 15
+
 _AUDIT_TIMEOUT_SECONDS = 300
-_SANDBOX_PORTS = {"terminal": "7681/tcp", "desktop": "6080/tcp"}
+# `play` is a desktop that starts the case's own game on boot (ADR-0078): the
+# same noVNC port, a different first window.
+_SANDBOX_PORTS = {"terminal": "7681/tcp", "desktop": "6080/tcp", "play": "6080/tcp"}
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -89,9 +122,11 @@ def _config_payload(session: Session, run: Run) -> RunConfigCreate:
         harness=config.harness,
         planner_model=config.planner_model,
         executor_model=config.executor_model,
+        executor_effort=config.executor_effort,
         score_mode=config.score_mode,
         max_steps=config.max_steps,
         resume=config.resume,
+        resume_from_step=config.resume_from_step,
         dry_run=config.dry_run,
         continuation_prompt=config.continuation_prompt,
         skills_disabled=list(config.skills_disabled),
@@ -159,6 +194,25 @@ def _case_prompt_text(case: Case, prompt_variant: str) -> str:
     if resolved is not None:
         return resolved
     return case.prompt_variants.get(prompt_variant, "")
+
+
+def _phase_prompts_for_variant(case: Case, prompt_variant: str) -> list[str]:
+    """A case's later-step prompts, carrying the harness when the run's variant does.
+
+    Each step is a fresh agent session, so the harness preamble that opens the
+    ``harness`` variant's step 1 would otherwise govern only the first phase of
+    a phased case and leave every later phase to the bare task (ADR-0079). The
+    preamble is the same file ``make prompts`` builds that variant from, so the
+    two cannot drift.
+    """
+    phases = list(case.step_prompts)
+    if not phases or prompt_variant != "harness":
+        return phases
+    preamble_path = get_settings().repo_root / "benchmarks" / "_harness_preamble.md"
+    if not preamble_path.is_file():
+        return phases
+    preamble = preamble_path.read_text()
+    return [f"{preamble}\n{phase}" for phase in phases]
 
 
 def _stage_harness_adapters(
@@ -294,10 +348,17 @@ def _write_case_spec(
             "base_commit": case.base_commit or "",
             "prompt_variant": prompt_variant,
             "prompt": _case_prompt_text(case, prompt_variant),
-            "step_prompts": list(case.step_prompts),
+            "step_prompts": _phase_prompts_for_variant(case, prompt_variant),
             "max_steps": case.max_steps,
             "constraints": list(case.constraints),
             "success_criteria": dict(case.success_criteria),
+            # The starter files a bug-fix case begins from (ADR-0068).
+            "starter_dir": meta.get("starter_dir", ""),
+            # What the prompt names as the entry point; main.py when unset.
+            "entry_point": meta.get("entry_point", ""),
+            # `report`: the run is one step, measured on what it hands in
+            # (ADR-0087).
+            "deliverable": meta.get("deliverable", ""),
         }
     if target:
         # An external target repository (ADR-0029). Carried alongside the case
@@ -404,9 +465,28 @@ def _provision_pro_workspace(session: Session, run_id: str, case_id: str) -> Non
 
 
 def _cancel_requested(session: Session, run_id: str) -> bool:
+    return _run_controls(session, run_id)[0]
+
+
+def _run_controls(session: Session, run_id: str) -> tuple[bool, int]:
+    """``(cancel_requested, extra_wait_seconds)``: what a person asked of the run."""
     session.expire_all()
     run = session.exec(select(Run).where(Run.run_id == run_id)).first()
-    return bool(run and run.cancel_requested)
+    if run is None:
+        return False, 0
+    return bool(run.cancel_requested), int(run.extra_wait_seconds or 0)
+
+
+# `--- Step 3/5 ---`: bench_run's marker for the start of a step.
+_STEP_MARKER_RE = re.compile(r"---\s*Step\s+(\d+)/(\d+)\s*---")
+
+
+def _wall_clock() -> float:
+    """Seconds since the epoch: the clock every run budget is measured on.
+
+    A function rather than a bare ``time.time`` so tests can drive it.
+    """
+    return time.time()
 
 
 def _drain(handle: RunHandle, lines: Queue[tuple[str, str] | None]) -> None:
@@ -422,8 +502,8 @@ class StreamOutcome:
     """Why streaming ended, and what the run last said before it did."""
 
     # None when the process ended on its own; otherwise "cancelled", "timeout",
-    # "stalled", "model_silent" or "endpoint". At most one applies — the loop
-    # stops the handle on the first one it sees.
+    # "stalled", "model_silent", "endpoint", "slow_phase" or "lease_lost". At
+    # most one applies — the loop stops the handle on the first one it sees.
     stop_reason: str | None
     tail: deque[str]
     # Seconds of silence when the run was stopped. Only meaningful for the two
@@ -451,8 +531,19 @@ def _stream_run(
     model_wait_seconds: int = 0,
     max_stream_errors: int = 0,
     harness: str = "",
+    phase_watch: PhaseWatch | None = None,
+    live_grader: LivePhaseGrader | None = None,
+    lease_lost: threading.Event | None = None,
 ) -> StreamOutcome:
     """Persist run output as RunEvents; watch for the four ways a run goes bad.
+
+    ``lease_lost`` is set by the shared-tree lease keeper (ADR-0082) when the
+    run no longer holds the tree; the run is then stopped (``lease_lost``).
+
+    ``phase_watch`` adds a fifth, per phase rather than per run: a phase past
+    its expected time is flagged for a person to decide on, and stopped only
+    when nobody does (``slow_phase``). ``live_grader`` grades each phase as it
+    finishes. Both are optional, so a single-step case is watched as before.
 
     ``stall_seconds`` catches the failure ``timeout_seconds`` structurally
     cannot: a run that is not slow but *stuck*, producing nothing while its
@@ -489,16 +580,31 @@ def _stream_run(
     failed_requests = 0
     awaiting_model = False
     stopped = False
-    started = time.monotonic()
+    step: int | None = None
+    step_started: float | None = None
+    extra_wait = 0
+    # Wall-clock time, not `time.monotonic()`: the worker runs in Docker
+    # Desktop's VM, whose monotonic clock stops while the host sleeps. A run
+    # that spanned three hours of a laptop's sleep was measured at 28% of its
+    # real length and outlived its two-hour budget by three hours
+    # (racing3d-v1-K-001). Sleeping time is time the operator waited too.
+    started = _wall_clock()
     last_output = started
     last_cancel_check = 0.0
     while True:
-        now = time.monotonic()
+        now = _wall_clock()
         if stop_reason is None:
             if now - last_cancel_check >= 1.0:
                 last_cancel_check = now
-                if _cancel_requested(session, run_id):
+                cancelled, extra_wait = _run_controls(session, run_id)
+                if cancelled:
                     stop_reason = "cancelled"
+                elif lease_lost is not None and lease_lost.is_set():
+                    stop_reason = "lease_lost"
+                elif phase_watch is not None:
+                    stop_reason = phase_watch.tick(step, step_started, extra_wait, now)
+                if live_grader is not None:
+                    live_grader.poll()
             if stop_reason is None and now - started >= timeout_seconds:
                 stop_reason = "timeout"
             if stop_reason is None:
@@ -527,13 +633,16 @@ def _stream_run(
             break
         # Any output at all resets the stall clock, including the blank lines
         # dropped just below — a run that is talking is a run that is alive.
-        last_output = time.monotonic()
+        last_output = _wall_clock()
         level, message = item
         if not message:
             continue
         session.add(RunEvent(run_id=run_id, level=level, message=message))
         session.commit()
         tail.append(message)
+        marker = _STEP_MARKER_RE.search(message)
+        if marker is not None:
+            step, step_started = int(marker.group(1)), last_output
         awaiting_model = run_failures.awaits_model_response(message, harness)
         if run_failures.is_model_request(message, harness):
             model_requests += 1
@@ -701,15 +810,85 @@ def _watchdog_failure(outcome: StreamOutcome, settings: Any, tail: str) -> str:
         )
     if outcome.stop_reason == "endpoint":
         return _endpoint_failure(outcome, tail)
+    if outcome.stop_reason == "lease_lost":
+        return _with_tail(
+            "Shared-tree lease lost: the lab could not keep its hold on the skill "
+            "catalog (ADR-0082), so another run may have rewritten it under this "
+            "one. Stopped rather than measured; retry it.",
+            tail,
+            "Last output:",
+        )
+    if outcome.stop_reason == "slow_phase":
+        return _with_tail(
+            "Phase too slow: it ran past its expected time, nobody chose to keep "
+            "waiting within the grace period, and the case's policy is to stop. "
+            "The work it left was graded. Raise the case's phase_budget_minutes, "
+            "or keep waiting from the run page next time.",
+            tail,
+            "Last output:",
+        )
     return f"Run timed out after {settings.run_timeout_seconds}s"
 
 
+def _case_agent_machine(session: Session, case_id: str) -> tuple[str, list[str]]:
+    """The image a case's agent runs in and the grading it must not read.
+
+    The image is the case's own (ADR-0078) or ``""``; the hidden paths are the
+    case's ``agent_hidden`` (ADR-0079), to which the executor adds the lab-wide
+    calibration references. A case naming something the lab refuses fails the
+    run here, before a container starts, with the reason — never a silent fall
+    back, which would grade a Godot case in a runner that has no Godot, or let
+    an agent read the grader it was told was hidden.
+    """
+    try:
+        case = CaseService(session).get_case(case_id)
+    except ValueError:
+        # No case row. The runner can still load the case from its
+        # `task.yaml`, so a case that declares its own machine there must not
+        # fall back to the shared one: that would run a Godot case without
+        # Godot, and leave its grader readable (fail closed, not open).
+        if _task_declares_own_machine(case_id):
+            raise RuntimeError(
+                f"Case {case_id} declares its own image or hidden grading in "
+                "task.yaml but is not in the database; import it (restart the "
+                "API, or POST /api/cases/seed) before running it."
+            ) from None
+        return "", []
+    try:
+        return runner_image_for(case), agent_hidden_for(case)
+    except CaseProfileError as exc:
+        raise RuntimeError(f"Case {case_id}: {exc}") from exc
+
+
+def _task_declares_own_machine(case_id: str) -> bool:
+    """Whether ``benchmarks/<case_id>/task.yaml`` names an image or hidden paths."""
+    import yaml
+
+    benchmarks = getattr(get_settings(), "benchmarks_dir", None)
+    if benchmarks is None:
+        return False
+    task = Path(benchmarks) / case_id / "task.yaml"
+    if not task.is_file():
+        return False
+    try:
+        raw = yaml.safe_load(task.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        # Unreadable: the runner will not load it either, so nothing leaks.
+        return False
+    return isinstance(raw, dict) and bool(
+        raw.get("runner_image") or raw.get("agent_hidden")
+    )
+
+
 def _execute_run_body(
-    run_id: str, executor: RunExecutor, db_engine: Engine | None = None
+    run_id: str,
+    executor: RunExecutor,
+    db_engine: Engine | None = None,
+    *,
+    lane: str = RUN_QUEUE,
+    leases: TreeLeases | None = None,
 ) -> None:
-    settings = get_settings()
     with Session(db_engine if db_engine is not None else engine) as session:
-        service = RunService(session)
         run = session.exec(select(Run).where(Run.run_id == run_id)).first()
         if run is None:
             return
@@ -723,114 +902,372 @@ def _execute_run_body(
             )
             session.commit()
             return
-
-        service.mark_running(run_id)
+        if leases is None:
+            _execute_pending_run(session, run, executor, lane)
+            return
+        exclusive = rewrites_shared_tree(_config_payload(session, run))
+        if not _wait_for_shared_tree(session, run_id, leases, exclusive):
+            # Cancelled while waiting: give back the waiting place, or new
+            # shared runs stay blocked behind a run that will never start.
+            with contextlib.suppress(Exception):
+                leases.release(run_id, exclusive)
+            return
+        stop = threading.Event()
+        lost = threading.Event()
+        keeper = threading.Thread(
+            target=_keep_lease,
+            args=(leases, run_id, exclusive, stop, lost),
+            name=f"lease-{run_id}",
+            daemon=True,
+        )
+        keeper.start()
         try:
-            # Rebuild the command at execution time; the stored Run.command is
-            # only a preview and may predate config/adapter changes.
-            config_payload = _config_payload(session, run)
-            command = BenchRunAdapter().build_command(run_id, config_payload)
-            run.command = command
-            session.add(run)
-            session.commit()
+            _execute_pending_run(session, run, executor, lane, lease_lost=lost)
+        finally:
+            stop.set()
+            with contextlib.suppress(Exception):
+                leases.release(run_id, exclusive)
 
-            # A continuation starts from its parent's final state, so seed the
-            # workspace before anything else touches it (ADR-0026).
-            if run.parent_run_id:
-                _seed_continuation_workspace(run_id, run.parent_run_id)
 
-            # Stage repo-task provisioning data for the container (no-op for
-            # non-repo cases like Tetris).
-            _write_case_spec(
-                session,
-                run_id,
-                config_payload.case_id,
-                config_payload.prompt_variant,
-                continuation_prompt=config_payload.continuation_prompt,
-                parent_run_id=run.parent_run_id,
-                target=_target_spec(session, run),
-                harness_source=str(config_payload.harness_source),
-            )
-            # Pro lane only: image-based provisioning needs docker, which the
-            # runner lacks — do it here before the container starts. Skipped for
-            # a continuation: the workspace it would build is the one we just
-            # seeded, and rebuilding it would discard the parent's work.
-            if not run.parent_run_id:
-                _provision_pro_workspace(session, run_id, config_payload.case_id)
+def _execute_pending_run(
+    session: Session,
+    run: Run,
+    executor: RunExecutor,
+    lane: str,
+    lease_lost: threading.Event | None = None,
+) -> None:
+    settings = get_settings()
+    run_id = run.run_id
+    service = RunService(session)
+    claimed = service.claim_pending(run_id, lane=lane)
+    if claimed is None:
+        # Cancelled (or taken by another delivery) since the worker read it.
+        # Nothing has started, so there is nothing to stop or to record.
+        session.expire_all()
+        return
+    run = claimed
+    try:
+        # Rebuild the command at execution time; the stored Run.command is
+        # only a preview and may predate config/adapter changes.
+        config_payload = _config_payload(session, run)
+        command = BenchRunAdapter().build_command(run_id, config_payload)
+        run.command = command
+        session.add(run)
+        session.commit()
 
-            # How much of the lab's own governance the container hides
-            # (ADR-0049). The keyword is passed only when there is something to
-            # hide, so an unmasked run reaches the executor exactly as before.
-            mask = GOVERNANCE_MASK_FOR_SOURCE.get(
-                config_payload.harness_source, GOVERNANCE_MASK_NONE
+        # A continuation starts from its parent's final state, so seed the
+        # workspace before anything else touches it (ADR-0026).
+        if run.parent_run_id:
+            _seed_continuation_workspace(run_id, run.parent_run_id)
+
+        # Stage repo-task provisioning data for the container (no-op for
+        # non-repo cases like Tetris).
+        _write_case_spec(
+            session,
+            run_id,
+            config_payload.case_id,
+            config_payload.prompt_variant,
+            continuation_prompt=config_payload.continuation_prompt,
+            parent_run_id=run.parent_run_id,
+            target=_target_spec(session, run),
+            harness_source=str(config_payload.harness_source),
+        )
+        # Pro lane only: image-based provisioning needs docker, which the
+        # runner lacks — do it here before the container starts. Skipped for
+        # a continuation: the workspace it would build is the one we just
+        # seeded, and rebuilding it would discard the parent's work.
+        if not run.parent_run_id:
+            _provision_pro_workspace(session, run_id, config_payload.case_id)
+
+        # How much of the lab's own governance the container hides
+        # (ADR-0049). The keyword is passed only when there is something to
+        # hide, so an unmasked run reaches the executor exactly as before.
+        mask = GOVERNANCE_MASK_FOR_SOURCE.get(
+            config_payload.harness_source, GOVERNANCE_MASK_NONE
+        )
+        # An injected arm has to read the very adapter files that mask
+        # hides, so the worker — which is not masked — stages them where
+        # the runner can still reach them.
+        _stage_harness_adapters(run_id, config_payload.harness_source, mask)
+        # The mask and the image are passed only when there is something to
+        # pass; `hidden` always is, because the agent's container is the one
+        # container the calibration references must never reach.
+        options: dict[str, Any] = {}
+        if mask != GOVERNANCE_MASK_NONE:
+            options["governance_mask"] = mask
+        # The harness decides which skill mirror stays visible in the runner
+        # and, for codex/gemini, which provider session is mounted (ADR-0094).
+        # Passed only when set, so every existing call shape is unchanged.
+        if config_payload.harness:
+            options["harness"] = config_payload.harness
+        image, hidden = _case_agent_machine(session, config_payload.case_id)
+        if image:
+            options["image"] = image
+        # Always passed for the agent's container — even empty, the lab's
+        # calibration references are masked out of it (ADR-0079).
+        options["hidden"] = hidden
+        # Its own folder, read-only, when the case is an authored benchmark
+        # (ADR-0087).
+        benchmarks = getattr(settings, "benchmarks_dir", None)
+        if (
+            benchmarks is not None
+            and (Path(benchmarks) / config_payload.case_id / "task.yaml").is_file()
+        ):
+            options["case_dir"] = f"benchmarks/{config_payload.case_id}"
+        handle = executor.start(run_id, command, **options)
+        phase_watch, live_grader = _phase_supervision(
+            session,
+            run_id,
+            config_payload.case_id,
+            config_payload.max_steps,
+            settings,
+        )
+        # A paced case may need more than the lab's default total: its
+        # phases are watched one by one, and this is only the ceiling.
+        run_timeout = settings.run_timeout_seconds
+        with contextlib.suppress(ValueError):
+            run_timeout = run_timeout_for(
+                CaseService(session).get_case(config_payload.case_id), run_timeout
             )
-            # An injected arm has to read the very adapter files that mask
-            # hides, so the worker — which is not masked — stages them where
-            # the runner can still reach them.
-            _stage_harness_adapters(run_id, config_payload.harness_source, mask)
-            handle = (
-                executor.start(run_id, command)
-                if mask == GOVERNANCE_MASK_NONE
-                else executor.start(run_id, command, governance_mask=mask)
-            )
+        try:
             outcome = _stream_run(
                 session,
                 run_id,
                 handle,
-                settings.run_timeout_seconds,
+                run_timeout,
                 getattr(settings, "run_stall_seconds", 0),
                 getattr(settings, "run_model_wait_seconds", 0),
                 getattr(settings, "run_max_stream_errors", 0),
                 harness=str(config_payload.harness or ""),
+                phase_watch=phase_watch,
+                live_grader=live_grader,
+                lease_lost=lease_lost,
             )
-            exit_code = _wait_bounded(handle, settings.run_timeout_seconds + 60)
-            if outcome.stop_reason == "cancelled":
-                service.mark_cancelled(run_id, exit_code)
-            elif outcome.stop_reason is not None:
-                service.mark_finished(
-                    run_id,
-                    exit_code if exit_code != 0 else -1,
-                    _watchdog_failure(
-                        outcome, settings, "\n".join(outcome.tail)[-600:]
-                    ),
-                )
-            else:
-                failure = None
-                if _model_never_answered(outcome):
-                    # Checked before the exit code: a clean exit earned by
-                    # archiving an empty result is still not a measurement.
-                    failure = _never_answered_failure(
-                        outcome, "\n".join(outcome.tail)[-600:]
+        finally:
+            if phase_watch is not None:
+                phase_watch.close()
+            if live_grader is not None:
+                # A grade in flight finishes before the final validation,
+                # which reinstalls the same dependency folder and regrades
+                # the same snapshots. Bounded by the longest a pass can
+                # take (every command at its own deadline), so it waits
+                # out a slow Godot harvest yet never holds the run forever.
+                deadline = _live_grade_deadline(session, run_id, config_payload.case_id)
+                if not live_grader.join(timeout=deadline):
+                    logger.warning(
+                        "Live grade of %s still running after %ss; final "
+                        "validation starts anyway",
+                        run_id,
+                        deadline,
                     )
-                elif exit_code != 0:
-                    failure = (
-                        "\n".join(outcome.tail)[-1000:] or "Run failed with no output"
-                    )
-                service.mark_finished(
-                    run_id,
-                    exit_code if failure is None or exit_code != 0 else -1,
-                    failure,
+        exit_code = _wait_bounded(handle, run_timeout + 60)
+        if outcome.stop_reason == "cancelled":
+            service.mark_cancelled(run_id, exit_code)
+            if _cut_measures_the_agent(outcome.stop_reason):
+                _grade_what_was_left(session, run_id, "cancelled")
+        elif outcome.stop_reason is not None:
+            service.mark_finished(
+                run_id,
+                exit_code if exit_code != 0 else -1,
+                _watchdog_failure(outcome, settings, "\n".join(outcome.tail)[-600:]),
+            )
+            # A run cut for time still built something, and the work it
+            # left is graded rather than thrown away. A run cut because the
+            # model never answered measured nothing and is not graded.
+            if _cut_measures_the_agent(outcome.stop_reason):
+                _grade_what_was_left(session, run_id, outcome.stop_reason)
+        else:
+            failure = None
+            if _model_never_answered(outcome):
+                # Checked before the exit code: a clean exit earned by
+                # archiving an empty result is still not a measurement.
+                failure = _never_answered_failure(
+                    outcome, "\n".join(outcome.tail)[-600:]
                 )
-                if failure is None:
-                    _run_objective_validation(session, run_id)
-                    _autoscore_run(session, run_id)
-            # Attribution is useful for any run that produced step logs
-            # (including cancelled/failed), so index it regardless of outcome.
-            _index_attribution(session, run_id)
-            _index_artifacts(session, run_id)
-            _check_harness_provenance(session, run_id)
-            # Scored for every terminal run, not only successful ones: a run
-            # that failed still spent tokens and produced a diff, and excluding
-            # it would make cost aggregates describe only the runs that worked.
-            _record_scores(session, run_id)
-            # Every terminal run, whatever its verdict: an experiment closes on
-            # its last run stopping, not on its last run succeeding.
-            _close_experiment_for_run(session, run_id)
-            # Last, and outside every branch: a failed run is exactly the one
-            # an operator wants to open in Langfuse.
-            _export_langfuse_traces(session, run_id)
-        except Exception as exc:
-            service.mark_finished(run_id, -1, f"Executor error: {exc!r}")
+            elif exit_code != 0:
+                failure = "\n".join(outcome.tail)[-1000:] or "Run failed with no output"
+            service.mark_finished(
+                run_id,
+                exit_code if failure is None or exit_code != 0 else -1,
+                failure,
+            )
+            if failure is None:
+                _run_objective_validation(session, run_id)
+                _autoscore_run(session, run_id)
+                _run_step_validation(session, run_id)
+        # Attribution is useful for any run that produced step logs
+        # (including cancelled/failed), so index it regardless of outcome.
+        _index_attribution(session, run_id)
+        _index_artifacts(session, run_id)
+        _check_harness_provenance(session, run_id)
+        # Scored for every terminal run, not only successful ones: a run
+        # that failed still spent tokens and produced a diff, and excluding
+        # it would make cost aggregates describe only the runs that worked.
+        _record_scores(session, run_id)
+        # Every terminal run, whatever its verdict: an experiment closes on
+        # its last run stopping, not on its last run succeeding.
+        _close_experiment_for_run(session, run_id)
+        # Last, and outside every branch: a failed run is exactly the one
+        # an operator wants to open in Langfuse.
+        _export_langfuse_traces(session, run_id)
+    except Exception as exc:
+        service.mark_finished(run_id, -1, f"Executor error: {exc!r}")
+
+
+def _phase_supervision(
+    session: Session, run_id: str, case_id: str, max_steps: int, settings: Any
+) -> tuple[PhaseWatch | None, LivePhaseGrader | None]:
+    """The phase watch and the live grader for a multi-step run, or ``(None, None)``.
+
+    A single-step run has no phases to watch: its total and silence budgets
+    are the whole supervision, as before.
+    """
+    if int(max_steps or 1) <= 1:
+        return None, None
+    run_dir = settings.data_runs_dir / run_id
+    floor = int(getattr(settings, "run_phase_floor_seconds", 0) or 0)
+    budget_minutes: int | None = None
+    on_slow = "stop"
+    with contextlib.suppress(ValueError, CaseProfileError):
+        budget_minutes, on_slow = slow_policy_for(
+            CaseService(session).get_case(case_id)
+        )
+    watch: PhaseWatch | None = None
+    if floor > 0 or budget_minutes:
+        history = phase_history(settings.data_runs_dir, case_id, run_id)
+
+        def budget_for(step: int) -> int:
+            return expected_seconds(
+                step,
+                case_budget_minutes=budget_minutes,
+                history=history,
+                floor_seconds=floor,
+            )
+
+        def flag(message: str) -> None:
+            # Its own session: the watchdog's is mid-loop and must stay clean.
+            with Session(session.get_bind()) as own:
+                own.add(RunEvent(run_id=run_id, level="warning", message=message))
+                own.commit()
+
+        watch = PhaseWatch(
+            run_dir=run_dir,
+            budget_for=budget_for,
+            grace_seconds=int(getattr(settings, "run_slow_grace_seconds", 900) or 0),
+            on_slow=on_slow,
+            on_flag=flag,
+        )
+
+    def grade(step: int, first: bool) -> dict[str, Any] | None:
+        from harness_lab_app.validation_service import ValidationService
+
+        # A thread of its own needs a session of its own.
+        with Session(session.get_bind()) as own:
+            return ValidationService(own).grade_step_live(
+                run_id, step, install_deps=first
+            )
+
+    return watch, LivePhaseGrader(run_dir, grade)
+
+
+# What a live grade is waited for when the case cannot be read: the default
+# deadline of one command, the floor below which no grade can finish.
+_LIVE_GRADE_FALLBACK_SECONDS = 900
+
+
+def _live_grade_deadline(session: Session, run_id: str, case_id: str) -> int:
+    """How long the final validation waits for a live grade still in flight.
+
+    A live grade is one pass over the case's validation spec (setup included,
+    the first time), so its longest possible run is the sum of its commands'
+    deadlines. A shorter fixed wait let the final validation start beside a
+    Godot harvest allowed 900 seconds, on the same dependency folder.
+    """
+    try:
+        case = CaseService(session).get_case(case_id)
+        return max(
+            _LIVE_GRADE_FALLBACK_SECONDS,
+            spec_deadline_seconds(build_validation_spec(case, run_id)),
+        )
+    except Exception:  # a wait bound must never fail the run
+        return _LIVE_GRADE_FALLBACK_SECONDS
+
+
+# Cuts after which the agent's work is still evidence about the agent: it was
+# working, and was stopped for taking too long or by a person. The other two
+# watchdog verdicts — the model never answered, the endpoint kept refusing —
+# measured nothing, so there is nothing of the agent's to grade.
+_GRADED_CUTS = frozenset({"timeout", "stalled", "slow_phase", "cancelled"})
+
+
+def _cut_measures_the_agent(stop_reason: str | None) -> bool:
+    return stop_reason in _GRADED_CUTS
+
+
+def _archive_cut_workspace(run_id: str) -> bool:
+    """Archive a stopped run's live workspace where validation looks for it.
+
+    ``bench_run`` archives the workspace in its last phase, which a stopped
+    container never reaches: the work stays in ``workspace/<run_id>/``. Copying
+    it to ``data/runs/<run_id>/workspace`` gives the cut run the same archive a
+    finished one has, so its grade, its Play tab and a continuation all find it.
+    The live copy is left in place; the next managed run resets it.
+    """
+    settings = get_settings()
+    live = settings.workspace_dir / run_id
+    archived = settings.data_runs_dir / run_id / "workspace"
+    if not live.is_dir() or not any(live.iterdir()):
+        # Nothing live: whatever was archived (a run that finished cleanly)
+        # is the work, and is graded as it is.
+        return archived.is_dir()
+    # The live tree is the run's latest state and replaces any archive. A
+    # retry resumes on the same workspace while the archive still holds the
+    # attempt before it: racing3d-v1-K-001's retry built a full game over
+    # five phases, and its archive was the two files the first attempt left
+    # when the network dropped. Copied to a sibling first, so a failed copy
+    # never leaves the run with no archive at all.
+    archived.parent.mkdir(parents=True, exist_ok=True)
+    staging = archived.with_name("workspace.cut-tmp")
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(live, staging, symlinks=True, ignore_dangling_symlinks=True)
+    if archived.exists():
+        shutil.rmtree(archived)
+    staging.rename(archived)
+    return True
+
+
+def _grade_what_was_left(session: Session, run_id: str, reason: str) -> None:
+    """Grade a run that was cut short on the work it had done (best-effort).
+
+    The verdict stays the cut — the run is ``failed`` with its reason — and the
+    grade sits beside it, so a run stopped at phase 4 of 5 shows what phases 1
+    to 3 achieved instead of nothing at all.
+    """
+    try:
+        if not _archive_cut_workspace(run_id):
+            return
+        session.add(
+            RunEvent(
+                run_id=run_id,
+                level="info",
+                message=f"Run cut ({reason}): grading the work it left.",
+            )
+        )
+        session.commit()
+    except Exception as exc:  # grading a cut run must never fail the run
+        session.rollback()
+        session.add(
+            RunEvent(
+                run_id=run_id,
+                level="warning",
+                message=f"Could not archive the cut run's workspace: {exc!r}",
+            )
+        )
+        session.commit()
+        return
+    _run_objective_validation(session, run_id)
+    _run_step_validation(session, run_id)
 
 
 def _index_artifacts(session: Session, run_id: str) -> None:
@@ -1301,10 +1738,144 @@ def _run_objective_validation(session: Session, run_id: str) -> None:
         session.commit()
 
 
-@celery_app.task(name="harness_lab_app.tasks.execute_run", acks_late=True)
-def execute_run(run_id: str) -> None:
+def _run_step_validation(session: Session, run_id: str) -> None:
+    """Grade every step's snapshot with the case's checks (ADR-0076).
+
+    After the final validation, which installed the graders' dependencies the
+    per-step pass reuses, and before scoring, which reads the trajectory.
+    Best-effort like every post-run step: a run with no reward curve is a run
+    with a gap in a chart, never a failed run.
+    """
+    from harness_lab_app.validation_service import ValidationService
+
+    try:
+        ValidationService(session).validate_steps(run_id)
+    except Exception as exc:  # the step reward must never fail the run
+        session.rollback()
+        session.add(
+            RunEvent(
+                run_id=run_id,
+                level="warning",
+                message=f"Per-step reward could not be computed: {exc!r}",
+            )
+        )
+        session.commit()
+
+
+@celery_app.task(name="harness_lab_app.tasks.execute_run", acks_late=True, bind=True)
+def execute_run(self: Any, run_id: str) -> None:
     init_db()
-    _execute_run_body(run_id, get_executor())
+    lane = str((self.request.delivery_info or {}).get("routing_key") or RUN_QUEUE)
+    leases: TreeLeases
+    try:
+        leases = redis_leases(get_settings().redis_url)
+    except Exception as exc:
+        # Fail closed (ADR-0082): a store that cannot even be built is an
+        # outage, and the run waits `pending` like it would for a Redis that
+        # does not answer, rather than running with no lease at all.
+        leases = _UnavailableLeases(exc)
+    _execute_run_body(run_id, get_executor(), lane=lane, leases=leases)
+
+
+class _UnavailableLeases:
+    """A lease store that could not be built: every call is the outage."""
+
+    def __init__(self, cause: Exception) -> None:
+        self._cause = cause
+
+    def try_acquire(self, run_id: str, exclusive: bool) -> str | None:  # noqa: ARG002
+        raise ConnectionError(f"lease store unavailable: {self._cause!r}")
+
+    def refresh(self, run_id: str, exclusive: bool) -> bool:  # noqa: ARG002
+        raise ConnectionError(f"lease store unavailable: {self._cause!r}")
+
+    def release(self, run_id: str, exclusive: bool) -> None:  # noqa: ARG002
+        return None
+
+
+def _wait_for_shared_tree(
+    session: Session, run_id: str, leases: TreeLeases, exclusive: bool
+) -> bool:
+    """Hold the run until it may use the lab's shared tree (ADR-0082).
+
+    The run stays ``pending`` while it waits, so it reads as queued and can be
+    cancelled. False when it was cancelled meanwhile. A lease store that fails
+    is waited out the same way: running without the lease is exactly what lets
+    an ablation rewrite the catalog under a model comparison on the other lane,
+    and a measurement that may be corrupt is worse than one that starts late.
+    """
+    announced = False
+    store_down = False
+    while True:
+        try:
+            holder = leases.try_acquire(run_id, exclusive)
+        except Exception as exc:
+            if not store_down:
+                session.add(
+                    RunEvent(
+                        run_id=run_id,
+                        level="warning",
+                        message="Shared-tree lease store unavailable, so the run "
+                        f"waits until it answers: {exc!r}",
+                    )
+                )
+                session.commit()
+                store_down = True
+            holder = ""
+        else:
+            store_down = False
+        if holder is None:
+            return True
+        if holder and not announced:
+            what = (
+                "This run changes the skill catalog, so it waits for"
+                if exclusive
+                else "A run that changes the skill catalog is using or waiting for"
+            )
+            session.add(
+                RunEvent(
+                    run_id=run_id,
+                    message=f"{what} the lab's shared tree ({holder}); "
+                    "it starts when that is free.",
+                )
+            )
+            session.commit()
+            announced = True
+        time.sleep(SHARED_TREE_POLL_SECONDS)
+        session.expire_all()
+        run = session.exec(select(Run).where(Run.run_id == run_id)).first()
+        if run is None or run.state != RunState.pending:
+            return False
+
+
+def _keep_lease(
+    leases: TreeLeases,
+    run_id: str,
+    exclusive: bool,
+    stop: threading.Event,
+    lost: threading.Event,
+) -> None:
+    """Refresh the run's lease until it ends; a killed worker's lease lapses.
+
+    Sets ``lost`` when the lease can no longer be vouched for: the store says
+    it is gone, or no refresh has succeeded for a lease period less one refresh
+    period. Redis expires the lease a full period after the last refresh it
+    saw, so giving it up one refresh early stops the run before another can
+    take the tree. One missed refresh is tolerated, so a blip does not kill a
+    run. The supervision loop stops a run whose lease is lost.
+    """
+    last_ok = time.monotonic()
+    while not stop.wait(REFRESH_SECONDS):
+        try:
+            held = leases.refresh(run_id, exclusive)
+        except Exception:
+            if time.monotonic() - last_ok < LEASE_SECONDS - REFRESH_SECONDS:
+                continue
+            held = False
+        if not held:
+            lost.set()
+            return
+        last_ok = time.monotonic()
 
 
 @celery_app.task(name="harness_lab_app.tasks.validate_run", acks_late=True)
@@ -1316,6 +1887,9 @@ def validate_run(run_id: str) -> None:
         # Re-validate also completes SWE-bench runs that were parked awaiting a
         # manual score before auto-scoring existed (or whose validation ran late).
         _autoscore_run(session, run_id)
+        # The per-step reward re-grades the snapshots too, so a re-validate
+        # after a grader fix refreshes the curve along with the verdict.
+        _run_step_validation(session, run_id)
         # Scores come after validation because they read its verdict, cost and
         # effort; re-scoring overwrites in place, so a re-validate refreshes
         # them rather than accumulating contradictions.
@@ -1515,6 +2089,8 @@ def audit_run(run_id: str, auditor_model: str | None = None) -> None:
     if auditor_model:
         command += ["--auditor-model", auditor_model]
     env = {**os.environ, **build_run_environment()}
+    # Not a runner container: the marker only belongs to the agent lane.
+    env.pop("HARNESS_LAB_IN_RUNNER", None)
 
     try:
         result = subprocess.run(
@@ -1748,10 +2324,15 @@ def _audit_repository_body(
             f"{evidence.get('health_at_pin', {}).get('status', 'unmeasured')}",
         )
 
+        # What actually served each pass. The Claude CLI ignores the requested
+        # temperature and answers a model name it cannot serve with its own
+        # default, so the request alone is not a record of the instrument.
+        served: list[llm_transport.ChatReply] = []
+
         def call(m: str, sys_: str, user: str, *, pass_number: int) -> str:
             if gateway is not None:
                 return gateway(m, sys_, user)
-            return llm_transport.chat(
+            reply = llm_transport.chat_reply(
                 m,
                 sys_,
                 user,
@@ -1764,6 +2345,8 @@ def _audit_repository_body(
                     "pass": pass_number,
                 },
             )
+            served.append(reply)
+            return reply.text
 
         raw_map = call(
             model, COMPONENT_MAP_PROMPT, render_audit_prompt(evidence), pass_number=1
@@ -1818,16 +2401,40 @@ def _audit_repository_body(
         plan = plan_cases(kept, capabilities)
         evidence = apply_case_plan(evidence, plan)
         _log_case_plan(session, target_id, evidence, plan)
-        markdown = render_markdown(findings, evidence, model=model, raw=raw)
+        recorded_model = _served_model(model, served)
+        if served:
+            evidence["llm"] = [reply.provenance() for reply in served]
+        markdown = render_markdown(findings, evidence, model=recorded_model, raw=raw)
         service.store_result(
             target_id,
             markdown=markdown,
             findings=findings,
             evidence=evidence,
-            model=model,
+            model=recorded_model,
         )
     except Exception as exc:  # the reading is optional; the record says why
         service.store_error(target_id, f"{type(exc).__name__}: {exc}")
+
+
+def _served_model(requested: str, served: list[llm_transport.ChatReply]) -> str:
+    """The model to file an audit under: what answered, not what was asked.
+
+    The requested name when nothing else is known (an injected gateway in a
+    test) or when it is what answered. When the transport substituted another
+    model, the record names it and keeps the request beside it, so an audit
+    filed as `gpt-5.4-mini` cannot turn out to have been read by Sonnet. When
+    a pass reached a model that reported nothing (a CLI too old to report
+    usage, sent a name it cannot serve), that is said too: the request is the
+    one model it certainly was not.
+    """
+    if not served:
+        return requested
+    effective = sorted({reply.model for reply in served if reply.model})
+    if any(not reply.model for reply in served):
+        effective.append("unknown")
+    if effective == [requested]:
+        return requested
+    return f"{', '.join(effective)} (requested {requested})"
 
 
 def _health_at_pin(target: TargetRepository) -> dict[str, Any]:
@@ -1955,6 +2562,8 @@ def improve_run(
     if strictness:
         command += ["--strictness", strictness]
     env = {**os.environ, **build_run_environment()}
+    # Not a runner container: the marker only belongs to the agent lane.
+    env.pop("HARNESS_LAB_IN_RUNNER", None)
 
     try:
         result = subprocess.run(
@@ -1984,13 +2593,46 @@ def _sandbox_container_name(run_id: str, kind: str) -> str:
     return f"harness-sandbox-{kind}-{safe}"
 
 
-def _launch_sandbox(client: Any, run_id: str, kind: str) -> tuple[str, int, str]:
+def _sandbox_profile(run_id: str) -> tuple[str, str]:
+    """The run's case's sandbox image and play command (ADR-0078).
+
+    Read from the database by the run's config, so the same run always opens
+    in the image its case names now. Empty strings mean the shared image and
+    no game to launch.
+    """
+    with Session(engine) as session:
+        service = RunService(session)
+        try:
+            config = service.get_run_config(service.get_run(run_id).run_config_id)
+            case = CaseService(session).get_case(config.case_id)
+        except ValueError:
+            return "", ""
+        return sandbox_image_for(case), play_command_for(case)
+
+
+def _launch_sandbox(
+    client: Any,
+    run_id: str,
+    kind: str,
+    profile: tuple[str, str] = ("", ""),
+) -> tuple[str, int, str]:
     """Copy the run's workspace and launch a sandbox container (worker-side).
 
     Returns (container_name, host_port, url). The bind mount uses the HOST path
     (docker-out-of-docker), and the port is docker-assigned then read back.
+
+    ``profile`` is the case's ``(sandbox_image, play_command)`` as
+    :func:`_sandbox_profile` resolved it; empty strings mean the shared image
+    and no game. Passed in rather than read here, so this stays a Docker-only
+    function that needs no database (ADR-0078).
     """
     settings = get_settings()
+    image, play_command = profile
+    image = image or settings.sandbox_image
+    if kind == "play" and not play_command:
+        raise RuntimeError(
+            "This case declares no play_command, so there is no game to launch."
+        )
     host_repo_root = settings.host_repo_root or str(settings.repo_root)
     workspace = settings.data_runs_dir / run_id / "workspace"
     if not workspace.exists():
@@ -2009,11 +2651,15 @@ def _launch_sandbox(client: Any, run_id: str, kind: str) -> tuple[str, int, str]
         client.containers.get(name).remove(force=True)
 
     port_key = _SANDBOX_PORTS[kind]
+    environment = {"MODE": "desktop" if kind == "play" else kind}
+    if kind == "play":
+        # Launched by the entrypoint once the desktop is up (sandbox_entrypoint.sh).
+        environment["PLAY_COMMAND"] = play_command
     container = client.containers.run(
-        image=settings.sandbox_image,
+        image=image,
         detach=True,
         name=name,
-        environment={"MODE": kind},
+        environment=environment,
         volumes={host_sandbox: {"bind": "/work", "mode": "rw"}},
         ports={port_key: None},
         labels={"harness-lab.sandbox": run_id, "harness-lab.sandbox-kind": kind},
@@ -2030,7 +2676,9 @@ def _launch_sandbox(client: Any, run_id: str, kind: str) -> tuple[str, int, str]
     if not host_port:
         raise RuntimeError("Sandbox container did not expose a host port")
 
-    path = "/vnc.html?autoconnect=1&resize=remote" if kind == "desktop" else "/"
+    path = (
+        "/vnc.html?autoconnect=1&resize=remote" if kind in ("desktop", "play") else "/"
+    )
     return name, host_port, f"http://localhost:{host_port}{path}"
 
 
@@ -2051,16 +2699,25 @@ def start_sandbox(run_id: str, kind: str) -> None:
     with Session(engine) as session:
         service = SandboxService(session)
         try:
-            client.images.get(settings.sandbox_image)
+            profile = _sandbox_profile(run_id)
+        except CaseProfileError as exc:
+            service.mark_error(run_id, kind, str(exc))
+            return
+        image = profile[0] or settings.sandbox_image
+        try:
+            client.images.get(image)
         except Exception:
+            build = (
+                "`make sandbox-build`"
+                if image == settings.sandbox_image
+                else "`make images-3d` (this case has its own image)"
+            )
             service.mark_error(
-                run_id,
-                kind,
-                "Sandbox image not found. Build it with `make sandbox-build`.",
+                run_id, kind, f"Sandbox image {image} not found. Build it with {build}."
             )
             return
         try:
-            name, port, url = _launch_sandbox(client, run_id, kind)
+            name, port, url = _launch_sandbox(client, run_id, kind, profile)
             service.mark_running(run_id, kind, name, port, url)
         except Exception as exc:
             service.mark_error(run_id, kind, repr(exc)[:800])
@@ -2101,7 +2758,7 @@ def cleanup_run_container(run_id: str) -> None:
     client = docker.from_env()
     _stop_orphan_container(client, run_id)
     # Also tear down any validation sandboxes the run left running.
-    for kind in ("terminal", "desktop"):
+    for kind in ("terminal", "desktop", "play"):
         with contextlib.suppress(Exception):
             container = client.containers.get(_sandbox_container_name(run_id, kind))
             with contextlib.suppress(Exception):
@@ -2124,24 +2781,129 @@ def _stop_orphan_container(client: Any, run_id: str) -> None:
         container.remove(force=True)
 
 
+def _run_id_of(task: dict[str, Any]) -> str | None:
+    """The run id an active ``execute_run`` task carries.
+
+    Celery reports a task's ``args`` as a list on this version, but as their
+    ``repr`` string (``"['chess3d-v1-K-020']"``) on others; both are read.
+    """
+    args = task.get("args")
+    if isinstance(args, str):
+        try:
+            args = ast.literal_eval(args)
+        except (ValueError, SyntaxError):
+            return None
+    if isinstance(args, (list, tuple)) and args:
+        return str(args[0])
+    return None
+
+
+@dataclass(frozen=True)
+class InFlight:
+    """What the workers that answered say they are executing.
+
+    ``lanes`` are the run queues those workers consume. A worker that did not
+    answer in time is simply absent, so a run on its lane cannot be told from an
+    orphan: the reply is read as complete only for the lanes that are in it.
+    """
+
+    run_ids: frozenset[str]
+    lanes: frozenset[str]
+
+
+def runs_in_flight(timeout: float = 2.0) -> InFlight | None:
+    """Runs some live worker is executing, and the lanes that answered.
+
+    ``None`` when nobody could be asked at all.
+    """
+    try:
+        inspector = celery_app.control.inspect(timeout=timeout)
+        replies = inspector.active()
+        queues = inspector.active_queues()
+    except Exception:
+        return None
+    if replies is None and queues is None:
+        return None
+    live: set[str] = set()
+    for tasks_on_worker in (replies or {}).values():
+        for task in tasks_on_worker or []:
+            if not isinstance(task, dict):
+                continue
+            if task.get("name") != "harness_lab_app.tasks.execute_run":
+                continue
+            run_id = _run_id_of(task)
+            if run_id:
+                live.add(run_id)
+    # A worker counts for a lane only when both answers came back from it: its
+    # active list says what it runs, its queues say which lane that covers.
+    answered = set(replies or {}) & set(queues or {})
+    lanes = {
+        str(queue.get("name"))
+        for node in answered
+        for queue in (queues or {}).get(node) or []
+        if isinstance(queue, dict) and queue.get("name") in RUN_QUEUES
+    }
+    return InFlight(frozenset(live), frozenset(lanes))
+
+
+def _own_lanes(sender: Any) -> frozenset[str]:
+    """The run lanes the worker that is booting consumes.
+
+    It answers for its own lanes even when the inspection, sent while it is
+    still starting, gets no reply from it — that is what lets a lone worker
+    (the host mode) recover its own orphans on restart.
+    """
+    try:
+        names = set(sender.app.amqp.queues.consume_from)
+    except Exception:
+        return frozenset()
+    return frozenset(names & set(RUN_QUEUES))
+
+
 def reconcile_stale_runs(
-    client: Any | None = None, db_engine: Engine | None = None
+    client: Any | None = None,
+    db_engine: Engine | None = None,
+    in_flight: InFlight | None = None,
+    own_lanes: frozenset[str] = frozenset(),
 ) -> int:
     """Fail `running` runs left over from a worker crash/restart.
 
     After a restart no task is attached to those runs anymore (redelivered
     tasks skip non-pending runs), so any leftover container is stopped and
     the run is failed; retry re-runs it with --resume.
+
+    Only runs on a lane whose worker answered are judged (ADR-0082): with two
+    run lanes and an interactive worker, every worker reconciles on boot, and
+    a restart of one must not fail — or stop the container of — a run another
+    still drives, or one on a lane that merely did not answer in time.
+    ``own_lanes`` are the booting worker's lanes, which it answers for itself;
+    a run with no recorded lane predates the second one and ran on ``runs``.
     """
     settings = get_settings()
     if client is None and settings.execution_backend == "docker":
         import docker  # local import: only the worker needs the socket
 
         client = docker.from_env()
+    reply = runs_in_flight() if in_flight is None else in_flight
+    live = reply.run_ids if reply is not None else frozenset()
+    judged = (reply.lanes if reply is not None else frozenset()) | own_lanes
+    if not judged:
+        # Fail closed: with no lane answering there is no telling a run another
+        # lane drives from an orphan. The health panel's heal button reconciles
+        # once the workers answer again.
+        logger.warning(
+            "Skipping run reconciliation: no run lane answered the active-task "
+            "inspection, so in-flight runs cannot be told from orphans."
+        )
+        return 0
     reconciled = 0
     with Session(db_engine if db_engine is not None else engine) as session:
         service = RunService(session)
-        stale = list(session.exec(select(Run).where(Run.state == RunState.running)))
+        stale = [
+            run
+            for run in session.exec(select(Run).where(Run.state == RunState.running))
+            if (run.lane or RUN_QUEUE) in judged and run.run_id not in live
+        ]
         for run in stale:
             if client is not None:
                 _stop_orphan_container(client, run.run_id)
@@ -2199,6 +2961,265 @@ def build_runner_image() -> dict[str, Any]:
     return {"ok": True, "detail": f"Built {settings.runner_image}"}
 
 
+def _run_cli_container(harness: str, label: str, command: list[str]) -> Any:
+    """A runner container for a native CLI, with its private session mounted.
+
+    Goes through :class:`DockerRunExecutor`, so the connection flows get exactly
+    a run's isolation: only this provider's session (a private copy), the
+    scrubbed environment, an empty HOME, and the credential copied back to the
+    store on ``wait()`` only when it is a well-formed subscription login.
+    """
+    from harness_lab_app.executors import DockerRunExecutor
+
+    return DockerRunExecutor().start(
+        f"connect-{harness}-{label}", command, harness=harness, hidden=[]
+    )
+
+
+#: How often a device login re-checks its deadline and whether a newer attempt
+#: superseded it, while the CLI prints nothing (it is silent once the code is
+#: shown, until the operator approves it).
+_LOGIN_POLL_SECONDS = 1.0
+
+
+def _sweep_login_leftovers(harness: str, keep: str, older_than: float) -> None:
+    """Remove login containers and session copies a dead worker left behind.
+
+    A live attempt cleans up after itself, including a superseded one (it
+    stops within a second and may still be copying back a credential approved
+    just before the new code was asked for), so only what is older than any
+    live attempt can be is touched: ``older_than`` seconds, the longest an
+    attempt runs. That is what a worker restarted mid-login leaves: a CLI
+    still waiting on a code no one sees, and its copy under ``data/runs``.
+    Best-effort; ``keep`` is the run id of the attempt that is starting.
+    """
+    import datetime as dt
+
+    prefix = f"connect-{harness}-login"
+    cutoff = _wall_clock() - older_than
+    with contextlib.suppress(Exception):
+        import docker  # local import: only the worker needs the socket
+
+        client = docker.from_env()
+        name_prefix = container_name_for_run(prefix)
+        listed = client.containers.list(all=True, filters={"name": name_prefix})
+        for container in listed:
+            name = str(container.name)
+            if name == container_name_for_run(keep) or not name.startswith(name_prefix):
+                continue
+            created = str(container.attrs.get("Created", ""))[:26].rstrip("Z")
+            with contextlib.suppress(ValueError):
+                born = dt.datetime.fromisoformat(created).replace(tzinfo=dt.UTC)
+                if born.timestamp() > cutoff:
+                    continue  # a live attempt's: it stops itself
+                with contextlib.suppress(Exception):
+                    container.stop(timeout=5)
+                with contextlib.suppress(Exception):
+                    container.remove(force=True)
+    with contextlib.suppress(OSError):
+        for leftover in get_settings().data_runs_dir.glob(f"{prefix}*"):
+            if (
+                leftover.name != keep
+                and leftover.is_dir()
+                and leftover.stat().st_mtime < cutoff
+            ):
+                shutil.rmtree(leftover, ignore_errors=True)
+
+
+@celery_app.task(name="harness_lab_app.tasks.connect_native_cli", acks_late=False)
+def connect_native_cli(harness: str, attempt: str = "") -> dict[str, Any]:
+    """Drive a CLI's device login for the UI (System → Agent CLIs, ADR-0094).
+
+    Publishes the URL and the one-time code the CLI prints, then waits for the
+    operator to approve it in their browser. The CLI writes its own credential;
+    the executor moves it into the store on exit. Runs on the interactive lane:
+    the wait can last the code's whole lifetime and must not hold a run lane.
+
+    ``attempt`` is the id the API gave this login. The task writes only its
+    own attempt's record, re-checks once a second that it is still the current
+    attempt, and stops its container the moment a newer one replaced it.
+    Deadlines are wall-clock (the Docker Desktop VM's monotonic clock stops
+    while the host sleeps), checked even while the CLI prints nothing, and
+    every way out writes a final state: the record never stays ``waiting``.
+    """
+    from harness_lab_app import native_connect
+    from harness_lab_app.native_auth import ensure_session_dir, session_status
+
+    spec = native_connect.CONNECTABLE.get(harness)
+    if spec is None:
+        return native_connect.write_state(
+            harness,
+            "login",
+            {"state": "failed", "reason": "error", "error": "not connectable"},
+        )
+    if not attempt:  # a message queued before attempts existed
+        attempt = str(native_connect.begin_login(harness)["attempt"])
+    if not native_connect.is_current(harness, attempt):
+        return {"harness": harness, "attempt": attempt, "state": "superseded"}
+
+    def finish(state: dict[str, Any]) -> dict[str, Any]:
+        if not native_connect.is_current(harness, attempt):
+            return {**state, "harness": harness, "state": "superseded"}
+        return native_connect.write_login(harness, attempt, state)
+
+    label = native_connect.login_label(attempt)
+    run_id = f"connect-{harness}-{label}"
+    code_wait = int(spec["code_wait_seconds"])
+    ensure_session_dir(harness)
+    _sweep_login_leftovers(
+        harness,
+        keep=run_id,
+        older_than=code_wait
+        + int(spec["code_lifetime_seconds"])
+        + int(spec["grace_seconds"])
+        + 5 * 60,
+    )
+    # Taken before the container starts, so before the CLI asks for its code:
+    # a countdown from here can only end early, never after the provider's.
+    anchor = _wall_clock()
+    native_connect.write_login(
+        harness,
+        attempt,
+        {"state": "starting", "worker_deadline": anchor + code_wait + 60},
+    )
+    try:
+        handle = _run_cli_container(harness, label, list(spec["login"]))
+    except Exception as exc:  # docker down, image missing: the UI says so
+        return finish(
+            {
+                "state": "failed",
+                "reason": "error",
+                "error": f"{type(exc).__name__}: {exc}"[:400],
+            }
+        )
+
+    lines: Queue[tuple[str, str] | None] = Queue()
+    threading.Thread(target=_drain, args=(handle, lines), daemon=True).start()
+    output: list[str] = []
+    published = False
+    superseded = False
+    stop_reason: str | None = None
+    failure: dict[str, Any] | None = None
+    deadline = anchor + code_wait
+    try:
+        while True:
+            try:
+                item = lines.get(timeout=_LOGIN_POLL_SECONDS)
+            except Empty:
+                item = ("", "")
+            if item is None:  # the CLI exited (or its log stream ended)
+                break
+            if item[1]:
+                output.append(item[1])
+            if item[1] and not published:
+                text = "\n".join(output)
+                prompt = native_connect.parse_device_prompt(text)
+                if prompt:
+                    lifetime = native_connect.printed_lifetime(text) or int(
+                        spec["code_lifetime_seconds"]
+                    )
+                    deadline = anchor + lifetime + int(spec["grace_seconds"])
+                    native_connect.write_login(
+                        harness,
+                        attempt,
+                        {
+                            "state": "waiting",
+                            **prompt,
+                            "issued_at": anchor,
+                            "expires_at": anchor + lifetime,
+                            "worker_deadline": deadline,
+                        },
+                    )
+                    published = True
+            # Once per line or per second of silence (the `get` above): a
+            # tiny JSON read, and the CLI prints a handful of lines in all.
+            if not native_connect.is_current(harness, attempt):
+                superseded = True
+                break
+            if _wall_clock() >= deadline:
+                stop_reason = "deadline" if published else "no_code"
+                break
+    except Exception as exc:  # never leave the record on "waiting"
+        failure = {
+            "state": "failed",
+            "reason": "error",
+            "error": f"{type(exc).__name__}: {exc}"[:400],
+        }
+    finally:
+        # Always stop: a no-op for a CLI that exited (docker keeps its exit
+        # code), and the only way out for one still running — the deadline
+        # passed, a newer attempt took over, or the log stream broke while
+        # the CLI kept waiting on its code.
+        with contextlib.suppress(Exception):
+            handle.stop()
+        try:
+            exit_code = handle.wait()  # copies a fresh credential to the store
+        except Exception:
+            exit_code = -1
+        shutil.rmtree(get_settings().data_runs_dir / run_id, ignore_errors=True)
+
+    if superseded:
+        return {"harness": harness, "attempt": attempt, "state": "superseded"}
+    if failure is not None:
+        return finish(failure)
+    connected = session_status(harness)["state"] == "connected"
+    return finish(
+        native_connect.login_outcome(
+            "\n".join(output),
+            exit_code,
+            connected=connected,
+            published=published,
+            stop_reason=stop_reason,
+        )
+    )
+
+
+@celery_app.task(name="harness_lab_app.tasks.test_native_cli", acks_late=False)
+def test_native_cli(harness: str, model: str = "") -> dict[str, Any]:
+    """Send one minimal prompt with a run's exact credential and environment.
+
+    The only honest "connected": the provider answered, through the same
+    container, session copy and scrubbed env a run uses. Spends one request of
+    the plan's quota.
+    """
+    from harness_lab_app import native_connect
+
+    native_connect.write_state(harness, "test", {"state": "running", "model": model})
+    started = time.monotonic()
+    try:
+        handle = _run_cli_container(
+            harness, "test", native_connect.test_command(harness, model)
+        )
+        output = [line for _level, line in handle.iter_lines()]
+        exit_code = handle.wait()
+    except Exception as exc:
+        return native_connect.write_state(
+            harness,
+            "test",
+            {"state": "failed", "error": f"{type(exc).__name__}: {exc}"},
+        )
+    summary = native_connect.summarize_test(harness, "\n".join(output), exit_code)
+    summary["seconds"] = round(time.monotonic() - started, 1)
+    summary["requested_model"] = model
+    return native_connect.write_state(harness, "test", summary)
+
+
+@celery_app.task(name="harness_lab_app.tasks.disconnect_native_cli", acks_late=False)
+def disconnect_native_cli(harness: str) -> dict[str, Any]:
+    """Forget a provider's login in the lab store (never the operator's own)."""
+    from harness_lab_app import native_connect
+    from harness_lab_app.native_auth import (
+        NATIVE_SESSION_HARNESSES,
+        credential_file,
+    )
+
+    if harness in NATIVE_SESSION_HARNESSES:
+        credential_file(harness).unlink(missing_ok=True)
+    native_connect.write_state(harness, "test", {"state": "idle"})
+    # Drops every attempt too: a login still running stops itself.
+    return native_connect.clear_login(harness)
+
+
 @control_command()
 def harness_facts(_state: Any) -> dict[str, Any]:
     """Answer "is the run runtime usable?" for the health panel (ADR-0018).
@@ -2214,8 +3235,18 @@ def harness_facts(_state: Any) -> dict[str, Any]:
         "runner_image": settings.runner_image,
         "docker_ok": False,
         "runner_image_present": False,
+        # From the image's label, so no container is started to ask (ADR-0070
+        # erratum: an unpinned CLI install stayed on a cached old version).
+        "claude_cli_version": "",
+        # Every native CLI's pinned version, by harness (ADR-0094), from the
+        # same image labels.
+        "cli_versions": {},
         "docker_version": "",
         "docker_error": "",
+        # The lab's own images a case may name (ADR-0078), e.g. the Godot
+        # runner of the 3D cases: `make app-up` builds only the shared one, so
+        # the run preflight asks which case images exist before queueing.
+        "case_images_present": [],
     }
     if settings.execution_backend != "docker":
         return facts
@@ -2226,14 +3257,31 @@ def harness_facts(_state: Any) -> dict[str, Any]:
         facts["docker_version"] = client.version().get("Version", "")
         facts["docker_ok"] = True
         with contextlib.suppress(Exception):
-            client.images.get(settings.runner_image)
+            from harness_lab_app.case_profile import image_is_allowed
+
+            facts["case_images_present"] = sorted(
+                tag
+                for image in client.images.list(name="harness-lab-*")
+                for tag in (getattr(image, "tags", None) or [])
+                if image_is_allowed(tag)
+            )
+        with contextlib.suppress(Exception):
+            image = client.images.get(settings.runner_image)
             facts["runner_image_present"] = True
+            labels = (image.labels or {}) if hasattr(image, "labels") else {}
+            facts["claude_cli_version"] = str(labels.get("claude-code.version", ""))
+            from harness_lab_app.native_models import CLI_VERSION_LABELS
+
+            facts["cli_versions"] = {
+                harness: str(labels.get(label, ""))
+                for harness, label in CLI_VERSION_LABELS.items()
+            }
     except Exception as exc:  # the failure *is* the answer this command reports
         facts["docker_error"] = f"{type(exc).__name__}: {exc}"
     return facts
 
 
 @worker_ready.connect
-def _on_worker_ready(**_kwargs: Any) -> None:
+def _on_worker_ready(sender: Any = None, **_kwargs: Any) -> None:
     init_db()
-    reconcile_stale_runs()
+    reconcile_stale_runs(own_lanes=_own_lanes(sender))

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import (
     Depends,
@@ -33,6 +34,11 @@ from harness_lab_app.auth import (
 )
 from harness_lab_app.case_derivation import derive_candidates
 from harness_lab_app.case_draft_service import generate_case_draft
+from harness_lab_app.case_profile import (
+    CaseProfileError,
+    play_command_for,
+    play_guide_for,
+)
 from harness_lab_app.case_service import (
     CaseExistsError,
     CaseService,
@@ -46,6 +52,7 @@ from harness_lab_app.celery_app import (
     enqueue_experiment_audit,
     enqueue_gate_check,
     enqueue_improve,
+    enqueue_parallel_run,
     enqueue_repository_audit,
     enqueue_run,
     enqueue_sandbox_start,
@@ -83,6 +90,7 @@ from harness_lab_app.gateway_catalog_service import GatewayCatalogService
 from harness_lab_app.harness_lifecycle import drafting, sanitizer
 from harness_lab_app.improvement_service import ImprovementError, ImprovementService
 from harness_lab_app.leaderboard_service import LeaderboardService
+from harness_lab_app.local_api import local_router
 from harness_lab_app.observability_service import ObservabilityService
 from harness_lab_app.overview_service import OverviewService
 from harness_lab_app.run_service import (
@@ -91,6 +99,7 @@ from harness_lab_app.run_service import (
     RunContinueError,
     RunDeleteConflictError,
     RunPreflightError,
+    RunRetryError,
     RunService,
 )
 from harness_lab_app.sandbox_service import VALID_KINDS, SandboxService
@@ -109,12 +118,17 @@ from harness_lab_app.schemas import (
     GatewayModelUpdate,
     GatewayTestRequest,
     GroupIssueRequest,
+    HarnessLevelsCreate,
     HealRequest,
     RunBatchCreate,
     RunBatchRead,
     RunConfigCreate,
     RunContinueRequest,
     RunCreate,
+    SkillAuditRequest,
+    SkillDraftStage,
+    SkillRefineCreate,
+    SkillTrialCreate,
     StagedSkillCreate,
     StagedSkillFileWrite,
     StagedSkillImportRequest,
@@ -172,6 +186,53 @@ class ScoreRequest(BaseModel):
     interventions: int
     notes: str = ""
     rubric: dict[str, int] = {}
+
+
+def _safe_play_command(case: Any) -> str:
+    """The case's play command, or ``""`` — a bad one only hides the Play tab."""
+    if case is None:
+        return ""
+    try:
+        return play_command_for(case)
+    except CaseProfileError:
+        return ""
+
+
+def _safe_play_guide(case: Any) -> dict[str, Any]:
+    """The case's play guide, or ``{}`` — a malformed one only hides the guide."""
+    if case is None:
+        return {}
+    try:
+        return play_guide_for(case)
+    except CaseProfileError:
+        return {}
+
+
+def _bound_keys(run_dir: Path) -> dict[str, list[str]]:
+    """The keys the run's game bound to each action, from its latest harvest.
+
+    The grader reads the game's live ``InputMap`` (an agent may register keys in
+    code rather than in ``project.godot``) into ``logic.json``. The final
+    workspace's harvest is preferred; a run still going, or cut, falls back to
+    its newest graded step snapshot. Empty when nothing was harvested.
+    """
+    candidates = [run_dir / "workspace" / ".lab-grade" / "logic.json"]
+    steps = run_dir / "steps"
+    if steps.is_dir():
+        candidates += sorted(
+            steps.glob("step-*.snapshot/.lab-grade/logic.json"),
+            key=lambda path: int(re.sub(r"\D", "", path.parent.parent.name) or 0),
+            reverse=True,
+        )
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        keys = data.get("action_keys") or data.get("actions")
+        if isinstance(keys, dict) and all(isinstance(v, list) for v in keys.values()):
+            return {str(k): [str(x) for x in v] for k, v in keys.items()}
+    return {}
 
 
 def _improvements_status(runs_dir: Path, run_id: str) -> str:
@@ -265,12 +326,156 @@ def _client_key(request: Request | None) -> str:
     return request.client.host if request is not None and request.client else "unknown"
 
 
+def _unique_experiment_id(session: Session, base_id: str) -> str:
+    """``base_id``, or ``base_id-N`` when that id is taken (bounded by the slug)."""
+    from harness_lab_app.models import Experiment
+
+    taken = set(
+        session.exec(
+            select(Experiment.experiment_id).where(
+                Experiment.experiment_id.startswith(base_id[:60])
+            )
+        ).all()
+    )
+    experiment_id, suffix = base_id, 2
+    while experiment_id in taken:
+        experiment_id = f"{base_id[:60]}-{suffix}"
+        suffix += 1
+    return experiment_id
+
+
+def _measured_match(
+    session: Session,
+    service: ExperimentService,
+    wanted: Any,
+    repetitions: int,
+    skill_hash: str,
+) -> Any:
+    """An existing experiment that already measured exactly ``wanted``, or None."""
+    from collections import Counter
+
+    from harness_lab_app.models import Experiment, RunState
+    from harness_lab_app.skill_trial import same_design
+
+    for row in session.exec(
+        select(Experiment).where(Experiment.family_id == wanted.family_id)
+    ).all():
+        if sorted(row.case_ids or []) != sorted(wanted.case_ids):
+            continue
+        if skill_hash and f"skill_hash={skill_hash}" not in (row.notes or ""):
+            continue
+        conditions = service.conditions(row.experiment_id)
+        stored = [
+            {
+                "role": c.role.value if hasattr(c.role, "value") else c.role,
+                "overrides": dict(c.overrides or {}),
+            }
+            for c in conditions
+        ]
+        if not same_design(stored, wanted):
+            continue
+        finished = Counter(
+            run.condition_label
+            for run in service.runs(row.experiment_id)
+            if run.state in (RunState.completed, RunState.awaiting_manual_score)
+        )
+        needed = repetitions * max(1, len(row.case_ids or []))
+        if all(finished[c.label] >= needed for c in conditions):
+            return row
+    return None
+
+
+def _create_base_trials(data: Any, pin: dict[str, str], session: Session) -> dict:
+    """One clean A/B per base, in one family; reuse an identical one (ADR-0092)."""
+    from harness_lab_app.skill_trial import (
+        base_design,
+        base_experiment_id,
+        base_family,
+    )
+    from harness_lab_app.skills_catalog import known_skill_names
+    from harness_lab_app.staged_skill_service import StagedSkillService
+
+    staged = data.source == "staged"
+    if staged and data.skill not in StagedSkillService(session).active_names():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"'{data.skill}' is not staged. Stage the case's candidate or "
+                "import the skill first (Skills → Import)."
+            ),
+        )
+    if not staged and data.skill not in known_skill_names():
+        raise HTTPException(
+            status_code=422, detail=f"'{data.skill}' is not a governed skill"
+        )
+    bases = ["minimal", "full"] if data.base == "both" else [data.base]
+    if not staged and "full" in bases:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"'{data.skill}' is a catalog skill, so full already carries it: "
+                "there is no full A/B to run. Pick base 'minimal', or use "
+                "`make prune` to ask whether it can leave full."
+            ),
+        )
+    service = ExperimentService(session)
+    created: list[dict] = []
+    reused: list[dict] = []
+    skill_hash = ""
+    if staged:
+        skill_hash = StagedSkillService(session).get_skill(data.skill).content_hash
+    for base in bases:
+        try:
+            wanted = base_design(
+                skill=data.skill,
+                staged=staged,
+                base=base,
+                cases=data.case_ids,
+                model=data.model,
+                reps=data.repetitions,
+                pin_arm=pin,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # Reuse only in a two-base request, and only what was really measured:
+        # the same arms, the same skill content, and at least as many finished
+        # runs per arm as asked. A draft, a shorter run, or an edited skill is
+        # not the measurement this request is about (review finding 2026-11-19).
+        if data.base == "both" and data.reuse_measured:
+            match = _measured_match(
+                session, service, wanted, data.repetitions, skill_hash
+            )
+            if match is not None:
+                reused.append({**match.model_dump(), "base": base})
+                continue
+        if data.dry_run:
+            created.append({"experiment_id": "", "base": base, "warnings": []})
+            continue
+        wanted.notes = (
+            f"{wanted.notes} skill_hash={skill_hash}" if skill_hash else wanted.notes
+        )
+        wanted.experiment_id = _unique_experiment_id(
+            session, base_experiment_id(data.skill, base, data.model)
+        )
+        try:
+            experiment, warnings = service.create_experiment(wanted)
+        except ExperimentError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        created.append({**experiment.model_dump(), "base": base, "warnings": warnings})
+    return {
+        "family_id": base_family(data.skill, data.model),
+        "experiments": created,
+        "reused": reused,
+    }
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Agentic Harness Lab")
     # Gate every /api route that is not explicitly public. Middleware rather than
     # a per-route dependency so routes added later are covered by default
     # (ADR-0015).
     app.add_middleware(SessionMiddleware)
+    app.include_router(local_router)
 
     @app.on_event("startup")
     def startup() -> None:
@@ -366,6 +571,13 @@ def create_app() -> FastAPI:
 
         return _list()
 
+    @app.get("/api/harness/profiles")
+    def list_skill_profiles():
+        """Harness levels a run can pick: full, minimal, ... (ADR-0085)."""
+        from harness_lab_app.skills_catalog import skill_profiles
+
+        return skill_profiles()
+
     @app.get("/api/docs")
     def list_docs():
         from harness_lab_app.docs_catalog import list_docs as _list
@@ -426,6 +638,131 @@ def create_app() -> FastAPI:
         catalog["models"] = direct + catalog["models"]
         catalog["direct_errors"] = direct_errors
         return catalog
+
+    @app.get("/api/models/native")
+    def list_native_models():
+        """The models each host CLI addresses natively (ADR-0069), each marked
+        with whether the gateway has a card that serves it. ``on_gateway`` is
+        null when no gateway is configured: unknown, not missing."""
+        from harness_lab_app.executors import claude_settings_env
+        from harness_lab_app.gateway_models import fetch_gateway_routing_cached
+        from harness_lab_app.native_models import native_catalog
+
+        base, token = _gateway_endpoint()
+        routing = fetch_gateway_routing_cached(base, token) if base and token else None
+        # The claude CLI uses the gateway only when the lab's Claude settings
+        # point it there; otherwise its models are not the gateway's to judge.
+        via_gateway = bool(
+            claude_settings_env(get_settings().repo_root).get("ANTHROPIC_BASE_URL")
+        )
+        # An unreachable gateway returns {}; that is "could not ask", not "none".
+        return native_catalog(routing or None, claude_via_gateway=via_gateway)
+
+    @app.get("/api/harness/clis")
+    def list_native_clis():
+        """Connection state of each native agent CLI (ADR-0094): installed
+        version, lane (docker/host), sandbox, subscription session and billing
+        mode. Reads the shape of each credential file, never a token."""
+        from harness_lab_app.health_service import native_cli_status
+
+        return {"clis": native_cli_status()}
+
+    def _native_cli_or_404(harness: str) -> str:
+        from harness_lab_app.native_auth import NATIVE_SESSION_HARNESSES
+
+        if harness not in NATIVE_SESSION_HARNESSES:
+            raise HTTPException(status_code=404, detail=f"unknown CLI {harness!r}")
+        return harness
+
+    @app.post("/api/harness/clis/{harness}/connect")
+    def connect_native_cli(harness: str, regenerate: bool = False):
+        """Start the CLI's own device login on the worker (ADR-0094). Poll
+        ``GET …/connect`` for the URL and code to show the operator.
+
+        A login in flight is returned, not restarted — unless ``regenerate``:
+        the operator asked for a new code, so the running attempt is
+        superseded (its worker stops its container within a second) and a new
+        one starts. One attempt at a time either way."""
+        from harness_lab_app import native_connect
+        from harness_lab_app.celery_app import enqueue_native_cli
+
+        harness = _native_cli_or_404(harness)
+        if harness in native_connect.UNAVAILABLE:
+            raise HTTPException(
+                status_code=409, detail=native_connect.UNAVAILABLE[harness]
+            )
+        if harness not in native_connect.CONNECTABLE:
+            raise HTTPException(status_code=409, detail="not connectable from the UI")
+        current = native_connect.read_login(harness)
+        if not regenerate and native_connect.login_in_flight(current):
+            return current
+        record = native_connect.begin_login(harness)
+        try:
+            enqueue_native_cli(
+                "connect_native_cli", harness, attempt=str(record["attempt"])
+            )
+        except Exception as exc:
+            native_connect.write_state(
+                harness,
+                "login",
+                {
+                    "state": "failed",
+                    "reason": "error",
+                    "error": "The worker queue is unreachable (Health).",
+                },
+            )
+            raise HTTPException(
+                status_code=503, detail=f"Worker queue unreachable: {exc}"
+            ) from exc
+        return native_connect.login_view(record)
+
+    @app.get("/api/harness/clis/{harness}/connect")
+    def connect_native_cli_state(harness: str):
+        """The current login, judged on the server's clock: a code past its
+        lifetime reads ``expired`` and ``server_time`` anchors the countdown."""
+        from harness_lab_app import native_connect
+
+        return native_connect.read_login(_native_cli_or_404(harness))
+
+    @app.post("/api/harness/clis/{harness}/test")
+    def test_native_cli(harness: str, model: str = ""):
+        """Send one minimal prompt with a run's exact credential (ADR-0094).
+        Spends one request of the plan's quota."""
+        from harness_lab_app import native_connect
+        from harness_lab_app.celery_app import enqueue_native_cli
+
+        harness = _native_cli_or_404(harness)
+        try:
+            enqueue_native_cli("test_native_cli", harness, model=model)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail=f"Worker queue unreachable: {exc}"
+            ) from exc
+        return native_connect.write_state(
+            harness, "test", {"state": "queued", "model": model}
+        )
+
+    @app.get("/api/harness/clis/{harness}/test")
+    def test_native_cli_state(harness: str):
+        from harness_lab_app import native_connect
+
+        return native_connect.read_state(_native_cli_or_404(harness), "test")
+
+    @app.delete("/api/harness/clis/{harness}/connect")
+    def disconnect_native_cli(harness: str):
+        """Forget this provider's login in the lab store (never ~/.codex).
+
+        The worker does it: the API mounts the store read-only."""
+        from harness_lab_app.celery_app import enqueue_native_cli
+
+        harness = _native_cli_or_404(harness)
+        try:
+            enqueue_native_cli("disconnect_native_cli", harness)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail=f"Worker queue unreachable: {exc}"
+            ) from exc
+        return {"harness": harness, "state": "disconnecting"}
 
     def _direct_options() -> tuple[list[dict], dict[str, str], list[DirectHostProbe]]:
         """Picker options for the direct sources, why each empty one is empty,
@@ -1114,6 +1451,36 @@ def create_app() -> FastAPI:
         """The score corpus, one entry per definition, with direction attached."""
         return ScoreService(session).aggregate()
 
+    @app.get("/api/scores/step-credit")
+    def step_credit(session: Session = Depends(get_session)):
+        """Per-item reward across the corpus: the pruning shortlist (ADR-0076)."""
+        from harness_lab_app.step_reward_service import StepRewardService
+
+        return StepRewardService(session).corpus()
+
+    @app.get("/api/scores/skill-census")
+    def skill_census(by: str = "model", session: Session = Depends(get_session)):
+        """Skill usage per model, case or harness, with each skill's size (ADR-0085)."""
+        from harness_lab_app.step_reward_service import StepRewardService
+
+        try:
+            return StepRewardService(session).census(by=by)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/runs/{run_id}/step-reward")
+    def get_step_reward(run_id: str, session: Session = Depends(get_session)):
+        """The run's per-step reward: progress after each step (ADR-0076)."""
+        from harness_lab_app.step_reward_service import StepRewardService
+
+        trajectory = StepRewardService(session).trajectory(run_id)
+        if trajectory is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No per-step reward for this run (it left no step snapshots).",
+            )
+        return trajectory
+
     @app.get("/api/runs/{run_id}/scores")
     def get_run_scores(run_id: str, session: Session = Depends(get_session)):
         return ScoreService(session).list_scores(run_id)
@@ -1153,6 +1520,11 @@ def create_app() -> FastAPI:
                 }
             )
         return rows
+
+    @app.get("/api/experiments/pruning")
+    def pruning_overview(session: Session = Depends(get_session)):
+        """Every pruning experiment's removal verdicts, newest first (ADR-0085)."""
+        return ExperimentService(session).pruning_overview()
 
     @app.get("/api/experiments/{experiment_id}")
     def get_experiment(experiment_id: str, session: Session = Depends(get_session)):
@@ -1289,6 +1661,18 @@ def create_app() -> FastAPI:
         except ExperimentNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/experiments/{experiment_id}/model-comparison")
+    def experiment_model_comparison(
+        experiment_id: str, session: Session = Depends(get_session)
+    ):
+        """Per model: checks passed, phase by phase, cost and time of each run."""
+        from harness_lab_app.model_comparison import model_comparison
+
+        try:
+            return model_comparison(ExperimentService(session), experiment_id)
+        except ExperimentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.post("/api/experiments", status_code=201)
     def create_experiment(
         data: ExperimentCreate, session: Session = Depends(get_session)
@@ -1302,6 +1686,434 @@ def create_app() -> FastAPI:
         except ExperimentError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {**experiment.model_dump(), "warnings": warnings}
+
+    @app.post("/api/experiments/skill-trial", status_code=201)
+    def create_skill_trial(
+        data: SkillTrialCreate, session: Session = Depends(get_session)
+    ):
+        """Create (never launch) a one-skill trial (ADR-0089, ADR-0090, ADR-0091).
+
+        ``source="catalog"``: the profile against the profile plus one governed
+        skill — the design ``make add-skill-trial`` builds.
+        ``source="staged"``: no skill against a staged one (a case's candidate,
+        or a skill you imported) — the design **New evaluation → Add skills**
+        builds with Enforce on. Launching stays on the Experiments page, behind
+        the shared launch form and preflight.
+        """
+        from harness_lab_app.models import Experiment
+        from harness_lab_app.skill_trial import (
+            design,
+            staged_design,
+            staged_trial_experiment_id,
+            trial_experiment_id,
+        )
+        from harness_lab_app.skills_catalog import (
+            known_skill_names,
+            profile_disabled,
+        )
+        from harness_lab_app.staged_skill_service import StagedSkillService
+
+        pin = {"executor_model": data.model, "harness": data.harness}
+        if data.effort:
+            pin["executor_effort"] = data.effort
+        if data.base is not None:
+            return _create_base_trials(data, pin, session)
+        if data.source == "staged":
+            if data.skill not in StagedSkillService(session).active_names():
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"'{data.skill}' is not staged. Stage the case's candidate "
+                        "or import the skill first (Skills → Import)."
+                    ),
+                )
+            base_id = staged_trial_experiment_id(data.skill, data.model)
+        else:
+            if data.skill not in known_skill_names():
+                raise HTTPException(
+                    status_code=422, detail=f"'{data.skill}' is not a governed skill"
+                )
+            try:
+                base_disabled = profile_disabled(data.profile)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            base_id = trial_experiment_id(data.skill, data.profile, data.model)
+        taken = set(
+            session.exec(
+                select(Experiment.experiment_id).where(
+                    Experiment.experiment_id.startswith(base_id[:60])
+                )
+            ).all()
+        )
+        experiment_id = base_id
+        suffix = 2
+        while experiment_id in taken:
+            experiment_id = f"{base_id[:60]}-{suffix}"
+            suffix += 1
+        try:
+            if data.source == "staged":
+                created = staged_design(
+                    skill=data.skill,
+                    cases=data.case_ids,
+                    model=data.model,
+                    reps=data.repetitions,
+                    experiment_id=experiment_id,
+                    pin_arm=pin,
+                )
+            else:
+                created = design(
+                    skill=data.skill,
+                    cases=data.case_ids,
+                    model=data.model,
+                    reps=data.repetitions,
+                    base_disabled=base_disabled,
+                    profile=data.profile,
+                    experiment_id=experiment_id,
+                    pin_arm=pin,
+                )
+            experiment, warnings = ExperimentService(session).create_experiment(created)
+        except (ValueError, ExperimentError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {**experiment.model_dump(), "warnings": warnings}
+
+    @app.post("/api/experiments/harness-levels", status_code=201)
+    def create_harness_levels(
+        data: HarnessLevelsCreate, session: Session = Depends(get_session)
+    ):
+        """None / minimal / full on one case and model, as clean A/Bs (ADR-0093).
+
+        Created, never launched. Every level uses the case's plain prompt: a
+        bare arm cannot be asked to follow a harness it cannot see.
+        """
+        from harness_lab_app.harness_levels import ladder_designs, ladder_family
+        from harness_lab_app.models import Case
+        from harness_lab_app.skills_catalog import profile_disabled
+
+        case = session.exec(select(Case).where(Case.case_id == data.case_id)).first()
+        if case is None:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown case '{data.case_id}'."
+            )
+        if "default" not in (case.prompt_variants or {}):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"'{data.case_id}' has no plain 'default' prompt, so it cannot "
+                    "run without a harness."
+                ),
+            )
+        try:
+            designs = ladder_designs(
+                case_id=data.case_id,
+                model=data.model,
+                harness=data.harness,
+                levels=data.levels,
+                reps=data.repetitions,
+                minimal_disabled=profile_disabled("minimal"),
+                effort=data.effort,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        service = ExperimentService(session)
+        created: list[dict] = []
+        for design in designs:
+            design.experiment_id = _unique_experiment_id(session, design.experiment_id)
+            try:
+                experiment, warnings = service.create_experiment(design)
+            except ExperimentError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            created.append({**experiment.model_dump(), "warnings": warnings})
+        return {
+            "family_id": ladder_family(data.case_id, data.model),
+            "experiments": created,
+        }
+
+    @app.post("/api/experiments/skill-refine", status_code=201)
+    def create_skill_refine(
+        data: SkillRefineCreate, session: Session = Depends(get_session)
+    ):
+        """Create (never launch) v1 vs v2 of one skill (ADR-0092)."""
+        from harness_lab_app.skill_refine import design, staged_design
+        from harness_lab_app.skills_catalog import known_skill_names, profile_disabled
+        from harness_lab_app.staged_skill_service import StagedSkillService
+
+        staged = StagedSkillService(session).active_names()
+        if data.candidate not in staged:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"'{data.candidate}' is not staged. Stage the v2 first "
+                    "(the skill audit's draft, or Skills → Import)."
+                ),
+            )
+        base_disabled = profile_disabled(data.base)
+        pin = {"executor_model": data.model, "harness": data.harness}
+        if data.effort:
+            pin["executor_effort"] = data.effort
+        base_id = f"refine-{data.skill}-vs-{data.candidate}".lower().replace("_", "-")
+        experiment_id = _unique_experiment_id(session, base_id[:64])
+        try:
+            if data.skill in staged:
+                created = staged_design(
+                    skill=data.skill,
+                    candidate=data.candidate,
+                    cases=data.case_ids,
+                    model=data.model,
+                    reps=data.repetitions,
+                    base_disabled=base_disabled,
+                    experiment_id=experiment_id,
+                    pin_arm=pin,
+                )
+            elif data.skill in known_skill_names():
+                created = design(
+                    skill=data.skill,
+                    candidate=data.candidate,
+                    cases=data.case_ids,
+                    model=data.model,
+                    reps=data.repetitions,
+                    base_disabled=base_disabled,
+                    invoke=True,
+                    profile=data.base,
+                )
+                created.experiment_id = experiment_id
+                for condition in created.conditions:
+                    condition.overrides = {**pin, **condition.overrides}
+            else:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"'{data.skill}' is neither staged nor a governed skill.",
+                )
+            experiment, warnings = ExperimentService(session).create_experiment(created)
+        except (ValueError, ExperimentError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {**experiment.model_dump(), "warnings": warnings}
+
+    @app.post("/api/skills/{name}/audit")
+    def audit_one_skill(
+        name: str, data: SkillAuditRequest, session: Session = Depends(get_session)
+    ):
+        """The LLM as auditor of one skill: diagnosis + a v2 draft (ADR-0092).
+
+        Reads the experiment's evidence for the arms that carried the skill.
+        Writes nothing: staging the draft is ``POST /api/skills/drafts``.
+        """
+        from harness_lab_app.llm_transport import GatewayHTTPError, TransportError
+        from harness_lab_app.skill_audit import (
+            SkillAuditError,
+            SkillNotFoundError,
+            audit_skill,
+        )
+
+        try:
+            result = audit_skill(
+                session, name, data.experiment_id, model=data.auditor_model
+            )
+        except (ExperimentNotFoundError, SkillNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except SkillAuditError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except GatewayHTTPError as exc:
+            # A 4xx is a request the gateway refused (an unknown auditor model):
+            # retrying will not help, and "unavailable" would mislead.
+            status = 400 if 400 <= exc.code < 500 else 503
+            raise HTTPException(
+                status_code=status, detail=f"The auditor call failed: {exc}"
+            ) from exc
+        except TransportError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"The auditor could not be reached: {exc}",
+            ) from exc
+        return result.as_dict()
+
+    @app.post("/api/skills/drafts", status_code=201)
+    def stage_skill_draft(
+        data: SkillDraftStage, session: Session = Depends(get_session)
+    ):
+        """Stage a reviewed v2 draft as a new staged skill (ADR-0092)."""
+        from harness_lab_app.staged_skill_service import (
+            StagedSkillError,
+            StagedSkillService,
+        )
+
+        description = data.description
+        if not description:
+            match = re.search(r"^description:\s*(.+)$", data.content, re.MULTILINE)
+            description = match.group(1).strip().strip('"') if match else ""
+        try:
+            skill = StagedSkillService(session).create_skill(
+                data.name, description, data.content
+            )
+        except StagedSkillError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"name": skill.name, "status": skill.status}
+
+    @app.get("/api/estimate")
+    def estimate_run_cost(
+        case_id: str,
+        model: str,
+        level: str = "",
+        session: Session = Depends(get_session),
+    ):
+        """Median cost and minutes per run, from this case and model's history.
+
+        What the guide shows before anything is created. ``n`` is how many
+        completed runs the median stands on; 0 means unknown, never free.
+
+        ``level`` (``bare`` | ``minimal`` | ``full``) keeps only the runs made
+        at that harness level, so a first bare run of a 3D case is not priced
+        with the full-harness runs before it. Empty reads every run, as before.
+        """
+        from statistics import median
+
+        from sqlmodel import col
+
+        from harness_lab_app.models import HarnessSource, Run, RunConfig, Score
+        from harness_lab_app.skills_catalog import profile_disabled
+
+        if level not in ("", "bare", "minimal", "full"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown harness level '{level}'. Use bare, minimal or full.",
+            )
+        rows = session.exec(
+            select(RunConfig).where(
+                RunConfig.case_id == case_id, RunConfig.executor_model == model
+            )
+        ).all()
+        if level:
+            minimal = sorted(profile_disabled("minimal"))
+
+            def at_level(config: RunConfig) -> bool:
+                source = config.harness_source
+                if level == "bare":
+                    return source == HarnessSource.bare
+                if source != HarnessSource.lab_root:
+                    return False
+                disabled = sorted(config.skills_disabled or [])
+                return disabled == (minimal if level == "minimal" else [])
+
+            rows = [config for config in rows if at_level(config)]
+        configs = [config.id for config in rows]
+        if not configs:
+            return {"case_id": case_id, "model": model, "n": 0}
+        run_ids = session.exec(
+            select(Run.run_id).where(
+                col(Run.run_config_id).in_(configs),
+                Run.state == "completed",
+            )
+        ).all()
+        costs: list[float] = []
+        minutes: list[float] = []
+        for score in session.exec(
+            select(Score).where(
+                col(Score.run_id).in_(run_ids),
+                col(Score.name).in_(["cost_usd", "wall_time_minutes"]),
+            )
+        ).all():
+            if score.value_num is None:
+                continue
+            (costs if score.name == "cost_usd" else minutes).append(score.value_num)
+        return {
+            "case_id": case_id,
+            "model": model,
+            "n": len(costs),
+            "cost_usd": median(costs) if costs else None,
+            "minutes": median(minutes) if minutes else None,
+        }
+
+    @app.get("/api/metrics/criteria")
+    def metric_criteria():
+        """The rules that turn numbers into a verdict, read from the code.
+
+        Shown beside the score registry on the Metrics page, so the values a
+        person might want to adjust are the ones the lab actually uses.
+        """
+        from harness_lab_app import pruning, statistics
+
+        return {
+            "repetitions": {
+                "exploratory_below": statistics.EXPLORATORY_ONLY,
+                "judgement_from": statistics.USEFUL_COMPARISON,
+                "validation_from": statistics.STRONGER_EVIDENCE,
+                "where": "src/harness_lab_app/statistics.py",
+            },
+            "success_interval": {
+                "method": "wilson",
+                "confidence": 0.95,
+                "where": "src/harness_lab_app/statistics.py",
+            },
+            "pruning": {
+                "success_margin": pruning.DEFAULT_SUCCESS_MARGIN,
+                "relative_margin": pruning.DEFAULT_RELATIVE_MARGIN,
+                "any_observed_loss_keeps": True,
+                "ceiling_or_floor_is_no_signal": True,
+                "where": "src/harness_lab_app/pruning.py",
+            },
+        }
+
+    @app.get("/api/cases/{case_id}/candidate-skills")
+    def list_case_candidate_skills(
+        case_id: str, session: Session = Depends(get_session)
+    ):
+        """The skills a case ships to be trialled, and whether each is staged (ADR-0091)."""
+        from harness_lab_app.candidate_skills import candidates_for_case
+        from harness_lab_app.staged_skill_service import StagedSkillService
+
+        root = get_settings().repo_root
+        staged = {
+            skill.name: skill for skill in StagedSkillService(session).list_skills()
+        }
+        out = []
+        for name, folder in candidates_for_case(root, case_id).items():
+            row = staged.get(name)
+            out.append(
+                {
+                    "name": name,
+                    "source": str(folder.relative_to(root)),
+                    "staged": row is not None and row.status != "archived",
+                    "status": row.status if row is not None else None,
+                }
+            )
+        return out
+
+    @app.post("/api/cases/{case_id}/candidate-skills/{name}/stage", status_code=201)
+    def stage_case_candidate_skill(
+        case_id: str,
+        name: str,
+        replace: bool = False,
+        session: Session = Depends(get_session),
+    ):
+        """Stage a case's candidate, as ``make stage-candidate`` does (ADR-0091).
+
+        ``replace`` re-reads it from the case, dropping local edits to the
+        staged copy — the same opt-in as the CLI's REPLACE=1.
+        """
+        from harness_lab_app.candidate_skills import (
+            CandidateSkillError,
+            candidates_for_case,
+            stage,
+        )
+        from harness_lab_app.skill_import import SkillImportError
+        from harness_lab_app.staged_skill_service import StagedSkillError
+
+        root = get_settings().repo_root
+        folder = candidates_for_case(root, case_id).get(name)
+        if folder is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Case '{case_id}' ships no candidate skill '{name}'.",
+            )
+        try:
+            result = stage(session, root, folder, name, replace=replace)
+        except (SkillImportError, CandidateSkillError, StagedSkillError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "name": result.name,
+            "files": result.files,
+            "source": result.source,
+            "warnings": result.warnings,
+        }
 
     @app.post("/api/experiments/from-suite", status_code=201)
     def create_experiment_from_suite(
@@ -1380,16 +2192,51 @@ def create_app() -> FastAPI:
         except ExperimentError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.get("/api/runs/lanes")
+    def run_lanes():
+        """Whether a second run lane is up, for the two-at-a-time option (ADR-0082)."""
+        from harness_lab_app.celery_app import PARALLEL_RUN_QUEUE
+        from harness_lab_app.health_service import queues_served
+
+        served = queues_served()
+        return {
+            # None: no worker could be asked, so the page cannot tell.
+            "parallel": None if served is None else PARALLEL_RUN_QUEUE in served,
+            "queues": sorted(served or []),
+        }
+
     @app.post("/api/experiments/{experiment_id}/launch", status_code=201)
     def launch_experiment(
         experiment_id: str,
         data: ExperimentLaunch,
         session: Session = Depends(get_session),
     ):
+        if data.parallel == 2:
+            from harness_lab_app.celery_app import PARALLEL_RUN_QUEUE
+            from harness_lab_app.health_service import queues_served
+
+            served = queues_served()
+            # Refused unless a worker is known to serve the second lane: an
+            # unknown answer is not a yes, and the runs sent there would wait
+            # with no error anywhere.
+            if served is None or PARALLEL_RUN_QUEUE not in served:
+                detail = (
+                    "Could not ask the workers whether the second run lane is up"
+                    if served is None
+                    else "No worker serves the second run lane"
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{detail}, so half of these runs could wait forever. "
+                        "Restart the stack (make app-up) to start it, or launch "
+                        "one at a time."
+                    ),
+                )
         try:
-            runs = ExperimentService(session, enqueue=enqueue_run).launch(
-                experiment_id, data.config
-            )
+            runs = ExperimentService(
+                session, enqueue=enqueue_run, enqueue_parallel=enqueue_parallel_run
+            ).launch(experiment_id, data.config, parallel=data.parallel)
         except ExperimentNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ExperimentError, RunPreflightError) as exc:
@@ -2050,6 +2897,30 @@ def create_app() -> FastAPI:
     ):
         return {"command": RunService(session).preview_command(run_id, config)}
 
+    def _unknown_cases(session: Session, case_ids: list[str]) -> list[str]:
+        """Case ids with no ``Case`` row — the runner would refuse them.
+
+        Every runnable case is a row (benchmarks are seeded into the table and
+        the worker stages ``case_spec.json`` from it). Checked at the API, where
+        a form or a script can send a stale id, so the run is refused before it
+        is queued instead of failing in the runner with "Unknown case".
+        """
+        from harness_lab_app.models import Case
+
+        wanted = sorted(set(case_ids))
+        known = set(
+            session.exec(
+                select(Case.case_id).where(Case.case_id.in_(wanted))  # type: ignore[attr-defined]
+            ).all()
+        )
+        return [case_id for case_id in wanted if case_id not in known]
+
+    def _unknown_case_detail(missing: list[str]) -> str:
+        return (
+            f"Unknown case(s): {', '.join(missing)}. Pick one from GET /api/cases "
+            "(seed the checked-in benchmarks from the Cases page if it is empty)."
+        )
+
     @app.post("/api/runs/preflight")
     def preflight_run_config(
         config: RunConfigCreate, session: Session = Depends(get_session)
@@ -2061,6 +2932,9 @@ def create_app() -> FastAPI:
         and measuring its context window) is memoized, so pressing Create right
         after costs nothing extra.
         """
+        missing = _unknown_cases(session, [config.case_id])
+        if missing:
+            return {"ok": False, "detail": _unknown_case_detail(missing)}
         try:
             RunService(session).preflight(config)
         except RunPreflightError as exc:
@@ -2069,6 +2943,9 @@ def create_app() -> FastAPI:
 
     @app.post("/api/runs")
     def create_run(data: RunCreate, session: Session = Depends(get_session)):
+        missing = _unknown_cases(session, [data.config.case_id])
+        if missing:
+            raise HTTPException(status_code=422, detail=_unknown_case_detail(missing))
         try:
             return RunService(session, enqueue=enqueue_run).create_run(data)
         except RunPreflightError as exc:
@@ -2086,6 +2963,9 @@ def create_app() -> FastAPI:
         request with 422 and persists nothing, so the caller never has to unpick
         a partially-created batch.
         """
+        missing = _unknown_cases(session, list(data.case_ids))
+        if missing:
+            raise HTTPException(status_code=422, detail=_unknown_case_detail(missing))
         try:
             batch_id, runs = RunService(session, enqueue=enqueue_run).create_batch(data)
         except RunBatchTooLargeError as exc:
@@ -2160,6 +3040,8 @@ def create_app() -> FastAPI:
             # saw the target repository's own setup or the one the lab injected.
             "harness_source": config.harness_source.value,
             "executor_model": config.executor_model or "",
+            # "" is the CLI's own default (ADR-0081), not an unknown.
+            "executor_effort": config.executor_effort,
             "planner_model": config.planner_model or "",
             "target_repo_id": config.target_repo_id,
             "target_name": target.name if target else "",
@@ -2177,14 +3059,35 @@ def create_app() -> FastAPI:
             ),
             "max_steps": config.max_steps,
             "parent_run_id": run.parent_run_id or "",
+            # A case that ships a game says how to start it (ADR-0078); the run
+            # page then offers a Play tab that opens the game in a desktop.
+            "play_command": _safe_play_command(case),
+            # What a person needs to play it: the case's guide, and the keys the
+            # game really bound, read from the grader's harvest of its InputMap.
+            "play_guide": _safe_play_guide(case),
+            "bound_keys": _bound_keys(get_settings().data_runs_dir / run.run_id),
         }
 
     @app.get("/api/runs/{run_id}/validation")
     def get_validation(run_id: str, session: Session = Depends(get_session)):
+        """The run's validation. A subscription run's cost stays unknown
+        (``cost_usd: null``, ADR-0094); beside it, ``estimated_cost_usd`` prices
+        its tokens at the provider's API list price, computed on read so runs
+        validated before the estimate existed get it too."""
+        from harness_lab_app.api_price_estimate import with_estimate
+        from harness_lab_app.models import Run, RunConfig
+
         validation = ValidationService(session).get_validation(run_id)
         if validation is None:
             raise HTTPException(status_code=404, detail="No validation for this run")
-        return validation
+        body = validation.model_dump()
+        if (validation.cost or {}).get("cost_source") == "subscription_quota":
+            run = session.exec(select(Run).where(Run.run_id == run_id)).first()
+            config = session.get(RunConfig, run.run_config_id) if run else None
+            body["cost"] = with_estimate(
+                validation.cost, config.executor_model if config else None
+            )
+        return body
 
     @app.get("/api/runs/{run_id}/attribution")
     def get_attribution(run_id: str, session: Session = Depends(get_session)):
@@ -2483,11 +3386,91 @@ def create_app() -> FastAPI:
 
     @app.post("/api/runs/{run_id}/cancel")
     def cancel_run(run_id: str, session: Session = Depends(get_session)):
+        # A cancelled run is graded on the work it left (ADR-0080), so this is
+        # also the page's "Stop and grade" for a slow phase.
         return RunService(session).cancel_run(run_id)
 
+    @app.post("/api/runs/{run_id}/keep-waiting")
+    def keep_waiting(run_id: str, session: Session = Depends(get_session)):
+        """Give a slow phase more time instead of letting its policy stop it."""
+        seconds = int(getattr(get_settings(), "run_phase_extend_seconds", 1800))
+        try:
+            run = RunService(session).keep_waiting(run_id, seconds)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"run_id": run.run_id, "extra_wait_seconds": run.extra_wait_seconds}
+
+    @app.get("/api/runs/{run_id}/progress")
+    def get_run_progress(run_id: str, session: Session = Depends(get_session)):
+        """What the run is doing now: phase, time, cost, last action, live grades."""
+        from harness_lab_app.models import Validation
+        from harness_lab_app.run_progress import (
+            fill_final_grades,
+            progress_clock,
+            read_progress,
+        )
+
+        service = RunService(session)
+        try:
+            run = service.get_run(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        config = service.get_run_config(run.run_config_id)
+        run_dir = get_settings().data_runs_dir / run_id
+        prompt_path = run_dir / "prompt.md"
+        first_prompt = (
+            prompt_path.read_text(errors="replace") if prompt_path.is_file() else ""
+        )
+        progress = read_progress(
+            run_dir,
+            max_steps=int(config.max_steps or 0),
+            first_prompt=first_prompt,
+            # A finished run is read at its end, not at the present.
+            now=progress_clock(run.ended_at),
+        )
+        # A phase graded after the run (the per-step reward) shows that grade
+        # where no live one exists: a run that predates live grading, or a
+        # phase that ended as the run did.
+        validation = session.exec(
+            select(Validation).where(Validation.run_id == run_id)
+        ).first()
+        fill_final_grades(
+            progress, ((validation.objective or {}) if validation else {})
+        )
+        progress["state"] = str(run.state)
+        progress["extra_wait_seconds"] = int(run.extra_wait_seconds or 0)
+        progress["extend_seconds"] = int(
+            getattr(get_settings(), "run_phase_extend_seconds", 1800)
+        )
+        return progress
+
+    @app.get("/api/runs/{run_id}/retry-options")
+    def retry_options(run_id: str, session: Session = Depends(get_session)):
+        """Whether the run can continue where it stopped, and from which step."""
+        service = RunService(session)
+        try:
+            service.get_run(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return service.retry_options(run_id)
+
     @app.post("/api/runs/{run_id}/retry")
-    def retry_run(run_id: str, session: Session = Depends(get_session)):
-        return RunService(session, enqueue=enqueue_run).retry_run(run_id)
+    def retry_run(
+        run_id: str,
+        mode: str = "resume",
+        session: Session = Depends(get_session),
+    ):
+        """Run it again: ``scratch`` (from nothing), ``continue`` (after the last
+        completed step) or ``resume`` (every step over the workspace left)."""
+        service = RunService(session, enqueue=enqueue_run)
+        try:
+            service.get_run(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        try:
+            return service.retry_run(run_id, mode)
+        except RunRetryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/runs/{run_id}/continue")
     def continue_run(

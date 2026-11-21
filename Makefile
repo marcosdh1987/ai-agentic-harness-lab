@@ -23,7 +23,7 @@ export ENVIRONMENT=localhost
 VENV_DIR ?= .venv
 KERNEL_NAME=ai-kernel
 TEMPLATE_REMOTE ?= template
-TEMPLATE_REPO ?= git@github.com:marcosdh1987/ml-python-base.git
+TEMPLATE_REPO ?= git@github.com:xmartlabs/sdlc-ml-python-template.git
 TEMPLATE_BRANCH ?= main
 
 # Declarative skills/adapters sync engine (replaces inline bash projection).
@@ -84,7 +84,7 @@ setup-hooks:
 	@if [ ! -d .venv ]; then make install; fi
 	@echo "📦 Syncing dev dependencies required for hooks..."
 	@uv sync --group dev
-	@. $(VENV_DIR)/bin/activate && pre-commit install
+	@. $(VENV_DIR)/bin/activate && pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push
 	@echo "✅ Hooks installed!"
 
 # =============================================================================
@@ -141,22 +141,25 @@ fix-force:
 # SYSTEM TESTING
 # =============================================================================
 
-# Run all tests with coverage
+# Run all tests with coverage; fail on test/collection errors without editing code.
 test:
 	@echo "🧪 Running tests with coverage..."
 	@if [ ! -d .venv ]; then make install; fi
-	@echo "🎨 Running format before tests..."
-	@make format
-	@echo "🔧 Running fix before tests..."
-	@make fix
-	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ --cov=src --cov-report=html --cov-report=term-missing || echo "⚠️  No tests found to run"
+	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ --cov=src --cov-report=html --cov-report=term-missing
 	@echo "✅ Tests completed! See report in htmlcov/index.html"
 
 # Run specific tests
 test-unit:
 	@echo "🧪 Running unit tests..."
 	@if [ ! -d .venv ]; then make install; fi
-	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ -v
+	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ -m "not integration" -v
+
+# Deterministic integration tests; live Docker/model smoke checks stay separate.
+.PHONY: test-integration
+test-integration:
+	@echo "🧪 Running integration tests..."
+	@if [ ! -d .venv ]; then make install; fi
+	@. $(VENV_DIR)/bin/activate && PYTHONPATH=${PWD}/src pytest tests/ -m integration -v
 
 # =============================================================================
 # OPENCODE RUNTIME (self-hosted / cloud, configured via .env)
@@ -164,6 +167,11 @@ test-unit:
 
 # Launch the opencode TUI with .env loaded so opencode.json {env:...} resolves.
 # Installs opencode-conductor-plugin into the global opencode config dir on first run.
+# Before launching, scripts/opencode_context.py reads the context window each
+# self-hosted model in .env is serving (LM Studio / Ollama) and exports an
+# OPENCODE_CONFIG_CONTENT overlay declaring it, so opencode compacts inside the
+# served window instead of overflowing it (ADR-0063). HARNESS_LAB_CONTEXT_AUTODETECT=0
+# skips the probe.
 opencode:
 	@command -v opencode >/dev/null 2>&1 || { echo "❌ opencode not found. Install: brew install anomalyco/tap/opencode"; exit 1; }
 	@[ -f .env ] || echo "⚠️  no .env found — copy .env.example to .env and edit (or use 'opencode auth login' / the /models picker)."
@@ -171,7 +179,8 @@ opencode:
 	  echo "🔌 Installing opencode-conductor-plugin..."; \
 	  npm install --prefix "$$HOME/.config/opencode" opencode-conductor-plugin; \
 	fi
-	@set -a; [ -f .env ] && . ./.env; set +a; opencode
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	eval "$$(uv run python scripts/opencode_context.py)"; opencode
 
 # Start a benchmark run: register, create workspace, inject prompt, launch opencode.
 # Usage: make bench-start RUN=tetris-v1-A-002 [KEY=sk-xxx]
@@ -204,6 +213,9 @@ bench-close:
 #
 # Dry run (print what would happen, write nothing):
 #   make bench-run ... DRY_RUN=1
+#
+# Reasoning effort for a claude-harness run (ADR-0081; low|medium|high|xhigh|max):
+#   make bench-run ... EXECUTOR_EFFORT=high
 bench-run:
 	@[ -n "$(CASE)" ] || { echo "❌ CASE is required. Example: CASE=tetris-v1"; exit 1; }
 	@[ -n "$(RUN)" ] || { echo "❌ RUN is required. Example: RUN=tetris-v1-A-003"; exit 1; }
@@ -219,6 +231,7 @@ bench-run:
 		$(if $(PROMPT),--prompt $(PROMPT),) \
 		$(if $(PLANNER_MODEL),--planner-model $(PLANNER_MODEL),) \
 		$(if $(EXECUTOR_MODEL),--executor-model $(EXECUTOR_MODEL),) \
+		$(if $(EXECUTOR_EFFORT),--executor-effort $(EXECUTOR_EFFORT),) \
 		$(if $(SCORE_MODE),--score-mode $(SCORE_MODE),) \
 		$(if $(SCORE),--score $(SCORE),) \
 		$(if $(INTERVENTIONS),--interventions $(INTERVENTIONS),) \
@@ -414,13 +427,21 @@ build-fresh:
 # api + celery worker + redis + the Vite dev server.
 app-up:
 	@echo "🚀 Starting local web app stack..."
+	@mkdir -p "$(AUTH_DIR)" && chmod 700 "$(AUTH_DIR)"
 	@docker compose build runner sandbox
-	@docker compose --profile dev up -d --build api worker redis frontend
+	@docker compose --profile dev up -d --build api worker worker-parallel worker-interactive redis frontend
 	@if [ "$$HARNESS_LAB_API_BIND_ADDR" = "0.0.0.0" ] \
 		&& ! grep -qs '^HARNESS_LAB_ADMIN_PASSWORD_HASH=.\+' .env; then \
 		echo "⚠️  API published on 0.0.0.0:$${HARNESS_LAB_API_PORT:-8009} with NO authentication —"; \
 		echo "    anyone on your network can start runs, which execute code."; \
 		echo "    Run: make set-password"; \
+	fi
+	@# The 3D cases run in their own Godot image (ADR-0078), ~6.5 GB, which
+	@# app-up does not build. Say so here rather than in a failed run.
+	@if ls benchmarks/*3d*/task.yaml >/dev/null 2>&1 \
+		&& ! docker image inspect harness-lab-runner-godot:latest >/dev/null 2>&1; then \
+		echo "ℹ️  The 3D cases (chess3d, racing3d, opencity3d) need their Godot image, not built yet."; \
+		echo "    Build it once with: make images-3d   (a few minutes; the run preflight refuses them until then)"; \
 	fi
 
 # Stop the dev stack. Containers are removed; named volumes and everything
@@ -445,7 +466,7 @@ app-up-prod:
 		|| echo "⚠️  No admin password set — the UI is open. Run: make set-password"
 	@docker compose build runner sandbox
 	@HARNESS_LAB_API_BIND_ADDR=127.0.0.1 \
-		docker compose --profile prod up -d --build api worker redis frontend-prod
+		docker compose --profile prod up -d --build api worker worker-parallel worker-interactive redis frontend-prod
 	@echo "✅ http://localhost:8080 (set HARNESS_LAB_BIND_ADDR=0.0.0.0 for LAN access)"
 
 app-down-prod:
@@ -487,13 +508,40 @@ app-worker-host:
 		docker run -d --rm --name harness-lab-redis-host -p 6379:6379 redis:7-alpine >/dev/null
 	@echo "🧑‍💻 Celery worker on host (subprocess backend — codex/claude ready)…"
 	@. $(VENV_DIR)/bin/activate && $(_HOST_ENV) \
-		celery -A harness_lab_app.celery_app worker -Q runs --loglevel=info --concurrency=1
+		celery -A harness_lab_app.celery_app worker -Q runs,interactive --loglevel=info --concurrency=1
 
 app-api-host:
 	@if [ ! -d .venv ]; then make install; fi
 	@echo "🧑‍💻 Web API on host (subprocess backend) at :8009…"
 	@. $(VENV_DIR)/bin/activate && $(_HOST_ENV) \
 		uvicorn harness_lab_app.api:app --host 0.0.0.0 --port 8009 --reload
+
+# Subscription logins for the codex / gemini harnesses (ADR-0094). Each CLI
+# keeps its session in its own directory under AUTH_DIR, outside the repo; a
+# run mounts only its own provider's. The official CLI performs the login:
+# nothing here reads, copies or prints a token.
+AUTH_DIR ?= $(or $(HARNESS_LAB_AUTH_DIR),$(HOME)/.harness-lab/auth)
+_AUTH_PY = $(VENV_DIR)/bin/python -c
+
+auth-codex:
+	@if ! command -v codex >/dev/null 2>&1; then echo "❌ codex CLI not found — npm install -g @openai/codex@0.171.0"; exit 1; fi
+	@HARNESS_LAB_AUTH_DIR="$(AUTH_DIR)" $(_AUTH_PY) 'from harness_lab_app.native_auth import ensure_session_dir as e; print(e("codex"))' >/dev/null
+	@echo "🔐 Codex: sign in with your ChatGPT plan (device code; works headless)."
+	@echo "   Session: $(AUTH_DIR)/codex  (never ~/.codex)"
+	@CODEX_HOME="$(AUTH_DIR)/codex" codex login --device-auth
+	@CODEX_HOME="$(AUTH_DIR)/codex" codex login status
+
+auth-gemini:
+	@if ! command -v gemini >/dev/null 2>&1; then echo "❌ gemini CLI not found — npm install -g @google/gemini-cli@0.70.0"; exit 1; fi
+	@HARNESS_LAB_AUTH_DIR="$(AUTH_DIR)" $(_AUTH_PY) 'from harness_lab_app.native_auth import ensure_session_dir as e; print(e("gemini"))' >/dev/null
+	@echo "🔐 Gemini CLI: choose 'Sign in with Google' (Google AI Pro/Ultra account),"
+	@echo "   open the printed URL, paste the code back, then type /quit."
+	@echo "   Session: $(AUTH_DIR)/gemini/.gemini  (never ~/.gemini)"
+	@GEMINI_CLI_HOME="$(AUTH_DIR)/gemini" NO_BROWSER=true GOOGLE_GENAI_USE_GCA=true \
+		env -u GEMINI_API_KEY -u GOOGLE_API_KEY gemini
+
+auth-status:
+	@HARNESS_LAB_AUTH_DIR="$(AUTH_DIR)" $(_AUTH_PY) 'import json; from harness_lab_app.native_auth import session_status as s; print(json.dumps([s("codex"), s("gemini")], indent=2))'
 
 # One command for host mode: redis + worker + API + frontend together, so the
 # codex/claude harnesses run against your host CLIs. Ctrl-C stops everything.
@@ -504,7 +552,7 @@ app-host:
 		docker run -d --rm --name harness-lab-redis-host -p 6379:6379 redis:7-alpine >/dev/null
 	@echo "🧑‍💻 Host mode (codex/claude ready): worker + API + frontend. Ctrl-C stops all."
 	@. $(VENV_DIR)/bin/activate; \
-		$(_HOST_ENV) celery -A harness_lab_app.celery_app worker -Q runs --loglevel=info --concurrency=1 & \
+		$(_HOST_ENV) celery -A harness_lab_app.celery_app worker -Q runs,interactive --loglevel=info --concurrency=1 & \
 		worker_pid=$$!; \
 		$(_HOST_ENV) uvicorn harness_lab_app.api:app --host 0.0.0.0 --port 8009 & \
 		api_pid=$$!; \
@@ -515,6 +563,15 @@ app-host:
 sandbox-build:
 	@echo "🧰 Building sandbox image (ttyd + Xvfb + noVNC)..."
 	@docker compose build sandbox
+
+# Images for 3D game cases (ADR-0078): runner + sandbox with the Godot engine.
+# Only the cases that name them use them; `make app-up` never builds them.
+images-3d:
+	@echo "🎮 Building the 3D game images (runner + sandbox with Godot)..."
+	@docker image inspect harness-lab-runner:latest >/dev/null 2>&1 || docker compose build runner
+	@docker image inspect harness-lab-sandbox:latest >/dev/null 2>&1 || docker compose build sandbox
+	@docker compose build runner-godot sandbox-godot
+	@docker run --rm --network none harness-lab-runner-godot:latest godot --headless --version
 
 # Smoke-test the runner image directly against the host gateway (no Celery):
 # proves opencode-in-container can reach LiteLLM/LM Studio on the host.
@@ -557,6 +614,56 @@ app-smoke-test:
 ladder:
 	@[ -n "$(MODEL)" ] || { echo "❌ MODEL is required. Example: MODEL=claude-haiku-4-5-20251001"; exit 1; }
 	@uv run python scripts/ladder.py $(if $(CASES),--cases $(CASES),) --model $(MODEL) --harness $(or $(HARNESS),claude) --reps $(or $(REPS),2) $(if $(LAUNCH),--launch,)
+
+# Lab scripts that open the database run inside the api container while the
+# stack is up: on the Docker Desktop bind mount, SQLite's WAL index is not shared
+# between the host and the containers. With the stack down they run on the host.
+# An explicit HARNESS_LAB_DATABASE_URL (e.g. a scratch copy) always runs on the
+# host: the container would ignore it and write to the live lab database.
+# Usage in a recipe: @$(LAB_PY) scripts/foo.py --flag ...
+LAB_PY = py="uv run python"; [ -z "$$HARNESS_LAB_DATABASE_URL" ] && docker compose ps --services --filter status=running 2>/dev/null | grep -qx api && py="docker compose exec -T api python"; $$py
+
+# Leave-one-out pruning (ADR-0076): full harness vs the same harness minus one
+# skill, per skill. The summary says removable / keep / inconclusive per skill.
+# Without ITEMS, the skills the per-step reward credits least are tried first.
+# GROUP=1 (ADR-0085) removes the items together in one arm; without ITEMS it
+# takes every skill no measured run ever opened (see `make skill-census`).
+# ALL=1 removes the whole catalog in one arm: does this model need skills at all?
+# Usage: make prune MODEL=claude-haiku-4-5-20251001 CASES="tetris-v2 cli-textstats-v1 clinic-slots-t1" [ITEMS="a b" TOP=4 REPS=3 HARNESS=claude GROUP=1 ALL=1 PROMPT=default LAUNCH=1]
+prune:
+	@[ -n "$(MODEL)" ] || { echo "❌ MODEL is required. Example: MODEL=claude-haiku-4-5-20251001"; exit 1; }
+	@[ -n "$(CASES)" ] || { echo "❌ CASES is required (3+ cases for a verdict)."; exit 1; }
+	@$(LAB_PY) scripts/prune.py --cases $(CASES) --model $(MODEL) --harness $(or $(HARNESS),claude) --reps $(or $(REPS),3) --top $(or $(TOP),4) $(if $(ITEMS),--items $(ITEMS),) $(if $(GROUP),--group,) $(if $(ALL),--group --all,) $(if $(PROMPT),--prompt $(PROMPT),) $(if $(LAUNCH),--launch,)
+
+# Skill census (ADR-0085): which skills each model / case / harness opens, with
+# what each skill costs to carry. Read-only. Runs inside the api container when
+# the stack is up — the lab DB must not be opened from the host across the
+# Docker Desktop bind mount.
+# Usage: make skill-census [BY=model|case|harness] [JSON=1]
+skill-census:
+	@$(LAB_PY) scripts/skill_census.py --by $(or $(BY),model) $(if $(JSON),--json,)
+
+# Read-only readiness checklist before a demo: docker, credential (names only),
+# API and cases. Writes nothing. Usage: make demo-check [API=http://localhost:8009]
+demo-check:
+	@uv run python scripts/demo_check.py $(API)
+
+# Deterministic harness checks on any local git repo — no stack, no model.
+# Exits 1 when a check fails. Usage: make harness-check REPO=../my-project [REF=main]
+harness-check:
+	@[ -n "$(REPO)" ] || { echo "❌ REPO is required. Example: REPO=../my-project"; exit 1; }
+	@uv run python scripts/harness_check.py --repo '$(REPO)' $(if $(REF),--ref '$(REF)',)
+
+# Carry the lab's harness — or just some skills — into your own repository
+# (ADR-0072). Previews by default; APPLY=1 writes. Refuses uncommitted work.
+# Usage: make harness-export REPO=../my-project [TOOL=claude] [SKILLS=a,b] [GOVERNANCE=0] [APPLY=1]
+#        make harness-export LIST=1   # the skill names you can export
+harness-export:
+	@if [ -n "$(LIST)" ]; then uv run python scripts/harness_export.py --list; exit 0; fi; \
+	[ -n "$(REPO)" ] || { echo "❌ REPO is required. Example: REPO=../my-project (or LIST=1 for the skill names)"; exit 1; }
+	@uv run python scripts/harness_export.py --repo '$(REPO)' --tool '$(or $(TOOL),claude)' \
+		$(if $(SKILLS),--skills '$(SKILLS)',) $(if $(filter 0,$(GOVERNANCE)),--no-governance,) \
+		$(if $(APPLY),--apply,)
 
 # Import a hand-authored benchmark case from its task.yaml (idempotent).
 # Usage: make case-import TASK=benchmarks/cli-textstats/task.yaml
@@ -716,12 +823,15 @@ ci:
 # Renames the package, rewrites references (keeping the upstream template URL),
 # creates .env, then chains environment setup and the read-only gates.
 # Usage:
-#   make init NAME=my_project
+#   make init NAME=my_project [PROFILE=minimal|full]
+# PROFILE picks the skills the project starts with (ADR-0085; default minimal):
+# it writes harness.toml, and `sync-skills` links and lists only those. The
+# other skills stay in .github/skills*/, one harness.toml line away.
 # Preview without writing:
 #   python3 scripts/init_project.py --name my_project --dry-run
 init:
 	@[ -n "$(NAME)" ] || { echo "❌ Usage: make init NAME=my_project"; exit 1; }
-	@python3 scripts/init_project.py --name "$(NAME)"
+	@python3 scripts/init_project.py --name "$(NAME)" $(if $(PROFILE),--profile "$(PROFILE)",)
 	@$(MAKE) install
 	@$(MAKE) sync-skills
 	@$(MAKE) template-remote-setup
@@ -876,6 +986,40 @@ sync-skills:
 check-sync:
 	@$(SKILLS_SYNC) check
 
+# Skill profiles (ADR-0085): list them and what this repo carries, or select one
+# (writes harness.toml and rebuilds the views). Usage: make skill-profile [SET=minimal]
+skill-profile:
+	@$(SKILLS_SYNC) profile $(if $(SET),--set $(SET),)
+
+# Lab: a profile x model grid (harness_by_model). Usage:
+# make skill-profile-experiment MODELS="claude-haiku-4-5-20251001 claude-opus-5-5" CASES="a b c" [PROFILES="full minimal" REPS=3 LAUNCH=1]
+skill-profile-experiment:
+	@[ -n "$(MODELS)" ] || { echo "❌ MODELS is required (two or more)."; exit 1; }
+	@[ -n "$(CASES)" ] || { echo "❌ CASES is required (3+ cases for a verdict)."; exit 1; }
+	@$(LAB_PY) scripts/profile_experiment.py --models $(MODELS) --cases $(CASES) $(if $(PROFILES),--profiles $(PROFILES),) --reps $(or $(REPS),3) --harness $(or $(HARNESS),claude) $(if $(LAUNCH),--launch,)
+
+# Lab: A/B a rewritten skill (staged under its own name) against the governed one.
+# Usage: make refine-skill SKILL=verify_changes CANDIDATE=verify_changes-v2 MODEL=... CASES="a b c" [PROFILE=minimal INVOKE=1 REPS=3 LAUNCH=1]
+refine-skill:
+	@[ -n "$(SKILL)" ] && [ -n "$(CANDIDATE)" ] || { echo "❌ SKILL and CANDIDATE are required."; exit 1; }
+	@[ -n "$(MODEL)" ] || { echo "❌ MODEL is required."; exit 1; }
+	@[ -n "$(CASES)" ] || { echo "❌ CASES is required (3+ cases for a verdict)."; exit 1; }
+	@$(LAB_PY) scripts/refine_skill.py --skill $(SKILL) --candidate $(CANDIDATE) --model $(MODEL) --cases $(CASES) $(if $(PROFILE),--profile $(PROFILE),) $(if $(INVOKE),--invoke,) --reps $(or $(REPS),3) --harness $(or $(HARNESS),claude) $(if $(LAUNCH),--launch,)
+
+# Lab: trial one governed skill on top of a profile, asked for (ADR-0089).
+# Usage: make add-skill-trial SKILL=sensible_testing MODEL=... CASES="a b c" [PROFILE=minimal REPS=3 LAUNCH=1]
+add-skill-trial:
+	@[ -n "$(SKILL)" ] || { echo "❌ SKILL is required."; exit 1; }
+	@[ -n "$(MODEL)" ] || { echo "❌ MODEL is required."; exit 1; }
+	@[ -n "$(CASES)" ] || { echo "❌ CASES is required (target cases plus one general case)."; exit 1; }
+	@$(LAB_PY) scripts/add_skill_trial.py --skill $(SKILL) --model $(MODEL) --cases $(CASES) $(if $(PROFILE),--profile $(PROFILE),) --reps $(or $(REPS),3) --harness $(or $(HARNESS),claude) $(if $(LAUNCH),--launch,)
+
+# Lab: stage a case's candidate skill (benchmarks/<case>/candidate-skill/<name>/) so an
+# "Add skills" experiment can trial it (ADR-0087). Usage: make stage-candidate SKILL=review_pull_request [REPLACE=1]
+# Without SKILL it lists the candidates.
+stage-candidate:
+	@$(LAB_PY) scripts/stage_candidate_skill.py $(if $(SKILL),--skill $(SKILL),--list) $(if $(REPLACE),--replace,)
+
 # Regenerate each case's `harness` prompt from its `default` sibling (ADR-0047).
 prompts:
 	@. $(VENV_DIR)/bin/activate && python scripts/build_prompt_variants.py
@@ -893,8 +1037,11 @@ help:
 	@echo "🧰 Agentic Harness Lab - Available Commands:"
 	@echo ""
 	@echo "Development Setup:"
-	@echo "  make init NAME=my_project Bootstrap a fresh clone as a new project (rename + env + gates)"
+	@echo "  make init NAME=my_project Bootstrap a fresh clone as a new project (rename + env + gates; PROFILE=minimal)"
 	@echo "  make install              Set up virtual environment and dependencies"
+	@echo "  make auth-codex           Sign Codex CLI in with your ChatGPT plan (lab session, not ~/.codex)"
+	@echo "  make auth-gemini          Sign Gemini CLI in with Google (lab session, not ~/.gemini)"
+	@echo "  make auth-status          Show whether the codex/gemini subscription sessions exist"
 	@echo "  make setup-hooks          Set up pre-commit hooks"
 	@echo "  make generate-requirements Generate requirements.txt from current environment"
 	@echo ""
@@ -910,6 +1057,7 @@ help:
 	@echo "Testing:"
 	@echo "  make test                 Run all tests with coverage"
 	@echo "  make test-unit            Run unit tests only"
+	@echo "  make test-integration     Run marked integration tests"
 	@echo ""
 	@echo "Application Execution (Local):"
 	@echo "  make app-up              Start the local web app (api + celery worker + redis + frontend)"
@@ -949,6 +1097,11 @@ help:
 	@echo "  make render-adapters     Regenerate the managed skill region in every adapter file"
 	@echo "  make sync-skills         Sync external skills to .github/skills-external and refresh native adapters"
 	@echo "  make check-sync          Fail if generated skill artifacts are stale (CI drift gate)"
+	@echo "  make skill-profile [SET=] List skill profiles / select one into harness.toml (ADR-0085)"
+	@echo "  make skill-census        Skill usage per model/case/harness, with each skill's size"
+	@echo "  make skill-profile-experiment / refine-skill   Lab experiments on profiles and rewrites"
+	@echo "  make add-skill-trial SKILL=<name>   Trial one skill on top of a profile (default minimal)"
+	@echo "  make stage-candidate SKILL=<name>   Stage a case's candidate skill for a trial (lists them without SKILL)"
 	@echo "  make purge-external-skills Purge all external skills and reset metadata"
 	@echo "  make langfuse-check      Verify the Langfuse host and credentials"
 	@echo "  make langfuse-export     Export one run's traces (RUN=... [DRY=1])"
@@ -969,4 +1122,4 @@ clean:
 .DEFAULT_GOAL := help
 
 # Declare phony targets
-.PHONY: init install setup-hooks opencode opencode-doctor build-api run-api-docker stop-docker build-fresh app-up app-down app-up-prod app-down-prod app-reset-db backup app-smoke-test app-runner-smoke app-test clean help generate-requirements test test-unit format lint lint-fast fix fix-force check typecheck ci template-remote-setup template-sync-preview template-sync-merge template-sync-rebase setup-claude-skills setup-antigravity-skills setup-opencode-skills sync-agents render-adapters sync-skills check-sync prompts prompts-check purge-external-skills sync-gateway-models set-password case-import app-worker-host app-api-host app-host improve harness-proposal harness-proposal-issue harness-status harness-sync-preview harness-sync-branch harness-sync-clean langfuse-check langfuse-export langfuse-backfill
+.PHONY: auth-codex auth-gemini auth-status init install setup-hooks opencode opencode-doctor build-api run-api-docker stop-docker build-fresh app-up app-down app-up-prod app-down-prod app-reset-db backup app-smoke-test app-runner-smoke app-test images-3d sandbox-build clean help generate-requirements test test-unit format lint lint-fast fix fix-force check typecheck ci template-remote-setup template-sync-preview template-sync-merge template-sync-rebase setup-claude-skills setup-antigravity-skills setup-opencode-skills sync-agents render-adapters sync-skills check-sync prompts prompts-check purge-external-skills sync-gateway-models set-password demo-check harness-check harness-export case-import app-worker-host app-api-host app-host improve harness-proposal harness-proposal-issue harness-status harness-sync-preview harness-sync-branch harness-sync-clean langfuse-check langfuse-export langfuse-backfill prune skill-census skill-profile skill-profile-experiment refine-skill add-skill-trial stage-candidate

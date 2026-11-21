@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException, Response
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from harness_lab_app import api
 from harness_lab_app.api import LoginRequest, create_app
@@ -155,6 +155,35 @@ def test_delete_run_endpoint_404_when_missing():
         assert exc.value.status_code == 404
 
 
+def test_retry_endpoints_404_when_the_run_is_missing():
+    """A stale run page asks about a run that is gone: not found, never a 500."""
+    app = create_app()
+    options = _route_endpoint(app, "/api/runs/{run_id}/retry-options")
+    retry = _route_endpoint(app, "/api/runs/{run_id}/retry", method="POST")
+    with _session() as session:
+        with pytest.raises(HTTPException) as exc:
+            options("ghost", session)
+        assert exc.value.status_code == 404
+        with pytest.raises(HTTPException) as exc:
+            retry("ghost", "resume", session)
+        assert exc.value.status_code == 404
+
+
+def test_retry_endpoint_does_not_call_a_broken_config_not_found(monkeypatch):
+    """Only an unknown run is a 404; any other ValueError is not "not found"."""
+    app = create_app()
+    retry = _route_endpoint(app, "/api/runs/{run_id}/retry", method="POST")
+
+    def broken(self, run_id, mode="resume"):
+        raise ValueError("stored config no longer validates")
+
+    monkeypatch.setattr(RunService, "retry_run", broken)
+    with _session() as session:
+        _seed_run(session, "api-retry-broken")
+        with pytest.raises(ValueError, match="no longer validates"):
+            retry("api-retry-broken", "resume", session)
+
+
 def test_delete_run_endpoint_409_when_running():
     app = create_app()
     delete = _route_endpoint(app, "/api/runs/{run_id}", method="DELETE")
@@ -211,11 +240,27 @@ def test_start_sandbox_endpoint_409_without_workspace():
         assert exc.value.status_code == 409
 
 
+def _seed_case(session: Session, case_id: str = "tetris-v1") -> None:
+    """A Case row: the API refuses a run for a case it does not know."""
+    from harness_lab_app.models import Case, CaseType
+
+    session.add(
+        Case(
+            case_id=case_id,
+            name=case_id,
+            type=CaseType.single_prompt,
+            prompt_variants={"sdlc": "Build it.", "harness": "Build it."},
+        )
+    )
+    session.commit()
+
+
 def test_validate_run_endpoint_greenlights_a_runnable_config():
     """The run form's Validate button: same checks as create, nothing written."""
     app = create_app()
     validate = _route_endpoint(app, "/api/runs/preflight", method="POST")
     with _session() as session:
+        _seed_case(session)
         result = validate(
             RunConfigCreate(
                 case_id="tetris-v1",
@@ -232,6 +277,7 @@ def test_validate_run_endpoint_reports_the_reason_instead_of_raising():
     app = create_app()
     validate = _route_endpoint(app, "/api/runs/preflight", method="POST")
     with _session() as session:
+        _seed_case(session)
         result = validate(
             RunConfigCreate(
                 case_id="tetris-v1",
@@ -242,6 +288,27 @@ def test_validate_run_endpoint_reports_the_reason_instead_of_raising():
         )
         assert result["ok"] is False
         assert "Executor model is required" in result["detail"]
+
+
+def test_a_run_for_an_unknown_case_is_refused_before_it_is_queued():
+    """A stale case id (a renamed benchmark, a form state that outlived its
+    list) used to queue a run that failed in the runner with "Unknown case"."""
+    app = create_app()
+    validate = _route_endpoint(app, "/api/runs/preflight", method="POST")
+    create = _route_endpoint(app, "/api/runs", method="POST")
+    config = RunConfigCreate(
+        case_id="tetris-v1", prompt_variant="harness", executor_model="stub-executor"
+    )
+    with _session() as session:
+        verdict = validate(config, session)
+        assert verdict["ok"] is False
+        assert "Unknown case(s): tetris-v1" in verdict["detail"]
+        with pytest.raises(HTTPException) as refused:
+            create(RunCreate(config=config), session)
+        assert refused.value.status_code == 422
+        from harness_lab_app.models import Run
+
+        assert session.exec(select(Run)).all() == []
 
 
 def test_validate_run_endpoint_persists_nothing():

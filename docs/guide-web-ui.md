@@ -7,12 +7,18 @@ walks the end-to-end flow and what each screen does.
 
 Start it with `make app-up` (brings up api + worker + redis + frontend).
 
+> **This is the screen-by-screen reference.** To get something done — make a case,
+> run a comparison, read a result, audit a repository, take a skill home — start at
+> [docs/README.md](README.md): six one-page journeys that send you here when you need
+> the detail.
+
 ## The core loop
 
 ```
 pick a Case → choose model + harness + prompt → Create run
    → watch it execute (logs stream live)
-   → it finishes: SWE-bench auto-scores; a case with a rubric is LLM-judged
+   → it finishes: a case with validation commands scores itself;
+     one with only a rubric is LLM-judged
    → Compare runs across models / conditions
 ```
 
@@ -34,7 +40,7 @@ state a question → declare the arms → launch N repetitions
    → record a finding → test it with another experiment
 ```
 
-## Four ways to use the lab
+## Five ways to use the lab
 
 The screens below document *what each one does*. This section is the other half:
 **which job you are doing**, and which screens that job touches.
@@ -96,6 +102,34 @@ Nothing is ablated, so the result says nothing about the harness. The sentence i
 licenses is "this subject passed N of M under `<harness>`/`<model>`", and it never
 adds the arms together. Lane C of
 [guide-skill-validation.md](guide-skill-validation.md) is the walkthrough.
+
+### Mode E — does a stronger model need less harness?
+
+**Home → Does a stronger model need less harness?** (or **Evaluate → Harness x
+model**) builds a full grid: every harness level on every model. Pick cases — ones the
+smallest model does not already pass without a harness — and models, listed smallest
+first, current generation before previous. The harness levels form a nested ladder:
+**no harness** (governance masked), **governance only** (rules on, every skill off) and
+**full harness**; untick the middle rung for a two-level grid. Models the configured
+gateway does not serve are marked before launch, and the form states the run count.
+
+The experiment page shows a **Harness x model** panel instead of a comparison:
+
+- each cell's pass rate, with cost per resolved task;
+- the harness effect per model with its 95% interval;
+- the interaction — how the effect changes from the first model to the last — with
+  its interval and one sentence of reading.
+
+The change is called *established* only when its interval excludes zero **and** at
+least three cases were scored in every cell; the cases, not the repetitions, are the
+unit of evidence. The interaction's interval is conservative by construction and can
+extend past what the design could reach.
+See [ADR-0066](adr/0066-harness-and-model-vary-together-only-in-a-full-grid.md).
+
+When the cases carry `tier:<name>` tags, a **Capability frontier** panel follows: per
+arm, the highest tier done reliably (ADR-0069). A tier with fewer than four cases cannot
+be established; the panel says so above the table and marks the frontier the runs so
+far point to with a **?** — see [Small models](guide-small-models.md).
 
 ## Auditing someone else's repository — worked example
 
@@ -251,27 +285,104 @@ scorecard, and a narrower one than it might be mistaken for.
 
 ## Where things live
 
-The navigation is grouped by what you came to do, not by which table backs it.
-Nothing was removed in the regrouping — the old paths still resolve, they just
-redirect.
+The navigation is grouped by **capability** — what you came to try — in seven
+entries ([ADR-0090](adr/0090-the-navigation-is-grouped-by-capability.md)). Each
+entry opens a **hub**: a board of cards that say what a capability does, whether
+it is **In the UI**, **Terminal only** or **To build**, and where it lives. No
+screen moved: every route below answers as it always did, the old flat paths
+still redirect, and an entry stays highlighted while you are inside any screen
+it owns.
 
-| Group | Screens | For |
+| Entry | Hub | Screens it reaches |
 |---|---|---|
-| — | **Home** | choosing what to learn, and what needs attention |
-| **Evaluate** | New evaluation, Experiments | stating a question and reading its answer |
-| **Evidence** | Findings, Cases, Repositories, Skills | what the lab knows and what it measures against |
-| **Advanced** | Runs, Compare, Benchmarks, Improvements | the operational machinery underneath |
-| **System** | Health, Guide, Settings | the lab itself |
+| **Home** | `/` | showcase of real runs (each opens a flow), five doors, the loop, first journeys, what needs attention |
+| **Models** | `/models` | Compare models, Harness × model, Tune your local model, Local results |
+| **Harness & skills** | `/harness` | the two profiles and the latest pruning verdict (live); New evaluation; Skills |
+| **Benchmarks** | `/benchmarks` | Cases, grouped by family (SWE-bench, 3D games, security, web, build, yours) |
+| **Your repo** | `/your-repo` | Audit, Validate your tool, Repositories |
+| **Results** | `/results` | Experiments, Runs, Ranking, Findings, Compare, Improvements |
+| **System** | `/system` | Settings, Health, Guide |
+
+### Guided flows
+
+Most of what people come to try starts from a guided flow, at `/flows/<name>`
+([ADR-0093](adr/0093-the-lab-is-driven-by-guided-flows.md)). Each one asks one question
+per step, answered with buttons, and keeps the long explanation behind an ⓘ. A flow
+diagram beside it lights up what you chose and marks the next step. Click a lit node,
+or an answer in the trail, to go back.
+
+| Flow | You choose | It creates |
+|---|---|---|
+| **Models and harness** → *Models* | case → Model 1 → Model 2 (optional) → harness level (full, minimal, none) → repetitions | a Compare-models experiment (family `models-<case>`); one model alone is a one-arm probe |
+| **Models and harness** → *Harness levels* | case (3D included) → agent and model → levels (none, minimal, full) → repetitions | one A/B per adjacent level pair, in one family, each with a verdict |
+| **Skills** → *Try a skill* | where the skill comes from → skill → base (minimal, full, both) → case → model → repetitions | one A/B per base, in one family ([ADR-0092](adr/0092-a-skill-is-trialled-on-a-chosen-base-and-improved-in-a-loop.md)) |
+| **Skills** → *Improve a skill* | skill → an experiment that used it → LLM audit → review the v2 draft → stage it → v1 vs v2 | a refine experiment |
+| **Metrics** | compare runs · what to improve · what we measure | nothing: it reads |
+
+Two doors each hold two branches, because each pair asks one kind of question.
+
+- **Models and harness** asks first *What do you compare?*: models (at a harness level
+  you pick) or harness levels (on one model).
+- **Skills** asks first *Try a skill* or *Improve a skill*.
+
+The old routes `/flows/harness` and `/flows/improve` still work: they land on the
+matching branch and keep `?case=` and `?skill=`.
+
+The last step always shows **arms, runs, estimated cost and time**, and only then
+**Create and launch (N runs)**:
+
+- The estimate is the lab's median for that case and model. With no measured run it
+  shows "—".
+- Repetitions are a stepper from 1 to 10.
+- **Create and launch** queues the runs. It passes the same preflight as the Experiments
+  page, so a run that cannot start is refused before anything is queued. **Create only**
+  leaves the experiment in Experiments to launch later.
+
+Every model step works the same way: pick the **agent** (`opencode`, `claude`, `codex`,
+`gemini`), then one of **its** models.
+
+- Each agent tab says whether it can run now. Sign codex and gemini in under
+  System → Agent CLIs.
+- Under opencode, choose **Local** or **Through the gateway**, then a vendor.
+- A model the run would be refused for, such as a Claude model with no gateway card,
+  shows disabled with the reason.
+- On the **claude** tab, a row sets the **reasoning effort** (`--effort`): Default, low,
+  medium, high, xhigh or max. Pick it before the model. The same model at two efforts
+  makes a valid pair to compare.
+
+**Runs** are one click away from every page: the pill at the top shows how many are
+active, and **Runs** and **Metrics** sit under *Lab* in the sidebar.
+
+### The Home showcase
+
+Home opens with a rotating banner of real runs: the racing3d car → kart
+continuation, chess3d across models, OpenCity as the player and the grader see
+it, and a replay of an agent-containment run. Hovering or focusing it holds the
+slide, **Pause** stops it, and `prefers-reduced-motion` starts it paused.
+
+To feature another run, add its media to `frontend/public/showcase/` and one
+entry to `frontend/src/showcase.ts` (copy in both languages, the run id as
+`source`). Keep clips short (≤ 12 s, ≤ 1 MB, no audio). A 3D run's grader
+already saves screenshots in `data/runs/<id>/workspace/.lab-grade/shots/`.
+
+### Trying a skill from the UI
+
+**Skills → Catalog** marks each governed skill as *in minimal* or *optional*.
+On an optional one, **Try on top of minimal** opens the **Try** tab with it
+selected: pick the cases it targets plus one general case, a model and the
+repetitions, then **Create trial**. That calls `POST /api/experiments/skill-trial`,
+which builds the same two-arm experiment as `make add-skill-trial`
+([ADR-0089](adr/0089-a-profile-grows-one-trialled-skill-at-a-time.md)) and
+**does not launch it** — the link takes you to the experiment, where the usual
+launch form and preflight run.
 
 ### Look and feel
 
-The UI carries no third-party branding (ADR-0060). It uses Outfit for text,
-Space Grotesk for headings, one accent colour, and a dark theme grounded in
-`--brand-dark`; the mark in the sidebar and on the login page is the lab's own
-`LabMark` component, drawn from the design tokens rather than an imported
-logo. Everything visual lives in `frontend/src/styles.css` as tokens and
-shared classes; pages do not carry `style={{}}` attributes. The classes that
-every wizard shares:
+The UI follows the Xmartlabs brand (`xmartlabs-branding` skill): Outfit for
+text, Space Grotesk for headings, XL Pink as the single accent, and a dark
+theme grounded in XL Dark. Everything visual lives in `frontend/src/styles.css`
+as tokens and shared classes; pages do not carry `style={{}}` attributes. The
+classes that every wizard shares:
 
 | Class | What it is | Rule of thumb |
 |---|---|---|
@@ -285,8 +396,31 @@ every wizard shares:
 
 Icons come from `frontend/src/components/icons.tsx` (inline Lucide geometry),
 never from emoji or text glyphs: emoji ignore the theme and render differently
-on every platform. To check a change without opening a browser, screenshot the
-dev server headlessly:
+on every platform.
+
+### Language
+
+The **EN | ES** switch under the brand at the top of the sidebar (and in **Settings → Appearance**)
+sets the interface language; the browser remembers it, and a first visit follows the
+browser's language. Every component keeps its strings beside its markup:
+
+```tsx
+const MESSAGES = defineMessages({
+  en: { title: "Experiments", runs: (count: number) => `${count} runs` },
+  es: { title: "Experimentos", runs: (count: number) => `${count} corridas` }
+});
+const m = useMessages(MESSAGES); // inside the component
+```
+
+The Spanish block is type-checked against the English one, so a string added in one
+language only fails `make check-frontend`. Strings that take values are functions, so
+each language owns its word order; helpers outside a component read
+`pickMessages(MESSAGES)` at call time, never at module load. Use the glossary in
+[ADR-0070](adr/0070-the-interface-speaks-english-and-spanish.md) for every term of the
+method. Text the backend composes — verdicts, readings, reasons, check results — and
+these guides stay in English for now.
+
+To check a change without opening a browser, screenshot the dev server headlessly:
 
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new \
@@ -295,18 +429,29 @@ dev server headlessly:
 
 ## Screens
 
-### Home — what do you want to learn?
+### Home — what do you want to try today?
 
-The landing page asks one question and offers three answers. Each card states the
-question it can answer, what it holds fixed, what it varies, and what it is **not**
-allowed to claim — so the choice of mode happens before any data is collected
-rather than after.
+The landing page opens with the [showcase](#the-home-showcase) of real runs, then
+four doors — **Models**, **Harness & skills**, **Benchmarks**, **Your repo** —
+each opening its hub. Below them: the **Start in 30 seconds** band
+(`make harness-check REPO=<path>` and the [demo guide](demo-guide.md)), the lab's
+loop as a diagram, four first journeys by what you have (a local model, a new
+skill, a new frontier model, your team's repo), what the lab will and will not
+tell you (it measures harnesses and workflows, never people), and the six guide
+journeys — shown always, not only on a fresh lab.
+
+The five evaluation modes sit under **Evaluation modes, in detail**. Each card
+states the question it can answer, what it holds fixed, what it varies, and what
+it is **not** allowed to claim — so the choice of mode happens before any data is
+collected rather than after.
 
 - **Validate your tool** → the five-step subject-validation wizard. First because
   it is the only door that opens on a fresh instance — no repository needed — and
   it leaves behind what the other two consume: a staged skill and a case with a
   real validation command.
 - **Evaluate a harness change** → the wizard at **Evaluate → New evaluation**.
+- **Does a stronger model need less harness?** → **Evaluate → Harness x model**, the
+  full harness x model grid (Mode E below).
 - **Audit a repository** → the three-step setup, then the repository's own page.
 
 Cross-repo evaluation keeps its mode but not its card: it needs two registered
@@ -734,6 +879,7 @@ A failed run also says *why*, in one word, with the full reason on hover:
 |---|---|---|
 | **lab error** | Never started — runner image missing, Docker unreachable, bad config | No |
 | **worker restarted** | Killed mid-flight by a restart; retry resumes it | No |
+| **lease lost** | The lab lost its hold on the shared skill catalog mid-run, so another run may have rewritten it; stopped rather than measured. Usually a Redis restart (the stack's Redis keeps no data across restarts), or Redis unreachable for about 90 s | No |
 | **endpoint down** | `run_max_stream_errors` provider requests failed back-to-back — or the run ended, however cleanly, with every model request it ever made having failed | No |
 | **no response** | The provider accepted the request and answered nothing for `run_model_wait_seconds` | No |
 | **stalled** | Ran, then went quiet for `run_stall_seconds` with no model request in flight | Yes |
@@ -890,20 +1036,22 @@ second borrows the authority of the first.
 | Metric | What it is |
 |---|---|
 | `task_validation_pass` | every one of the case's validation commands exited 0. The success metric of every experiment |
-| `test_pass_rate` | passed ÷ *conclusive* checks. Its resolution is the number of validation commands the case declares: one command makes it binary, ten make it a gradient. A check that timed out, was killed, could not find its command or had no network is excluded, never counted as a failure ([ADR-0048](adr/0048-a-check-that-did-not-measure-is-not-a-failure.md), [ADR-0063](adr/0063-a-check-the-environment-failed-is-not-a-verdict.md)) |
-| `cost_usd` | what the provider charged, from the CLI's own accounting |
+| `test_pass_rate` | passed ÷ *conclusive* checks. Its resolution is the number of validation commands the case declares: one command makes it binary, ten make it a gradient. A check that timed out, was killed, could not find its command or had no network is excluded, never counted as a failure ([ADR-0048](adr/0048-a-check-that-did-not-measure-is-not-a-failure.md), [ADR-0062](adr/0062-a-check-the-environment-failed-is-not-a-verdict.md)) |
+| `cost_usd` | what the provider charged, from the CLI's own accounting. **`0` for a self-hosted model on opencode** (`lmstudio/…`, `ollama/…`, `gateway/lmstudio-…`): measured as free, not unknown. `usage.json` says so in `cost_source: self_hosted` |
 | `billed_tokens` | **every token billed**: input + output + prompt cache written + prompt cache re-read. This is what a harness actually costs — a 25-skill catalog in the system prompt is re-read on every turn |
 | `total_tokens` | uncached input + output only. Kept for continuity with older runs; it can move *down* while cost moves up, so read `billed_tokens` |
 | `cache_read_tokens` | the prompt cache re-read across the run's turns, on its own |
+| `output_tokens` | every token the model **generated**, reasoning included. On a self-hosted model, where the bill is $0, this is what a harness costs: decode is the slow half of inference |
 | `agent_steps` | harness **restarts**, not work: one invocation that ran fifty turns counts 1. Alone it reads a stop-criterion difference as an agent difference — read it with `agent_turns` and the run's `stop_reason` |
 | `agent_turns`, `agent_tool_calls` | the work measures |
-| `wall_time_minutes` | the agent's own duration, not created-to-ended (the worker runs at concurrency 1, so a run can sit queued for hours) |
+| `wall_time_minutes` | the **step clock**: wall time of every harness invocation, summed. The same clock for opencode, claude and codex, and for a masked bare arm and a full-harness one. Queueing, provisioning and scoring are outside it |
+| `model_minutes` | (opencode) how long the model itself spent answering, summed over its turns. The gap to `wall_time_minutes` is tool execution and harness overhead |
 
 ##### Observations — what the record shows
 
 | Metric | What it is, and its blind spot |
 |---|---|
-| `skill_invoked` | share of the skills *this run is about* that the agent opened — a `Skill` tool call or a read of the skill's `SKILL.md` **that succeeded**; a call the harness rejected (`Unknown skill`) is tallied in the reason as a failed call, not counted ([ADR-0062](adr/0062-a-claude-run-started-inside-a-clone-must-be-told-where-the-skills-are.md)). **A lower bound**: a harness that injects a skill's body without either leaves no trace and scores 0 ([ADR-0041](adr/0041-a-skill-under-test-is-invoked-not-just-available.md)). Emitted only when the run is about some skill; never a zero for "not observed" |
+| `skill_invoked` | share of the skills *this run is about* that the agent opened — a `Skill` tool call or a read of the skill's `SKILL.md`. **A lower bound**: a harness that injects a skill's body without either leaves no trace and scores 0 ([ADR-0041](adr/0041-a-skill-under-test-is-invoked-not-just-available.md)). Emitted only when the run is about some skill; never a zero for "not observed" |
 | `skill_invocations` | the raw count, neutral direction |
 | `governance_read_coverage` | share of **that run's own** governance surface the agent opened. The denominator is resolved per run: a `native` arm is measured against the target repo's documents, never the lab's ([ADR-0036](adr/0036-audit-judges-a-run-against-its-own-governance.md)). Also a lower bound — context-injected content leaves no read event |
 | `expected_files_modified` / `forbidden_files_modified` | only when the case declares `files_expected` / `files_forbidden`. A correct solution may legitimately land elsewhere |
@@ -992,7 +1140,9 @@ disabled with `0` (`HARNESS_LAB_RUN_STALL_SECONDS`,
 `run_model_wait_seconds` for a slow model.
 
 ### Cases
-The catalog of tasks. Four ways to get realistic cases:
+The catalog of tasks. How to choose between the ways in — AI draft, SWE-bench and
+SWE-bench Pro import, a repository, a `task.yaml` — is
+[create a case](journey-create-a-case.md); this section is the screen itself.
 
 - **Draft it with AI** — describe the case in one sentence and the assistant
   shapes the whole thing: case type, a free id, name, description, the
@@ -1078,7 +1228,7 @@ thing it names?* Seven things put a card there:
 - **Nothing resolved on either side** — the mirror of "no headroom": no arm passed
   anything, so the dimension ranks nobody. When every run failed the *same* check it
   is the environment that decided, and the card says so
-  ([ADR-0063](adr/0063-a-check-the-environment-failed-is-not-a-verdict.md)).
+  ([ADR-0062](adr/0062-a-check-the-environment-failed-is-not-a-verdict.md)).
 - **The arm mixes treated and untreated runs** — it invoked its skills in some and not
   others.
 - **The design was objected to when it was created** — a warning the wizard showed you
@@ -1101,6 +1251,43 @@ and refuses to say who won, because that delta partly measures the stop criterio
 wording is deliberately cautious. The lab runs no hypothesis test, so it never says
 *significant*; it says exploratory (1 repetition), a judgement (2–4), a validation
 (5 or more), within observed variance, or improvement observed.
+
+#### Uncertainty — how wide the result still is
+
+The repetition ladder says that five runs are more than two. It does not say how wide
+five runs still are, so every experiment now shows its intervals
+([ADR-0064](adr/0064-an-experiment-shows-its-uncertainty.md)):
+
+- **Every arm's success rate carries its 95% interval**, as in `60% [23–88]`. This is
+  a Wilson interval over the scored runs, which stays honest at the edges: 0 of 5
+  reads `0% [0–43]`, not a confident zero.
+- **The success delta carries a 95% interval in points**, as in
+  `+40 pp, 95% interval [-12, +80] pp`, and the verdict's claim repeats it. The lab
+  resamples by case first and then by repetition within each case. Repetitions of one
+  case share its difficulty, so forty runs over four cases are not forty independent
+  facts. The interval is also never narrower than Newcombe's interval from the two
+  arms' Wilson intervals, so a unanimous 0/5 against 5/5 does not read as
+  "+100, certainly". The same runs always draw the same interval, because the
+  resampling seed is fixed.
+- **When the delta's interval includes zero**, the page and the verdict say so: these
+  runs are also compatible with no effect. For a tie, the verdict says that a tie this
+  wide does not show the arms are equivalent. This is a description, not a test, and
+  it never changes the headline.
+- **pass^k** sits under the success rate: the share of cases where *every* one of
+  k tries passed, with k the fewest repetitions any case has in any arm. **pass@k**
+  (at least one of k passed) sits beside it, and the gap between them shows how much
+  retrying hides.
+- **A planning hint** under the conditions table answers one question: how many
+  repetitions per case per arm would detect a 20-point difference (two-sided 5%, 80%
+  power). It plans from a 50% rate until every arm has 10 scored runs, and from the
+  noisiest observed arm after that. It ignores what pairing by case saves, so it errs
+  high. It is advice for the next design and never a judgement on this one. It appears
+  only for designs that compare arms.
+
+The summary API carries the same numbers: `success_rate_ci_low/high` and `pass_k` per
+condition, `delta_ci_low/high`, `interval_crosses_zero` and `paired_cases` on each
+comparison's `success`, and `repetition_plan` plus `repetitions_needed_for_20pp` on
+the summary.
 
 #### Reading — the experiment in plain language
 
@@ -1128,7 +1315,11 @@ that wrote it, and it never replaces the cards: it is a layer over them.
 Under that it keeps outcome, efficiency and behaviour in separate rows, shows every
 mean with its spread, colours a delta by the metric's **declared direction** (a drop
 in cost is a win; a drop in pass rate is not), and flags a delta that sits inside
-run-to-run variance. Below it, the **case matrix** shows where a treatment helped and
+run-to-run variance. A metric that **either arm lacks on any run** is shown as
+*not comparable* with how many runs are missing it, never as a delta computed on the runs
+that happened to record it; when that metric is `cost_usd`, `billed_tokens` or
+`wall_time_minutes`, the validity block adds **The arms cannot be compared on cost**
+and the headline leaves that figure out. Below it, the **case matrix** shows where a treatment helped and
 where it did not — an average of "+8 points" can be "fixed four cases, broke two".
 
 Two caveats are raised automatically because they are the ones that read as
@@ -1209,7 +1400,7 @@ the network at validation is what stops audited code from calling out while it i
 being measured. A command that installs will therefore die in its own installer every
 time, so the readiness report carries an **Offline validation** line that names any
 such command — including a `make test` whose recipe calls `make install` — before a
-run proves it ([ADR-0063](adr/0063-a-check-the-environment-failed-is-not-a-verdict.md)).
+run proves it ([ADR-0062](adr/0062-a-check-the-environment-failed-is-not-a-verdict.md)).
 Full walkthrough: [Target repositories](guide-target-repositories.md).
 
 Once two active repositories are registered the page header offers **Test the
@@ -1277,6 +1468,21 @@ recorded appears with its provenance, and the winning cell follows each metric's
 *declared direction* rather than the sign — a lower cost wins, a lower pass rate does
 not.
 
+**Reading** ([ADR-0060](adr/0060-compare-can-ask-a-model-to-read-the-table.md)).
+Under the table, *Explain this comparison* asks an LLM to say what the numbers mean:
+whether anything improved, which cells were never measured rather than measured at
+zero, what was held constant and what varied between these runs, and why a hand-picked
+selection is not a causal claim. Six fixed sections, in English, over the same evidence
+the table renders plus the run context it cannot show — the configuration each run
+carried, its failed checks, the judge's rationale, and which governance docs and skills
+it actually opened.
+
+Nothing is generated until you press the button: an unread comparison is an empty box.
+Pressing it again replaces the reading rather than adding one. The reading is stored
+against the *set* of runs, so reordering the columns returns the same text and changing
+one empties the box again. It is a **judgement** and is badged as one. The button waits
+until every selected run has stopped.
+
 Line up runs of the same case across models or harness conditions:
 
 - Pick 2–4 runs; the **metrics table** shows case, models, prompt, objective
@@ -1296,21 +1502,6 @@ Line up runs of the same case across models or harness conditions:
 
 Typical use: run the same case with a new model and a previous one, then open
 Compare to see the objective and cost deltas.
-
-**Reading** ([ADR-0061](adr/0061-compare-can-ask-a-model-to-read-the-table.md)).
-Under the table, *Explain this comparison* asks an LLM to say what the numbers mean:
-whether anything improved, which cells were never measured rather than measured at
-zero, what was held constant and what varied between these runs, and why a hand-picked
-selection is not a causal claim. Six fixed sections, in English, over the same evidence
-the table renders plus the run context it cannot show — the configuration each run
-carried, its failed checks, the judge's rationale, and which governance docs and skills
-it actually opened.
-
-Nothing is generated until you press the button: an unread comparison is an empty box.
-Pressing it again replaces the reading rather than adding one. The reading is stored
-against the *set* of runs, so reordering the columns returns the same text and changing
-one empties the box again. It is a **judgement** and is badged as one. The button waits
-until every selected run has stopped.
 
 ### Health
 What the lab can reach, and where its generated state has drifted

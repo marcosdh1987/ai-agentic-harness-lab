@@ -1,7 +1,7 @@
 import re
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from harness_lab_app.models import (
     CaseProvenance,
@@ -55,7 +55,8 @@ class CaseCreate(BaseModel):
     provenance: CaseProvenance = CaseProvenance.synthetic
     files_expected: list[str] = Field(default_factory=list)
     files_forbidden: list[str] = Field(default_factory=list)
-    metadata_json: dict[str, str] = Field(default_factory=dict)
+    # JSON values: `validation_requirements` is a list (ADR-0071).
+    metadata_json: dict[str, Any] = Field(default_factory=dict)
     max_steps: int = 1
     # The repository this case was written for, when it was written for one.
     # What turns a pile of cases into a repository's own library (ADR-0042).
@@ -180,6 +181,88 @@ class SuiteArmCreate(BaseModel):
     overrides: dict = Field(default_factory=dict)
 
 
+class SkillTrialCreate(BaseModel):
+    """Trial one governed skill on top of a profile, from the web UI (ADR-0089).
+
+    The same design as ``make add-skill-trial``: control is the profile, the
+    treatment adds the skill and asks for it. Creating never launches — the
+    experiment is launched from the Experiments page like any other.
+    """
+
+    skill: str
+    model: str = Field(min_length=1)
+    case_ids: list[str] = Field(min_length=1)
+    profile: str = "minimal"
+    repetitions: int = Field(default=3, ge=1, le=10)
+    # Pinned in both arms, so launching from the shared form cannot swap in its
+    # own default model or harness (ADR-0090).
+    harness: str = Field(default="claude", pattern="^(claude|opencode|codex|gemini)$")
+    # Reasoning effort (ADR-0081), pinned in every arm like the model. Empty
+    # keeps the CLI default, so an older request builds exactly what it did.
+    effort: str = Field(default="", pattern="^(|low|medium|high|xhigh|max)$")
+    # "catalog": profile vs profile + a governed skill (ADR-0089).
+    # "staged": no skill vs a staged one — a case's candidate, or yours (ADR-0091).
+    source: str = Field(default="catalog", pattern="^(catalog|staged)$")
+    # Which harness the skill is trialled on top of (ADR-0092). Unset keeps the
+    # original single design for `source`. "both" creates the minimal and the
+    # full A/B in one family, never a four-arm design.
+    base: str | None = Field(default=None, pattern="^(minimal|full|both)$")
+    # With "both": an A/B already measured with this exact design, skill
+    # content and at least this many runs per arm is reused, not re-run.
+    reuse_measured: bool = True
+    # Preview only: report which bases would be reused or created, write nothing.
+    # The guided flow shows the real run count with it before creating.
+    dry_run: bool = False
+
+
+class HarnessLevelsCreate(BaseModel):
+    """None / minimal / full on one case and model, as a ladder of A/Bs (ADR-0093)."""
+
+    case_id: str
+    model: str = Field(min_length=1)
+    levels: list[str] = Field(min_length=2)
+    repetitions: int = Field(default=1, ge=1, le=10)
+    harness: str = Field(default="claude", pattern="^(claude|opencode|codex|gemini)$")
+    # Reasoning effort (ADR-0081), pinned in every arm like the model. Empty
+    # keeps the CLI default, so an older request builds exactly what it did.
+    effort: str = Field(default="", pattern="^(|low|medium|high|xhigh|max)$")
+
+
+class SkillRefineCreate(BaseModel):
+    """v1 against v2 of one skill, on the same cases and model (ADR-0092).
+
+    ``skill`` is v1, ``candidate`` the staged v2. A staged v1 (a case's
+    candidate, or yours) is compared add-for-add; a governed v1 is swapped out
+    for the candidate, as ``make refine-skill`` does. Created, never launched.
+    """
+
+    skill: str
+    candidate: str
+    model: str = Field(min_length=1)
+    case_ids: list[str] = Field(min_length=1)
+    base: str = Field(default="full", pattern="^(minimal|full)$")
+    repetitions: int = Field(default=3, ge=1, le=10)
+    harness: str = Field(default="claude", pattern="^(claude|opencode|codex|gemini)$")
+    # Reasoning effort (ADR-0081), pinned in every arm like the model. Empty
+    # keeps the CLI default, so an older request builds exactly what it did.
+    effort: str = Field(default="", pattern="^(|low|medium|high|xhigh|max)$")
+
+
+class SkillAuditRequest(BaseModel):
+    """Audit one skill from an experiment where it was used (ADR-0092)."""
+
+    experiment_id: str
+    auditor_model: str = ""
+
+
+class SkillDraftStage(BaseModel):
+    """Stage an audited v2 draft under ``name`` — the explicit, reviewed step."""
+
+    name: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    description: str = ""
+
+
 class SuiteExperimentCreate(BaseModel):
     """Generate an experiment from a regression suite (§13).
 
@@ -197,15 +280,65 @@ class SuiteExperimentCreate(BaseModel):
     notes: str = ""
 
 
+def _normalize_effort(value: str | None) -> str:
+    """Lower-cased effort level, or "" for the CLI default; refuses the rest.
+
+    Which levels a given *model* accepts is a preflight question (it needs the
+    catalog); this only keeps a typo from reaching the CLI as an argument it
+    would reject at launch.
+    """
+    from harness_lab_app.native_models import EFFORT_LEVELS
+
+    normalized = (value or "").strip().lower()
+    if normalized and normalized not in EFFORT_LEVELS:
+        raise ValueError(
+            f"executor_effort must be one of: {', '.join(EFFORT_LEVELS)} "
+            "(or empty for the CLI default)"
+        )
+    return normalized
+
+
+def _apply_skill_profile(model: Any) -> Any:
+    """Expand ``skill_profile`` into ``skills_disabled`` (ADR-0085).
+
+    A profile is a named, reproducible ablation: the run records the exact
+    list it hid, so the condition hash and every comparison keep reading
+    ``skills_disabled`` as before. Combining a profile with a hand-written
+    list would make the arm ambiguous, so it is refused.
+    """
+    profile = (model.skill_profile or "").strip()
+    if not profile or profile == "full":
+        model.skill_profile = profile or ""
+        return model
+    from harness_lab_app.skills_catalog import profile_disabled
+
+    disabled = profile_disabled(profile)
+    if model.skills_disabled and sorted(model.skills_disabled) != disabled:
+        raise ValueError(
+            "skill_profile and skills_disabled are exclusive: pick a profile or "
+            "list the skills to hide, not both"
+        )
+    model.skills_disabled = disabled
+    return model
+
+
 class RunConfigCreate(BaseModel):
     case_id: str
     prompt_variant: str
     harness: str = "opencode"
     planner_model: str | None = None
     executor_model: str | None = None
+    # Reasoning effort for the executor (ADR-0081): one of
+    # ``native_models.EFFORT_LEVELS``, passed to the claude CLI as ``--effort``.
+    # Empty means the CLI's own default — what every run before the selector
+    # got — so it is the historical arm, not a missing value.
+    executor_effort: str = ""
     score_mode: str = "manual"
     max_steps: int = 1
     resume: bool = False
+    # Set only by a "continue where it stopped" retry (ADR-0083): the step the
+    # loop starts at, the earlier ones kept as they ran. 0 runs every step.
+    resume_from_step: int = Field(default=0, ge=0)
     dry_run: bool = False
     # Follow-up instruction that replaces the case prompt for a continuation
     # run (ADR-0026). Set by RunService.continue_run, not by the run form.
@@ -213,6 +346,10 @@ class RunConfigCreate(BaseModel):
     # Per-run harness ablation: governed skills to hide from the agent for this
     # run (empty = full harness, the historical default arm).
     skills_disabled: list[str] = Field(default_factory=list)
+    # Harness level (ADR-0085): "full" (default, every skill) or a profile from
+    # .github/skill-profiles.toml such as "minimal". Expanded into
+    # `skills_disabled` on validation, so the run records the exact list.
+    skill_profile: str = ""
     # Staged/experimental skills (data/skills_staging/<name>/) to add for this
     # run only. Unchecked by default in the UI.
     skills_extra: list[str] = Field(default_factory=list)
@@ -223,6 +360,10 @@ class RunConfigCreate(BaseModel):
     # governed and not in `skills_disabled`.
     skills_invoke: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _expand_skill_profile(self) -> "RunConfigCreate":
+        return _apply_skill_profile(self)
+
     # External target repository (ADR-0029). `target_repo_id` is what the run
     # form sends; `target_ref` defaults to the repository's own default_ref.
     # `target_commit` is NOT accepted from the client — RunService resolves it,
@@ -232,6 +373,11 @@ class RunConfigCreate(BaseModel):
     # Which harness the agent sees (ADR-0031). `native`/`injected` both run the
     # agent inside the target repository and therefore require one.
     harness_source: HarnessSource = HarnessSource.lab_root
+
+    @field_validator("executor_effort")
+    @classmethod
+    def validate_executor_effort(cls, value: str) -> str:
+        return _normalize_effort(value)
 
     @field_validator("score_mode")
     @classmethod
@@ -252,6 +398,8 @@ class ExperimentLaunch(BaseModel):
     """Settings every arm of the launch shares; conditions override on top."""
 
     config: RunConfigCreate
+    # How many runs execute at once: 1, the lab's one lane, or 2 (ADR-0082).
+    parallel: int = Field(default=1, ge=1, le=2)
 
 
 class FindingCreate(BaseModel):
@@ -430,6 +578,9 @@ class RunBatchCreate(BaseModel):
     # the axis passes a single-element list.
     executor_models: list[str | None] = Field(default_factory=_unset_axis)
     planner_models: list[str | None] = Field(default_factory=_unset_axis)
+    # Reasoning effort axis (ADR-0081). The default single "" means "the CLI's
+    # own default", which is what every batch before the selector asked for.
+    executor_efforts: list[str] = Field(default_factory=lambda: [""])
     # Target repositories to run against (ADR-0029) — the Mode B axis: one case
     # family, N repositories, harness held fixed. The default single empty
     # string means "no external target", which is what every batch created
@@ -451,8 +602,14 @@ class RunBatchCreate(BaseModel):
     max_steps: int = 1
     dry_run: bool = False
     skills_disabled: list[str] = Field(default_factory=list)
+    # Harness level for every run of the batch (ADR-0085); see RunConfigCreate.
+    skill_profile: str = ""
     skills_extra: list[str] = Field(default_factory=list)
     skills_invoke: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _expand_skill_profile(self) -> "RunBatchCreate":
+        return _apply_skill_profile(self)
 
     @field_validator("case_ids", "prompt_variants", "harnesses")
     @classmethod
@@ -469,6 +626,13 @@ class RunBatchCreate(BaseModel):
         if not value:
             raise ValueError("must contain at least one entry (use [null] for unset)")
         return value
+
+    @field_validator("executor_efforts")
+    @classmethod
+    def validate_effort_axis(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError('must contain at least one entry (use [""] for default)')
+        return [_normalize_effort(item) for item in value]
 
     @field_validator("repetitions")
     @classmethod
@@ -541,6 +705,11 @@ class CaseDraftResponse(BaseModel):
     subject: str
     instruction: str
     validation_commands: list[str] = Field(default_factory=list)
+    # What those commands import beyond the runner's own packages, pinned. The
+    # checks run offline in a clean container, so a draft that needs numpy and
+    # does not say so grades nothing (ADR-0071). Saved under
+    # `metadata_json["validation_requirements"]`.
+    validation_requirements: list[str] = Field(default_factory=list)
     max_steps: int = 10
     # The rest of the case's shape. Optional because the subject-validation
     # wizard only needs subject/instruction/commands and fills the remaining

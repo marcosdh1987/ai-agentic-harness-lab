@@ -37,16 +37,16 @@ are a polish problem (a homelab leaking into product copy), not an exposure.
 
 ### 1.1 Repository slugs → settings
 
-The repository slug is hardcoded in six places. Defaults stay pointed at the real repos —
+`xmartlabs/sdlc-*` is hardcoded in six places. Defaults stay pointed at the real repos —
 that is on-message for a lab whose subject *is* `sdlc-ml-python-base` — but they become
 configurable.
 
 Add to `Settings` ([config.py](../../src/harness_lab_app/config.py), prefix `HARNESS_LAB_`):
 
 ```python
-template_repository: str = "marcosdh1987/ml-python-base"
-lab_repository: str = "marcosdh1987/ai-agentic-harness-lab"
-guide_repository: str = "marcosdh1987/harness-engineering-guide"
+template_repository: str = "xmartlabs/sdlc-ml-python-base"
+lab_repository: str = "xmartlabs/sdlc-ml-python-harness-lab"
+guide_repository: str = "xmartlabs/sdlc-harness-engineering-guide"
 ```
 
 Call sites to migrate:
@@ -94,6 +94,13 @@ Phase 1 makes it configurable, not absent. Grepping for it is therefore not an e
 criterion — an earlier draft of this plan claimed it returned only `Makefile` and
 settings defaults, which was never true.
 
+**Superseded 2026-08-20.** The three repositories moved to the `xmartlabs`
+organization and took an `sdlc-` prefix: `xmartlabs/sdlc-ml-python-base`,
+`xmartlabs/sdlc-ml-python-harness-lab`, and
+`xmartlabs/sdlc-harness-engineering-guide`. The reasoning above is unchanged —
+the slug is a real owner, not a leak — only the owner is different. GitHub
+redirects the old paths after a rename, so historical PR and issue links in
+these plans resolve either way.
 
 ## Phase 2 — Publishing hygiene
 

@@ -52,7 +52,7 @@ def _proposal(proposal_id: str = "HEP-2026-014") -> Proposal:
         title="Improve systematic debugging stop conditions",
         created_at=FIXED,
         source=ProposalSource(
-            repository="marcosdh1987/ai-agentic-harness-lab", runs=[]
+            repository="xmartlabs/sdlc-ml-python-harness-lab", runs=[]
         ),
         observation=Observation(
             failure_mode="Agent repeated an equivalent failing command.",
@@ -125,6 +125,21 @@ def test_atomic_write_leaves_no_temp(tmp_path: Path) -> None:
     assert [x.name for x in target.parent.iterdir()] == ["file.yaml"]
 
 
+def test_failed_atomic_replace_keeps_previous_manifest(tmp_path, monkeypatch):
+    target = tmp_path / "file.yaml"
+    target.write_text("version: old\n")
+
+    def fail_replace(source, destination):
+        raise OSError("simulated replacement failure")
+
+    monkeypatch.setattr(manifests.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated replacement failure"):
+        manifests.atomic_write_text(target, "version: new\n")
+
+    assert target.read_text() == "version: old\n"
+    assert [p.name for p in tmp_path.iterdir()] == ["file.yaml"]
+
+
 # --------------------------------------------------------------------------- #
 # ID allocation
 # --------------------------------------------------------------------------- #
@@ -175,7 +190,7 @@ def test_link_issue_sets_state_and_lifecycle() -> None:
     p = _proposal()
     linked = proposals.link_issue(
         p,
-        "https://github.com/marcosdh1987/ml-python-base/issues/31",
+        "https://github.com/xmartlabs/sdlc-ml-python-template/issues/31",
         at=FIXED,
         actor="human",
     )

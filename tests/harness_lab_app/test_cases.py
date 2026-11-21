@@ -54,6 +54,33 @@ def test_seeding_imports_every_authored_benchmark(session):
     )
 
 
+def test_the_frontend_case_grades_every_browser_test_on_its_own(session):
+    """todo-web-v1 (ADR-0067): tamper guard first, then the entry point, then one
+    command per shipped test — so test_pass_rate has the suite's resolution."""
+    import re
+
+    from harness_lab_app.case_validation import check_commands
+
+    case = next(
+        c
+        for c in CaseService(session).seed_benchmark_cases()
+        if c.case_id == "todo-web-v1"
+    )
+    commands = case.validation_commands
+    assert commands[0].startswith(
+        "git -C /app diff --quiet HEAD -- benchmarks/todo-web-v1/tests"
+    )
+    shipped = re.findall(
+        r"^def (test_\w+)\(",
+        Path("benchmarks/todo-web-v1/tests/test_todo.py").read_text(),
+        re.M,
+    )
+    graded = [c.rsplit("::", 1)[1] for c in commands if "::" in c]
+    assert graded == shipped
+    assert check_commands(commands) == []
+    assert "frontend" in case.tags and "browser" in case.tags
+
+
 def test_reseeding_refreshes_stale_prompt_variants(session):
     """A re-seed rebuilds the variant map from task.yaml (ADR-0047).
 
@@ -219,3 +246,238 @@ def test_creating_a_duplicate_case_is_a_named_refusal(session):
 
     with pytest.raises(CaseExistsError, match="derived-once"):
         service.create_case(payload)
+
+
+def test_the_clinic_ladder_declares_three_tiers(session):
+    """Tier tags drive the capability frontier (ADR-0069); a missing or duplicated
+    tier would silently shorten the ladder."""
+    seeded = {c.case_id: c for c in CaseService(session).seed_benchmark_cases()}
+    tiers = {
+        case_id: next(t for t in seeded[case_id].tags if t.startswith("tier:"))
+        for case_id in ("clinic-slots-t1", "clinic-booking-t2", "clinic-rules-t3")
+    }
+    assert tiers == {
+        "clinic-slots-t1": "tier:1",
+        "clinic-booking-t2": "tier:2",
+        "clinic-rules-t3": "tier:3",
+    }
+
+
+def test_a_task_yaml_declares_its_graders_dependencies(tmp_path):
+    """ADR-0071: the packages the graded tests import are case data, stored like
+    the starter, refreshed on re-seed and dropped when the yaml drops them."""
+    import yaml
+
+    from harness_lab_app.case_service import CaseService
+
+    task = tmp_path / "task.yaml"
+    body = {
+        "task_id": "deps-case",
+        "description": "d",
+        "prompts": {"default": "p"},
+        "validation_commands": ["pytest {workspace}/t.py -q"],
+        "validation_requirements": ["pandas==2.2.3", "joblib==1.4.2"],
+    }
+    task.write_text(yaml.safe_dump(body))
+    from sqlmodel import Session, SQLModel, create_engine
+    from sqlmodel.pool import StaticPool
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        case = CaseService(session).import_task_yaml(task)
+        assert case.metadata_json["validation_requirements"] == [
+            "pandas==2.2.3",
+            "joblib==1.4.2",
+        ]
+
+
+def test_a_graded_case_hands_its_tests_an_absolute_workspace():
+    """Every graded command `cd`s into the workspace first, so a `{workspace}` path
+    relative to the lab root no longer resolves after it. The clinic tests only
+    worked because `python -m pytest` happens to put the cwd on sys.path; the iris
+    tests, which run `main.py` by path, did not (2026-10-24)."""
+    import re
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[2] / "benchmarks"
+    offenders = []
+    for task in sorted(root.glob("*/task.yaml")):
+        for command in (
+            yaml.safe_load(task.read_text()).get("validation_commands") or []
+        ):
+            if re.search(r"\b[A-Z_]+_WORKSPACE=\{workspace\}", str(command)):
+                offenders.append(task.parent.name)
+                break
+    assert offenders == [], offenders
+
+
+def test_a_case_with_validation_requirements_reads_back_through_the_api_schema():
+    """The list lives in metadata_json; a `dict[str, str]` schema would refuse to
+    serialize every case that declares it."""
+    from harness_lab_app.schemas import CaseRead
+
+    record = CaseRead(
+        case_id="c",
+        name="c",
+        type="build_from_scratch",
+        status="active",
+        sync_state="imported_from_yaml",
+        metadata_json={"validation_requirements": ["pandas==3.1.0"]},
+    )
+    assert record.metadata_json["validation_requirements"] == ["pandas==3.1.0"]
+
+
+def test_editing_a_case_keeps_what_its_metadata_holds(session):
+    """The case editor sends no `metadata_json`; an edit replaced it with `{}`.
+
+    That silently dropped `validation_requirements` (ADR-0071), `starter_dir`
+    and a SWE case's instance data the first time anyone fixed a typo.
+    """
+    service = CaseService(session)
+    service.create_case(
+        CaseCreate(
+            case_id="graded-case",
+            name="Graded case",
+            type=CaseType.build_from_scratch,
+            prompt_variants={"default": "Build it."},
+            metadata_json={
+                "validation_requirements": ["numpy==2.4.6"],
+                "starter_dir": "benchmarks/x/starter",
+            },
+        )
+    )
+
+    updated = service.update_case(
+        "graded-case",
+        CaseCreate(
+            case_id="graded-case",
+            name="Graded case, renamed",
+            type=CaseType.build_from_scratch,
+            prompt_variants={"default": "Build it."},
+        ),
+    )
+
+    assert updated.name == "Graded case, renamed"
+    assert updated.metadata_json == {
+        "validation_requirements": ["numpy==2.4.6"],
+        "starter_dir": "benchmarks/x/starter",
+    }
+
+
+def test_an_edit_that_sends_requirements_replaces_only_those(session):
+    service = CaseService(session)
+    service.create_case(
+        CaseCreate(
+            case_id="graded-case",
+            name="Graded case",
+            type=CaseType.build_from_scratch,
+            metadata_json={
+                "validation_requirements": ["numpy==2.4.6"],
+                "starter_dir": "benchmarks/x/starter",
+            },
+        )
+    )
+
+    updated = service.update_case(
+        "graded-case",
+        CaseCreate(
+            case_id="graded-case",
+            name="Graded case",
+            type=CaseType.build_from_scratch,
+            metadata_json={"validation_requirements": ["pandas==3.1.0"]},
+        ),
+    )
+    assert updated.metadata_json == {
+        "validation_requirements": ["pandas==3.1.0"],
+        "starter_dir": "benchmarks/x/starter",
+    }
+
+    cleared = service.update_case(
+        "graded-case",
+        CaseCreate(
+            case_id="graded-case",
+            name="Graded case",
+            type=CaseType.build_from_scratch,
+            metadata_json={"validation_requirements": []},
+        ),
+    )
+    assert cleared.metadata_json == {"starter_dir": "benchmarks/x/starter"}
+
+
+def test_a_new_case_does_not_store_an_empty_requirements_list(session):
+    """The Cases form always sends the key; empty means "none", not a value."""
+    case = CaseService(session).create_case(
+        CaseCreate(
+            case_id="plain-case",
+            name="Plain case",
+            type=CaseType.single_prompt,
+            metadata_json={"validation_requirements": []},
+        )
+    )
+    assert case.metadata_json == {}
+
+
+def test_a_requirement_the_setup_step_would_drop_is_refused_on_save(session):
+    """Copilot on #47: the editor stored any line, and the setup step then
+    skipped the ones it could not pass to pip without a word. The case showed a
+    dependency it would never install, and its checks ended inconclusive."""
+    import pytest
+
+    from harness_lab_app.case_service import CaseValidationError
+
+    service = CaseService(session)
+    with pytest.raises(CaseValidationError) as refused:
+        service.create_case(
+            CaseCreate(
+                case_id="bad-deps",
+                name="Bad deps",
+                type=CaseType.build_from_scratch,
+                metadata_json={
+                    "validation_requirements": [
+                        "numpy==2.4.6",
+                        "pandas; rm -rf /",
+                        "git+https://example.invalid/pkg.git",
+                    ]
+                },
+            )
+        )
+    problems = refused.value.problems
+    # One message per line it would skip, each naming that line first.
+    assert [line.split(" ", 1)[0] for line in problems] == [
+        "'pandas;",
+        "'git+https://example.invalid/pkg.git'",
+    ]
+
+
+def test_an_edit_with_a_requirement_the_setup_step_would_drop_is_refused(session):
+    import pytest
+
+    from harness_lab_app.case_service import CaseValidationError
+
+    service = CaseService(session)
+    service.create_case(
+        CaseCreate(
+            case_id="graded",
+            name="Graded",
+            type=CaseType.build_from_scratch,
+            metadata_json={"validation_requirements": ["numpy==2.4.6"]},
+        )
+    )
+    with pytest.raises(CaseValidationError):
+        service.update_case(
+            "graded",
+            CaseCreate(
+                case_id="graded",
+                name="Graded",
+                type=CaseType.build_from_scratch,
+                metadata_json={"validation_requirements": ["numpy 2.4.6"]},
+            ),
+        )
+    # Refused, so nothing was half-applied.
+    assert service.get_case("graded").metadata_json == {
+        "validation_requirements": ["numpy==2.4.6"]
+    }

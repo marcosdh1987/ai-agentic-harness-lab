@@ -198,7 +198,7 @@ def test_the_evidence_says_what_each_arm_used_and_did_not(session):
 
 def test_an_inconclusive_check_is_not_listed_as_a_failure(session):
     """An auditor handed a sandbox failure as a failed check writes that the arm
-    failed the check (ADR-0063)."""
+    failed the check (ADR-0062)."""
     from harness_lab_app.models import Validation
 
     _, runs = _launch(session)
@@ -334,6 +334,27 @@ def test_a_gateway_that_never_answers_fails_with_its_attempt_count(session):
     assert audit is not None
     assert audit.status == "failed"
     assert "3 attempts" in (audit.error or "")
+
+
+def test_a_gateway_error_that_outlasts_the_retries_keeps_its_status_and_body():
+    """Three 5xx in a row used to end in ``TypeError: missing 'body'``.
+
+    ``GatewayHTTPError`` takes ``(code, body)``; rebuilding it from a message
+    raised inside the retry and the comparison stored that TypeError instead
+    of the gateway's answer (compare 2737eaf…, 2026-09-22).
+    """
+
+    def call() -> str:
+        raise GatewayHTTPError(524, "origin timed out")
+
+    with pytest.raises(GatewayHTTPError) as caught:
+        call_with_retry(call, sleep=lambda _s: None)
+
+    assert caught.value.code == 524
+    assert caught.value.body == "origin timed out (after 3 attempts)"
+    assert "Gateway HTTP 524" in str(caught.value)
+    assert "3 attempts" in str(caught.value)
+    assert isinstance(caught.value.__cause__, GatewayHTTPError)
 
 
 def test_a_bad_request_is_not_asked_three_times(session):

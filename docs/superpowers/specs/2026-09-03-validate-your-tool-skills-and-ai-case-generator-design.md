@@ -42,7 +42,7 @@ On mount, `SubjectValidation.tsx` fetches both:
       checked={isolateGoverned}
       onChange={(e) => setIsolateGoverned(e.target.checked)}
     />
-    <span>Isolate the run: disable every harness skill that is not selected above.</span>
+    <span>Aislar ejecución: deshabilitar en el harness las demás skills no seleccionadas</span>
   </label>
   ```
 * **Readiness & Execution Parameters:**
@@ -94,7 +94,7 @@ On mount, `SubjectValidation.tsx` fetches both:
 
 ## Error Handling & Resilience
 
-* **Gateway Offline / Auth Failures:** Returns HTTP 400 with actionable error detail: `"Could not reach the model. Fill the fields in by hand, or check your connection under Settings."`
+* **Gateway Offline / Auth Failures:** Returns HTTP 400 with actionable error detail: `"No se pudo conectar con el modelo. Puedes completar los campos manualmente o verificar tu conexión en Settings."`
 * **Malformed JSON from LLM:** Sanitizes potential markdown wrapping (````json ... ````) before calling `json.loads`. Falls back gracefully with HTTP 422 if unparseable.
 * **Skill Collision / Missing Files:** Missing `SKILL.md` files during context building are ignored gracefully without breaking the draft flow.
 

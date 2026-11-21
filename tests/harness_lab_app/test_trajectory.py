@@ -133,7 +133,7 @@ def test_a_rejected_skill_call_is_not_an_invocation():
     """`Unknown skill` hands the agent nothing.
 
     Counting it is how a run whose catalog was never registered with the CLI
-    scored as a fully activated treatment (ADR-0062).
+    scored as a fully activated treatment (ADR-0061).
     """
     call = {**tool_use("Skill", skill="systematic_debugging"), "id": "t1"}
     lines = [

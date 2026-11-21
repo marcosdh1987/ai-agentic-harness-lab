@@ -5,7 +5,7 @@ Used by **Cell A** (`tetris_incremental_v1`).
 
 ## Per-run procedure (clones-per-run linkage)
 
-1. **Freeze** the subject `base_commit` of `ml-python-base` in `benchmarks/_archive/tetris-v1/runs.yaml`.
+1. **Freeze** the subject `base_commit` of `ml-python-base` in `benchmarks/tetris/runs.yaml`.
 2. **Register** the run: `python scripts/create_run.py --benchmark tetris-v1 --run tetris-v1-A-001`
    → creates `data/runs/tetris-v1-A-001/` and prints `session_id` / tags / branch.
 3. **Isolate the subject** in a branch (the subject code is never committed into this lab):
@@ -25,7 +25,7 @@ Used by **Cell A** (`tetris_incremental_v1`).
 6. **Attach metadata** per the standard (`metadata-standard.md`): `session_id=bench-tetris-v1-A-001`.
 7. **Capture** into `data/runs/tetris-v1-A-001/`: the final diff, `result_commit`, terminal log,
    and a screenshot of the running game.
-8. **Score** manually against the case's `scoring.md` rubric (run the game, observe, 0-10).
+8. **Score** manually: `python scripts/score_tetris.py --run tetris-v1-A-001`.
 
 ## Notes
 

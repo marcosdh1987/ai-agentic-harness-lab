@@ -102,9 +102,7 @@ def test_adopt_writes_the_installed_manifest(
         cli.releases, "resolve_ref_commit", lambda _root, _ref: "a" * 40
     )
     monkeypatch.setattr(cli.sync, "read_registry_protocol", lambda _root: 1)
-    monkeypatch.setattr(
-        cli, "template_repository", lambda: "marcosdh1987/ml-python-base"
-    )
+    monkeypatch.setattr(cli, "template_repository", lambda: "xmartlabs/ml-python-base")
 
     code = cli.main(["adopt", "--ref", "v0.4.0"])
 
@@ -143,9 +141,7 @@ def test_adopt_dry_run_writes_nothing(
         cli.releases, "resolve_ref_commit", lambda _root, _ref: "b" * 40
     )
     monkeypatch.setattr(cli.sync, "read_registry_protocol", lambda _root: 1)
-    monkeypatch.setattr(
-        cli, "template_repository", lambda: "marcosdh1987/ml-python-base"
-    )
+    monkeypatch.setattr(cli, "template_repository", lambda: "xmartlabs/ml-python-base")
 
     assert cli.main(["adopt", "--ref", "v0.4.0", "--dry-run"]) == 0
     assert not (tmp_path / ".harness-version.yaml").exists()

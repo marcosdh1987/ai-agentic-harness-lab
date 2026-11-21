@@ -19,6 +19,8 @@ failed, and did anything get measured — so they are kept together.
 
 from __future__ import annotations
 
+import re
+
 # kind -> (prefix, human label). Order matters only for readability; the
 # prefixes are mutually exclusive.
 _KINDS: tuple[tuple[str, str, str], ...] = (
@@ -26,6 +28,9 @@ _KINDS: tuple[tuple[str, str, str], ...] = (
     ("lab", "Executor error:", "lab error"),
     # Killed by a restart while in flight; the run itself said nothing about it.
     ("lab", "Worker restarted", "worker restarted"),
+    # The lab lost its own lock on the skill catalog mid-run (ADR-0082) and
+    # stopped the run — see `tasks._keep_lease`.
+    ("lab", "Shared-tree lease lost:", "lease lost"),
     # The provider kept refusing the request — see `tasks._endpoint_failure`.
     ("lab", "Model endpoint failing:", "endpoint down"),
     # The provider accepted the request and never answered — see
@@ -36,7 +41,26 @@ _KINDS: tuple[tuple[str, str, str], ...] = (
     # `tasks._stall_failure`. That silence is the agent's own doing (a tool call
     # that never returns), so unlike the two above it *is* a result.
     ("stalled", "Run stalled:", "stalled"),
+    # A phase past its expected time that nobody chose to keep waiting for.
+    # Like a timeout it is a result about the agent — too slow — and the work
+    # it left is graded (ADR-0080).
+    ("timeout", "Phase too slow:", "phase too slow"),
     ("timeout", "Run timed out", "timed out"),
+)
+
+# Phrases anywhere in an agent-output tail that mean the run never reached the
+# model. Prefixes cannot catch these: the reason is the tail of the CLI's own
+# output. con-o-sin-harness (2026-10-23) recorded eight "agent error"s for a
+# model the gateway had no card for. Checked in order; the first match wins.
+_LAB_MARKERS: tuple[tuple[str, str], ...] = (
+    # LiteLLM / Anthropic-shaped refusals of an unknown model id.
+    ("invalid model name", "model not served"),
+    ("model_not_found", "model not served"),
+    ("does not exist or you do not have access", "model not served"),
+    # The API refusing the harness CLI itself, not the request it sent.
+    ("claude_code_version_too_old", "CLI too old"),
+    # bench_run's own verdict when the harness died before the model answered.
+    ("stop_reason=harness_error", "harness error"),
 )
 
 # Kinds where nothing can be concluded about the model or the harness, so the
@@ -44,12 +68,33 @@ _KINDS: tuple[tuple[str, str, str], ...] = (
 UNMEASURED_KINDS = frozenset({"lab"})
 
 
+# A server-side status from the provider or a proxy in front of it (Cloudflare
+# 52x, Anthropic 529 overloaded). The run reached a gateway that could not
+# answer, which says nothing about the model.
+_SERVER_ERROR_RE = re.compile(r"API Error: 5\d\d\b")
+
+
+def _lab_marker(text: str) -> str | None:
+    lowered = text.lower()
+    for marker, label in _LAB_MARKERS:
+        if marker in lowered:
+            # A server-side outage outranks the generic harness_error verdict
+            # that always accompanies it.
+            if label == "harness error" and _SERVER_ERROR_RE.search(text):
+                return "endpoint down"
+            return label
+    if _SERVER_ERROR_RE.search(text):
+        return "endpoint down"
+    return None
+
+
 def classify_failure(reason: str | None) -> str | None:
     """Return ``"lab"``, ``"stalled"``, ``"timeout"``, ``"agent"`` or ``None``.
 
     ``None`` means the run did not fail (or recorded no reason). ``"agent"`` is
     the fallback: the reason is the tail of the agent's own output, which is a
-    real result — a bad one, but a result.
+    real result — a bad one, but a result — unless that tail says the model was
+    never reached.
     """
     text = (reason or "").strip()
     if not text:
@@ -57,6 +102,8 @@ def classify_failure(reason: str | None) -> str | None:
     for kind, prefix, _label in _KINDS:
         if text.startswith(prefix):
             return kind
+    if _lab_marker(text):
+        return "lab"
     return "agent"
 
 
@@ -68,7 +115,7 @@ def failure_label(reason: str | None) -> str | None:
     for _kind, prefix, label in _KINDS:
         if text.startswith(prefix):
             return label
-    return "agent error"
+    return _lab_marker(text) or "agent error"
 
 
 def is_unmeasured(reason: str | None) -> bool:
@@ -159,6 +206,22 @@ _HARNESS_SIGNALS: dict[str, HarnessSignals] = {
         wait=(CLAUDE_AWAITING_MARKER, "# claude session init"),
         stream_error=("# stream error",),
         retry_noise=(CLAUDE_AWAITING_MARKER, "# claude session init"),
+    ),
+    # codex and gemini step logs are rendered by harness_events with the same
+    # vocabulary: `# awaiting model` when a request is in flight (codex
+    # `turn.started` / a finished command; gemini a tool result going back),
+    # `# stream error:` for the CLI's reconnect notices (ADR-0094).
+    "codex": HarnessSignals(
+        request=(CLAUDE_AWAITING_MARKER,),
+        wait=(CLAUDE_AWAITING_MARKER, "# codex session init"),
+        stream_error=("# stream error",),
+        retry_noise=(CLAUDE_AWAITING_MARKER, "# codex session init"),
+    ),
+    "gemini": HarnessSignals(
+        request=(CLAUDE_AWAITING_MARKER,),
+        wait=(CLAUDE_AWAITING_MARKER, "# gemini session init"),
+        stream_error=("# stream error",),
+        retry_noise=(CLAUDE_AWAITING_MARKER, "# gemini session init"),
     ),
 }
 

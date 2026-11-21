@@ -271,7 +271,7 @@ def test_a_python_repo_with_uv_lock_suggests_uv_flavoured_commands():
     )
     assert out["setup"] == ["uv sync"]
     # `--offline`: setup installs with a network, validation runs without one,
-    # and plain `uv run` dies re-checking the lock there (ADR-0063).
+    # and plain `uv run` dies re-checking the lock there (ADR-0062).
     assert out["validation"] == ["uv run --offline pytest -x -q"]
 
 
@@ -522,3 +522,19 @@ def test_the_report_carries_the_offline_check(session):
     )
     offline = next(c for c in report["checks"] if c["label"] == "Offline validation")
     assert offline["status"] == "missing"
+
+
+def test_a_plugin_marketplace_is_read_as_skills_and_agents():
+    """`plugins/<p>/skills/` and `plugins/<p>/agents/` are a harness."""
+    found = readiness_service.classify(
+        [
+            "plugins/tribunal/skills/review-pr/SKILL.md",
+            "plugins/tribunal/agents/tribunal-refuter.md",
+            "plugins/homosapiens/skills/humanize/SKILL.md",
+            "plugins/tribunal/skills/README.md",
+            "plugins/tribunal/rust/README.md",
+        ]
+    )
+    assert found["skills"] == ["homosapiens:humanize", "tribunal:review-pr"]
+    assert found["agents"] == ["tribunal:tribunal-refuter"]
+    assert found["governance_docs"] == []

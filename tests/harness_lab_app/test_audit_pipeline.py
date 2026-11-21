@@ -216,7 +216,7 @@ def _seed(session, **over) -> TargetRepository:
     base = {
         "target_id": "talos",
         "name": "talos",
-        "repository_url": "git@github.com:example-org/talos.git",
+        "repository_url": "git@github.com:xmartlabs/talos.git",
         "pinned_commit": "3" * 40,
         "validation_commands": [
             'for t in tests/test_*.sh; do bash "$t" || exit 1; done'
